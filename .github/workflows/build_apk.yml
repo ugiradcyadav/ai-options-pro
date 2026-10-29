@@ -32,7 +32,13 @@ jobs:
           cp pubspec.yaml.bak pubspec.yaml
           cp -r lib_bak/* lib/
           rm -rf pubspec.yaml.bak lib_bak test
+          
+          # Inject Internet Permission
           sed -i '/<application/i <uses-permission android:name="android.permission.INTERNET"/>' android/app/src/main/AndroidManifest.xml
+          
+          # Upgrade Kotlin version in settings.gradle to satisfy Gradle build
+          sed -i 's/kotlin-version = ".*"/kotlin-version = "1.8.22"/g' android/settings.gradle || true
+          sed -i 's/id "org.jetbrains.kotlin.android" version ".*"/id "org.jetbrains.kotlin.android" version "1.8.22"/g' android/settings.gradle || true
 
       - name: Install Dependencies
         run: flutter pub get
