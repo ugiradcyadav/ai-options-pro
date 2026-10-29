@@ -254,7 +254,7 @@ class HomeScreen extends StatelessWidget {
                   children: [
                     const Row(
                       children: [
-                        Icon(Icons.Query_stats, color: Color(0xFF40C4FF), size: 18),
+                        Icon(Icons.query_stats, color: Color(0xFF40C4FF), size: 18),
                         SizedBox(width: 6),
                         Text(
                           'Market Sense',

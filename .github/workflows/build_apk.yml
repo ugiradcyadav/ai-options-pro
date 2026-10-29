@@ -26,7 +26,12 @@ jobs:
 
       - name: Generate Android Platform Wrapper & Internet Permissions
         run: |
-          flutter create --platforms=android --org com.aioptionspro.trading .
+          cp pubspec.yaml pubspec.yaml.bak
+          cp -r lib lib_bak
+          flutter create --platforms=android --project-name ai_options_pro --org com.aioptionspro.trading .
+          cp pubspec.yaml.bak pubspec.yaml
+          cp -r lib_bak/* lib/
+          rm -rf pubspec.yaml.bak lib_bak test
           sed -i '/<application/i <uses-permission android:name="android.permission.INTERNET"/>' android/app/src/main/AndroidManifest.xml
 
       - name: Install Dependencies
