@@ -25,7 +25,7 @@ class _BacktestScreenState extends State<BacktestScreen> {
 
   bool _running = false;
   BacktestReport? _lastReport;
-  List> _savedStrategies = [];
+  List _savedStrategies = [];
 
   @override
   void initState() {

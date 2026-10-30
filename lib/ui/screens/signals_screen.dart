@@ -17,7 +17,7 @@ class SignalsScreen extends StatefulWidget {
 
 class _SignalsScreenState extends State<SignalsScreen> {
   String _subTab = 'Live'; // Live, Backtest, History
-  List> _historySignals = [];
+  List _historySignals = [];
 
   @override
   void initState() {
