@@ -1,3 +1,4 @@
+import '../../main.dart';
 import 'package:flutter/material.dart';
 import '../../core/totp_auth.dart';
 import '../../data/dhan_data_engine.dart';
@@ -88,6 +89,9 @@ class _ApiSetupScreenState extends State<ApiSetupScreen> {
     });
 
     widget.onConnectedSuccess();
+    if (mounted && widget.isFirstLaunch) {
+      Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => MainTerminalShell(appState: globalAppState)));
+    }
   }
 
   @override

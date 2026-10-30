@@ -11,6 +11,8 @@ import 'ui/screens/positions_screen.dart';
 import 'ui/screens/settings_screen.dart';
 import 'ui/screens/signals_screen.dart';
 
+final AppState globalAppState = AppState();
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const AiOptionsProApp());
@@ -24,7 +26,6 @@ class AiOptionsProApp extends StatefulWidget {
 }
 
 class _AiOptionsProAppState extends State<AiOptionsProApp> {
-  final AppState _appState = AppState();
   bool _checkingAuth = true;
   bool _needsFirstLaunchSetup = false;
 
@@ -35,19 +36,41 @@ class _AiOptionsProAppState extends State<AiOptionsProApp> {
   }
 
   Future<void> _checkFirstLaunchGate() async {
-    final creds = await TotpAuthManager.loadCredentials();
-    if (!creds.isConfigured) {
-      setState(() {
-        _needsFirstLaunchSetup = true;
-        _checkingAuth = false;
-      });
-    } else {
-      await _appState.initializeApp();
-      setState(() {
-        _needsFirstLaunchSetup = false;
-        _checkingAuth = false;
-      });
+    try {
+      final creds = await TotpAuthManager.loadCredentials();
+      if (!creds.isConfigured) {
+        if (mounted) {
+          setState(() {
+            _needsFirstLaunchSetup = true;
+            _checkingAuth = false;
+          });
+        }
+      } else {
+        if (mounted) {
+          setState(() {
+            _needsFirstLaunchSetup = false;
+            _checkingAuth = false;
+          });
+        }
+        // Start live engine non-blocking so Dashboard opens immediately
+        globalAppState.initializeApp();
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _needsFirstLaunchSetup = true;
+          _checkingAuth = false;
+        });
+      }
     }
+  }
+
+  void _unlockAndOpenDashboard() {
+    setState(() {
+      _needsFirstLaunchSetup = false;
+      _checkingAuth = false;
+    });
+    globalAppState.initializeApp();
   }
 
   @override
@@ -69,12 +92,9 @@ class _AiOptionsProAppState extends State<AiOptionsProApp> {
           : _needsFirstLaunchSetup
               ? ApiSetupScreen(
                   isFirstLaunch: true,
-                  onConnectedSuccess: () async {
-                    await _appState.initializeApp();
-                    setState(() => _needsFirstLaunchSetup = false);
-                  },
+                  onConnectedSuccess: _unlockAndOpenDashboard,
                 )
-              : MainTerminalShell(appState: _appState),
+              : MainTerminalShell(appState: globalAppState),
     );
   }
 }
@@ -90,8 +110,8 @@ class MainTerminalShell extends StatefulWidget {
 
 class _MainTerminalShellState extends State<MainTerminalShell> {
   int _bottomNavIndex = 0;
-  String _analyticsSubView = 'oi_analysis'; // oi_analysis, option_chain, charts
-  String _moreSubView = 'settings'; // backtest, settings
+  String _analyticsSubView = 'oi_analysis';
+  String _moreSubView = 'settings';
 
   void _handleQuickAction(String dest) {
     setState(() {
