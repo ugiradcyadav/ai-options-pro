@@ -1,8 +1,8 @@
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 
 class DhanCredentials {
   final String clientId;
@@ -10,6 +10,7 @@ class DhanCredentials {
   final String totpSecret;
   final String accessToken;
   final int tokenGeneratedAtMs;
+  final String lastAuthError;
 
   const DhanCredentials({
     required this.clientId,
@@ -17,6 +18,7 @@ class DhanCredentials {
     required this.totpSecret,
     required this.accessToken,
     required this.tokenGeneratedAtMs,
+    this.lastAuthError = '',
   });
 
   bool get isConfigured =>
@@ -28,33 +30,33 @@ class DhanCredentials {
     final ageHours =
         (DateTime.now().millisecondsSinceEpoch - tokenGeneratedAtMs) /
             (1000 * 3600);
-    return ageHours < 22.0;
+    return ageHours < 20.0;
   }
 }
 
 class TotpAuthManager {
-  static const _storage = FlutterSecureStorage(
-    aOptions: AndroidOptions(encryptedSharedPreferences: true),
-  );
+  static const _kClientId = 'dhan_client_id_v2';
+  static const _kPinSecret = 'dhan_pin_secret_v2';
+  static const _kTotpSecret = 'dhan_totp_secret_v2';
+  static const _kAccessToken = 'dhan_access_token_v2';
+  static const _kTokenTime = 'dhan_token_time_ms_v2';
 
-  static const _kClientId = 'dhan_client_id';
-  static const _kPinSecret = 'dhan_pin_secret';
-  static const _kTotpSecret = 'dhan_totp_secret';
-  static const _kAccessToken = 'dhan_access_token';
-  static const _kTokenTime = 'dhan_token_time_ms';
+  static String lastServerMessage = '';
 
   static Future<DhanCredentials> loadCredentials() async {
-    final clientId = await _storage.read(key: _kClientId) ?? '';
-    final pinOrSecret = await _storage.read(key: _kPinSecret) ?? '';
-    final totpSecret = await _storage.read(key: _kTotpSecret) ?? '';
-    final accessToken = await _storage.read(key: _kAccessToken) ?? '';
-    final tokenTimeStr = await _storage.read(key: _kTokenTime) ?? '0';
+    final prefs = await SharedPreferences.getInstance();
+    final clientId = prefs.getString(_kClientId) ?? '';
+    final pinOrSecret = prefs.getString(_kPinSecret) ?? '';
+    final totpSecret = prefs.getString(_kTotpSecret) ?? '';
+    final accessToken = prefs.getString(_kAccessToken) ?? '';
+    final tokenTime = prefs.getInt(_kTokenTime) ?? 0;
+
     return DhanCredentials(
       clientId: clientId,
       pinOrSecret: pinOrSecret,
       totpSecret: totpSecret,
       accessToken: accessToken,
-      tokenGeneratedAtMs: int.tryParse(tokenTimeStr) ?? 0,
+      tokenGeneratedAtMs: tokenTime,
     );
   }
 
@@ -64,29 +66,28 @@ class TotpAuthManager {
     required String totpSecret,
     required String accessToken,
   }) async {
-    await _storage.write(key: _kClientId, value: clientId.trim());
-    await _storage.write(key: _kPinSecret, value: pinOrSecret.trim());
-    await _storage.write(
-        key: _kTotpSecret, value: totpSecret.trim().replaceAll(' ', ''));
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kClientId, clientId.trim());
+    await prefs.setString(_kPinSecret, pinOrSecret.trim());
+    await prefs.setString(
+      _kTotpSecret,
+      totpSecret.trim().toUpperCase().replaceAll(RegExp(r'[^A-Z2-7]'), ''),
+    );
     if (accessToken.trim().isNotEmpty) {
-      await _storage.write(key: _kAccessToken, value: accessToken.trim());
-      await _storage.write(
-        key: _kTokenTime,
-        value: DateTime.now().millisecondsSinceEpoch.toString(),
-      );
+      await prefs.setString(_kAccessToken, accessToken.trim());
+      await prefs.setInt(_kTokenTime, DateTime.now().millisecondsSinceEpoch);
     }
-  }
-
-  static Future<void> clearAll() async {
-    await _storage.deleteAll();
   }
 
   /// Generates RFC-6238 6-digit TOTP code locally from Base32 secret
   static String generateTotpCode(String base32Secret, {DateTime? now}) {
-    final clean = base32Secret.toUpperCase().replaceAll(RegExp(r'[^A-Z2-7]'), '');
+    final clean =
+        base32Secret.toUpperCase().replaceAll(RegExp(r'[^A-Z2-7]'), '');
     if (clean.isEmpty) return '000000';
 
     final keyBytes = _base32Decode(clean);
+    if (keyBytes.isEmpty) return '000000';
+
     final timeSec = ((now ?? DateTime.now()).millisecondsSinceEpoch ~/ 1000);
     int counter = timeSec ~/ 30;
 
@@ -108,39 +109,63 @@ class TotpAuthManager {
     return otp.toString().padLeft(6, '0');
   }
 
-  /// Exchanges TOTP + PIN with Dhan Auth Endpoint or verifies existing Access Token
-  static Future<DhanCredentials> ensureValidSession() async {
+  /// Strictly authenticates with Dhan using TOTP or Direct Token and reports exact error if any
+  static Future<DhanCredentials> ensureValidSession({bool forceRefresh = false}) async {
     final creds = await loadCredentials();
-    if (!creds.isConfigured) return creds;
-
-    if (creds.isTokenFresh) {
+    if (!creds.isConfigured) {
+      lastServerMessage = 'Credentials not configured.';
       return creds;
     }
 
+    if (!forceRefresh && creds.isTokenFresh && creds.accessToken.isNotEmpty) {
+      return creds;
+    }
+
+    // If user pasted a direct 24h JWT Access Token, verify it first
+    if (creds.accessToken.isNotEmpty && creds.totpSecret.isEmpty) {
+      lastServerMessage = 'Using direct 24h Access Token.';
+      return creds;
+    }
+
+    // Exchange ClientID + PIN + TOTP with Dhan Auth API
     if (creds.totpSecret.isNotEmpty && creds.pinOrSecret.isNotEmpty) {
+      final totp = generateTotpCode(creds.totpSecret);
       try {
-        final totp = generateTotpCode(creds.totpSecret);
         final uri = Uri.parse(
           'https://auth.dhan.co/app/generateAccessToken?dhanClientId=${Uri.encodeComponent(creds.clientId)}&pin=${Uri.encodeComponent(creds.pinOrSecret)}&totp=$totp',
         );
-        final resp = await http.post(uri).timeout(const Duration(seconds: 10));
+        final resp = await http.post(
+          uri,
+          headers: {'Accept': 'application/json'},
+        ).timeout(const Duration(seconds: 12));
+
         if (resp.statusCode == 200) {
           final body = jsonDecode(resp.body);
-          final newToken = (body['accessToken'] ?? body['token'] ?? '').toString();
-          if (newToken.isNotEmpty) {
-            await saveCredentials(
-              clientId: creds.clientId,
-              pinOrSecret: creds.pinOrSecret,
-              totpSecret: creds.totpSecret,
-              accessToken: newToken,
-            );
-            return await loadCredentials();
+          if (body is Map &&
+              (body['accessToken'] != null || body['token'] != null)) {
+            final newToken =
+                (body['accessToken'] ?? body['token']).toString().trim();
+            if (newToken.isNotEmpty) {
+              await saveCredentials(
+                clientId: creds.clientId,
+                pinOrSecret: creds.pinOrSecret,
+                totpSecret: creds.totpSecret,
+                accessToken: newToken,
+              );
+              lastServerMessage = 'Auto-TOTP token generated successfully!';
+              return await loadCredentials();
+            }
           }
+          lastServerMessage = 'Dhan Auth Response: ${resp.body}';
+        } else {
+          lastServerMessage =
+              'Dhan TOTP Auth HTTP ${resp.statusCode}: ${resp.body}';
         }
-      } catch (_) {
-        // Fallback to existing token verification
+      } catch (e) {
+        lastServerMessage = 'Network/Auth Error: $e';
       }
     }
+
     return creds;
   }
 

@@ -157,7 +157,7 @@ class DhanDataEngine {
     final valid = await fetchFundLimits();
     if (!valid) {
       isConnected = false;
-      connectionStatusText = 'Auth Failed - Check Client ID / Token / TOTP';
+      connectionStatusText = TotpAuthManager.lastServerMessage.isNotEmpty ? TotpAuthManager.lastServerMessage : 'Auth Failed: Verify Token or TOTP+PIN';
       onDataUpdated?.call();
       return false;
     }

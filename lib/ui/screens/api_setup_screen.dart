@@ -1,7 +1,7 @@
-import '../../main.dart';
 import 'package:flutter/material.dart';
 import '../../core/totp_auth.dart';
 import '../../data/dhan_data_engine.dart';
+import '../../main.dart';
 
 class ApiSetupScreen extends StatefulWidget {
   final VoidCallback onConnectedSuccess;
@@ -24,6 +24,7 @@ class _ApiSetupScreenState extends State<ApiSetupScreen> {
   final _accessTokenCtrl = TextEditingController();
 
   bool _loading = false;
+  bool _isError = false;
   String _statusMessage = '';
   String _liveTotpPreview = '------';
 
@@ -35,6 +36,7 @@ class _ApiSetupScreenState extends State<ApiSetupScreen> {
 
   Future<void> _loadExisting() async {
     final creds = await TotpAuthManager.loadCredentials();
+    if (!mounted) return;
     setState(() {
       _clientIdCtrl.text = creds.clientId;
       _pinSecretCtrl.text = creds.pinOrSecret;
@@ -56,19 +58,27 @@ class _ApiSetupScreenState extends State<ApiSetupScreen> {
 
   Future<void> _saveAndConnect() async {
     if (_clientIdCtrl.text.trim().isEmpty) {
-      setState(() => _statusMessage = 'Please enter your Dhan Client ID.');
+      setState(() {
+        _isError = true;
+        _statusMessage = 'Error: Please enter your Dhan Client ID.';
+      });
       return;
     }
     if (_totpSecretCtrl.text.trim().isEmpty &&
         _accessTokenCtrl.text.trim().isEmpty) {
-      setState(() => _statusMessage =
-          'Enter either TOTP Secret + PIN (for auto daily login) or Access Token.');
+      setState(() {
+        _isError = true;
+        _statusMessage =
+            'Error: Enter either TOTP Secret + 6-digit PIN OR a Direct 24h Access Token.';
+      });
       return;
     }
 
     setState(() {
       _loading = true;
-      _statusMessage = 'Generating TOTP & verifying Dhan live session...';
+      _isError = false;
+      _statusMessage =
+          'Step 1/2: Authenticating with Dhan Server & verifying token...';
     });
 
     await TotpAuthManager.saveCredentials(
@@ -78,19 +88,51 @@ class _ApiSetupScreenState extends State<ApiSetupScreen> {
       accessToken: _accessTokenCtrl.text,
     );
 
+    final refreshedCreds =
+        await TotpAuthManager.ensureValidSession(forceRefresh: true);
+    if (refreshedCreds.accessToken.trim().isEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _isError = true;
+        _statusMessage =
+            'Dhan Token Generation Failed:\n${TotpAuthManager.lastServerMessage}\n\nTip: Check your 6-digit PIN & TOTP Secret, or paste a 24h Access Token from web.dhan.co -> DhanHQ Trading APIs.';
+      });
+      return;
+    }
+
+    setState(() {
+      _statusMessage =
+          'Step 2/2: Token acquired! Connecting to Dhan Live Feed & Fund API...';
+    });
+
     final ok = await DhanDataEngine.instance.initializeAndStart();
     if (!mounted) return;
 
+    if (!ok) {
+      setState(() {
+        _loading = false;
+        _isError = true;
+        _statusMessage =
+            'Dhan API Rejected Connection:\n${DhanDataEngine.instance.connectionStatusText}\n\nMake sure "Free Tier: Trading APIs" is subscribed on web.dhan.co.';
+      });
+      return;
+    }
+
     setState(() {
       _loading = false;
-      _statusMessage = ok
-          ? 'Connected to Dhan! Starting 1m Forever Engine...'
-          : 'Credentials saved. Verify active market token or TOTP key.';
+      _isError = false;
+      _statusMessage =
+          'Verified & Connected to Dhan! Opening Live Terminal...';
     });
 
     widget.onConnectedSuccess();
     if (mounted && widget.isFirstLaunch) {
-      Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => MainTerminalShell(appState: globalAppState)));
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(
+          builder: (_) => MainTerminalShell(appState: globalAppState),
+        ),
+      );
     }
   }
 
@@ -127,7 +169,7 @@ class _ApiSetupScreenState extends State<ApiSetupScreen> {
                       Icon(Icons.security, color: Color(0xFF2979FF), size: 20),
                       SizedBox(width: 8),
                       Text(
-                        'On-Device Encrypted Auto-TOTP Auth',
+                        'Strict Dhan API Verification (Zero Bypass)',
                         style: TextStyle(
                           color: Colors.white,
                           fontWeight: FontWeight.bold,
@@ -138,7 +180,7 @@ class _ApiSetupScreenState extends State<ApiSetupScreen> {
                   ),
                   SizedBox(height: 6),
                   Text(
-                    'Credentials are stored in Android Hardware Keystore (AES-256). App automatically refreshes your 24h Dhan token every morning using your TOTP secret.',
+                    'App verifies your live Dhan session before unlocking the terminal. Enter Client ID + PIN + TOTP Secret (or paste a 24h Access Token).',
                     style: TextStyle(color: Colors.white70, fontSize: 12),
                   ),
                 ],
@@ -147,14 +189,14 @@ class _ApiSetupScreenState extends State<ApiSetupScreen> {
             const SizedBox(height: 16),
             _buildField(
               label: 'Dhan Client ID *',
-              hint: 'e.g. 1100223344',
+              hint: 'e.g. 1101108080',
               controller: _clientIdCtrl,
               icon: Icons.badge_outlined,
             ),
             const SizedBox(height: 12),
             _buildField(
-              label: 'Dhan 6-Digit PIN / API Secret (for Auto-TOTP)',
-              hint: 'Enter your Dhan PIN',
+              label: 'Dhan 6-Digit Login PIN (for Auto-TOTP)',
+              hint: 'Enter your 6-digit Dhan PIN',
               controller: _pinSecretCtrl,
               icon: Icons.lock_outline,
               obscure: true,
@@ -162,7 +204,7 @@ class _ApiSetupScreenState extends State<ApiSetupScreen> {
             const SizedBox(height: 12),
             _buildField(
               label: 'TOTP Base32 Secret Key (Auto-Login Every Day)',
-              hint: 'e.g. JBSWY3DPEHPK3PXP...',
+              hint: 'e.g. TVTLGOXTN5OG3VUQ...',
               controller: _totpSecretCtrl,
               icon: Icons.timer_outlined,
               onChanged: _updateTotpPreview,
@@ -181,19 +223,40 @@ class _ApiSetupScreenState extends State<ApiSetupScreen> {
               ),
             const SizedBox(height: 12),
             _buildField(
-              label: 'Direct 24h Access Token (Optional Fallback)',
-              hint: 'Paste JWT Access Token if not using TOTP',
+              label: 'Direct 24h Access Token (Optional / Instant Login)',
+              hint: 'Paste JWT Access Token from web.dhan.co',
               controller: _accessTokenCtrl,
               icon: Icons.vpn_key_outlined,
             ),
             if (_statusMessage.isNotEmpty) ...[
               const SizedBox(height: 14),
-              Text(
-                _statusMessage,
-                style: const TextStyle(color: Color(0xFFFFAB00), fontSize: 12),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: _isError
+                      ? const Color(0xFFD50000).withOpacity(0.15)
+                      : const Color(0xFF00C853).withOpacity(0.15),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                    color: _isError
+                        ? const Color(0xFFFF5252)
+                        : const Color(0xFF00E676),
+                  ),
+                ),
+                child: Text(
+                  _statusMessage,
+                  style: TextStyle(
+                    color: _isError
+                        ? const Color(0xFFFF5252)
+                        : const Color(0xFF00E676),
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
               ),
             ],
-            const SizedBox(height: 22),
+            const SizedBox(height: 20),
             SizedBox(
               width: double.infinity,
               height: 48,
@@ -218,8 +281,8 @@ class _ApiSetupScreenState extends State<ApiSetupScreen> {
                     : const Icon(Icons.bolt),
                 label: Text(
                   _loading
-                      ? 'Connecting to Dhan Feed...'
-                      : 'Save & Start Live Data Engine',
+                      ? 'Verifying with Dhan Server...'
+                      : 'Verify & Start Live Data Engine',
                   style: const TextStyle(
                     fontWeight: FontWeight.bold,
                     fontSize: 14,

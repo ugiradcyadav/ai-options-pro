@@ -17,8 +17,8 @@ class ForeverDatabase {
       dbPath,
       version: 1,
       onConfigure: (db) async {
-        await db.execute('PRAGMA journal_mode = WAL;');
-        await db.execute('PRAGMA synchronous = NORMAL;');
+        await db.rawQuery('PRAGMA journal_mode = WAL;');
+        await db.rawQuery('PRAGMA synchronous = NORMAL;');
       },
       onCreate: (db, version) async {
         await db.execute('''
