@@ -45,7 +45,7 @@ extension UnderlyingIndexExt on UnderlyingIndex {
     }
   }
 
-  int get fallbackLotSize {
+  int get defaultLotSize {
     switch (this) {
       case UnderlyingIndex.nifty50:
         return 75;
@@ -76,114 +76,32 @@ extension SignalActionExt on SignalAction {
 
 enum TradingMode { paper, live }
 
-/// T1: Explicit Order Lifecycle State Machine
-enum OrderLifecycleState {
-  submitted,
-  pending,
-  partiallyFilled,
-  filled,
-  rejected,
-  cancelled,
-  unknown,
-}
-
-extension OrderLifecycleStateExt on OrderLifecycleState {
-  String get label {
-    switch (this) {
-      case OrderLifecycleState.submitted:
-        return 'SUBMITTED';
-      case OrderLifecycleState.pending:
-        return 'PENDING';
-      case OrderLifecycleState.partiallyFilled:
-        return 'PARTIALLY_FILLED';
-      case OrderLifecycleState.filled:
-        return 'FILLED';
-      case OrderLifecycleState.rejected:
-        return 'REJECTED';
-      case OrderLifecycleState.cancelled:
-        return 'CANCELLED';
-      case OrderLifecycleState.unknown:
-        return 'UNKNOWN';
-    }
-  }
-
-  bool get isTerminal =>
-      this == OrderLifecycleState.filled ||
-      this == OrderLifecycleState.rejected ||
-      this == OrderLifecycleState.cancelled;
-}
-
-/// T1: Single unit-tested mapping table for Dhan broker order statuses.
-/// Unmapped or missing status strictly maps to UNKNOWN, never FILLED.
-OrderLifecycleState mapBrokerOrderStatus(String? rawStatus) {
-  if (rawStatus == null) return OrderLifecycleState.unknown;
-  switch (rawStatus.trim().toUpperCase()) {
-    case 'TRADED':
-    case 'FILLED':
-    case 'COMPLETE':
-      return OrderLifecycleState.filled;
-    case 'PARTIALLY_TRADED':
-    case 'PARTIALLY_FILLED':
-    case 'PARTIAL':
-      return OrderLifecycleState.partiallyFilled;
-    case 'PENDING':
-    case 'TRANSIT':
-    case 'OPEN':
-    case 'TRIGGER_PENDING':
-    case 'AMO_REQ_RECEIVED':
-      return OrderLifecycleState.pending;
-    case 'REJECTED':
-    case 'OMS_REJECTED':
-    case 'RMS_REJECTED':
-      return OrderLifecycleState.rejected;
-    case 'CANCELLED':
-    case 'EXPIRED':
-      return OrderLifecycleState.cancelled;
-    case 'SUBMITTED':
-      return OrderLifecycleState.submitted;
-    default:
-      return OrderLifecycleState.unknown;
-  }
-}
-
-enum MarketRegimeState {
-  bullishAccumulation,
-  bearishDistribution,
-  choppyHighThetaTrap,
-}
-
-extension MarketRegimeStateExt on MarketRegimeState {
-  String get label {
-    switch (this) {
-      case MarketRegimeState.bullishAccumulation:
-        return 'Bullish';
-      case MarketRegimeState.bearishDistribution:
-        return 'Bearish';
-      case MarketRegimeState.choppyHighThetaTrap:
-        return 'Neutral (Choppy/Theta Trap)';
-    }
-  }
-}
-
-/// T3: Resolved Contract Metadata from Dhan Scrip Master
-class ResolvedContract {
-  final String numericSecurityId;
-  final String tradingSymbol;
+class InstrumentContract {
+  final String securityId;
   final UnderlyingIndex index;
-  final String expiryIso;
+  final String expiry;
   final int strike;
   final OptionType optionType;
+  final int strikeOffset;
   final int lotSize;
 
-  const ResolvedContract({
-    required this.numericSecurityId,
-    required this.tradingSymbol,
+  const InstrumentContract({
+    required this.securityId,
     required this.index,
-    required this.expiryIso,
+    required this.expiry,
     required this.strike,
     required this.optionType,
+    required this.strikeOffset,
     required this.lotSize,
   });
+
+  String get offsetLabel {
+    if (strikeOffset == 0) return 'ATM';
+    return strikeOffset > 0 ? 'ATM+$strikeOffset' : 'ATM$strikeOffset';
+  }
+
+  String get displaySymbol =>
+      '${index.dhanSymbol} $expiry $strike ${optionType == OptionType.ce ? "CE" : "PE"}';
 }
 
 class OneMinEnrichedBar {
@@ -269,7 +187,7 @@ class OneMinEnrichedBar {
         'next_3m_return': next3mReturn,
       };
 
-  factory OneMinEnrichedBar.fromMap(Map<String, dynamic> m) => OneMinEnrichedBar(
+  factory OneMinEnrichedBar.fromMap(Map m) => OneMinEnrichedBar(
         timestampMs: m['timestamp_ms'] as int,
         indexName: m['index_name'] as String,
         expiry: m['expiry'] as String,
@@ -305,7 +223,6 @@ class StrikeRowSnapshot {
   final int offset;
   final String ceSecurityId;
   final String peSecurityId;
-  final int lotSize;
   final double ceLtp;
   final double peLtp;
   final int ceOi;
@@ -325,8 +242,6 @@ class StrikeRowSnapshot {
   final double ceGamma;
   final double ceTheta;
   final double ceVega;
-  final double ceVanna;
-  final double ceCharm;
   final double ceBid;
   final double ceAsk;
   final double peBid;
@@ -340,7 +255,6 @@ class StrikeRowSnapshot {
     required this.offset,
     required this.ceSecurityId,
     required this.peSecurityId,
-    this.lotSize = 75,
     required this.ceLtp,
     required this.peLtp,
     required this.ceOi,
@@ -360,8 +274,6 @@ class StrikeRowSnapshot {
     required this.ceGamma,
     required this.ceTheta,
     required this.ceVega,
-    this.ceVanna = 0.0,
-    this.ceCharm = 0.0,
     required this.ceBid,
     required this.ceAsk,
     required this.peBid,
@@ -377,10 +289,8 @@ class AiSignal {
   final UnderlyingIndex index;
   final String expiry;
   final int strike;
-  final String securityId;
   final SignalAction action;
   final double confidencePct;
-  final MarketRegimeState regimeState;
   final String htfOiReason;
   final List<String> reasons;
   final double entryPremium;
@@ -392,17 +302,14 @@ class AiSignal {
   final bool riskWithinLimits;
   final String riskNote;
   final String modelVersion;
-  final int ltpTimestampMs;
 
   const AiSignal({
     required this.timestampMs,
     required this.index,
     required this.expiry,
     required this.strike,
-    this.securityId = '',
     required this.action,
     required this.confidencePct,
-    this.regimeState = MarketRegimeState.choppyHighThetaTrap,
     required this.htfOiReason,
     required this.reasons,
     required this.entryPremium,
@@ -414,7 +321,6 @@ class AiSignal {
     required this.riskWithinLimits,
     required this.riskNote,
     required this.modelVersion,
-    this.ltpTimestampMs = 0,
   });
 
   Map<String, dynamic> toMap() => {
@@ -440,75 +346,59 @@ class AiSignal {
 
 class TradeOrder {
   final String orderId;
-  final String correlationId;
   final int timestampMs;
-  final String securityId;
   final String indexName;
   final String expiry;
   final int strike;
   final String optionType;
   final String side;
-  final int requestedQty;
-  final int filledQty;
-  final double avgFillPrice;
-  final OrderLifecycleState lifecycleState;
+  final int quantity;
+  final double price;
+  final String status;
   final String mode;
   final String reason;
 
   const TradeOrder({
     required this.orderId,
-    this.correlationId = '',
     required this.timestampMs,
-    this.securityId = '',
     required this.indexName,
     required this.expiry,
     required this.strike,
     required this.optionType,
     required this.side,
-    required this.requestedQty,
-    required this.filledQty,
-    required this.avgFillPrice,
-    required this.lifecycleState,
+    required this.quantity,
+    required this.price,
+    required this.status,
     required this.mode,
     required this.reason,
   });
 
-  int get quantity => filledQty > 0 ? filledQty : requestedQty;
-  double get price => avgFillPrice;
-  String get status => lifecycleState.label;
-
   Map<String, dynamic> toMap() => {
         'order_id': orderId,
-        'correlation_id': correlationId,
         'timestamp_ms': timestampMs,
-        'security_id': securityId,
         'index_name': indexName,
         'expiry': expiry,
         'strike': strike,
         'option_type': optionType,
         'side': side,
         'quantity': quantity,
-        'filled_qty': filledQty,
-        'price': avgFillPrice,
-        'status': lifecycleState.label,
+        'price': price,
+        'status': status,
         'mode': mode,
         'reason': reason,
       };
 
-  factory TradeOrder.fromMap(Map<String, dynamic> m) => TradeOrder(
+  factory TradeOrder.fromMap(Map m) => TradeOrder(
         orderId: m['order_id'] as String,
-        correlationId: (m['correlation_id'] ?? '') as String,
         timestampMs: m['timestamp_ms'] as int,
-        securityId: (m['security_id'] ?? '') as String,
         indexName: m['index_name'] as String,
         expiry: m['expiry'] as String,
         strike: m['strike'] as int,
         optionType: m['option_type'] as String,
         side: m['side'] as String,
-        requestedQty: m['quantity'] as int,
-        filledQty: (m['filled_qty'] ?? m['quantity']) as int,
-        avgFillPrice: (m['price'] as num).toDouble(),
-        lifecycleState: mapBrokerOrderStatus(m['status'] as String?),
+        quantity: (m['quantity'] as num).toInt(),
+        price: (m['price'] as num).toDouble(),
+        status: m['status'] as String,
         mode: m['mode'] as String,
         reason: m['reason'] as String,
       );
@@ -526,10 +416,7 @@ class PositionRecord {
   final double currentLtp;
   final double stopLossPrice;
   final double targetPrice;
-  final String? protectiveSlOrderId;
   final bool isOpen;
-  final bool exitFailed;
-  final String exitFailureNote;
   final String mode;
   final int openedAtMs;
   final int? closedAtMs;
@@ -547,10 +434,7 @@ class PositionRecord {
     required this.currentLtp,
     required this.stopLossPrice,
     required this.targetPrice,
-    this.protectiveSlOrderId,
     required this.isOpen,
-    this.exitFailed = false,
-    this.exitFailureNote = '',
     required this.mode,
     required this.openedAtMs,
     this.closedAtMs,
@@ -565,9 +449,6 @@ class PositionRecord {
   PositionRecord copyWith({
     double? currentLtp,
     bool? isOpen,
-    bool? exitFailed,
-    String? exitFailureNote,
-    String? protectiveSlOrderId,
     int? closedAtMs,
     double? realizedPnl,
   }) =>
@@ -583,10 +464,7 @@ class PositionRecord {
         currentLtp: currentLtp ?? this.currentLtp,
         stopLossPrice: stopLossPrice,
         targetPrice: targetPrice,
-        protectiveSlOrderId: protectiveSlOrderId ?? this.protectiveSlOrderId,
         isOpen: isOpen ?? this.isOpen,
-        exitFailed: exitFailed ?? this.exitFailed,
-        exitFailureNote: exitFailureNote ?? this.exitFailureNote,
         mode: mode,
         openedAtMs: openedAtMs,
         closedAtMs: closedAtMs ?? this.closedAtMs,
@@ -605,32 +483,26 @@ class PositionRecord {
         'current_ltp': currentLtp,
         'stop_loss_price': stopLossPrice,
         'target_price': targetPrice,
-        'protective_sl_order_id': protectiveSlOrderId,
         'is_open': isOpen ? 1 : 0,
-        'exit_failed': exitFailed ? 1 : 0,
-        'exit_failure_note': exitFailureNote,
         'mode': mode,
         'opened_at_ms': openedAtMs,
         'closed_at_ms': closedAtMs,
         'realized_pnl': realizedPnl,
       };
 
-  factory PositionRecord.fromMap(Map<String, dynamic> m) => PositionRecord(
+  factory PositionRecord.fromMap(Map m) => PositionRecord(
         positionId: m['position_id'] as String,
         securityId: m['security_id'] as String,
         indexName: m['index_name'] as String,
         expiry: m['expiry'] as String,
         strike: m['strike'] as int,
         optionType: m['option_type'] as String,
-        quantity: m['quantity'] as int,
+        quantity: (m['quantity'] as num).toInt(),
         avgEntryPrice: (m['avg_entry_price'] as num).toDouble(),
         currentLtp: (m['current_ltp'] as num).toDouble(),
         stopLossPrice: (m['stop_loss_price'] as num).toDouble(),
         targetPrice: (m['target_price'] as num).toDouble(),
-        protectiveSlOrderId: m['protective_sl_order_id'] as String?,
         isOpen: (m['is_open'] as int) == 1,
-        exitFailed: ((m['exit_failed'] ?? 0) as int) == 1,
-        exitFailureNote: (m['exit_failure_note'] ?? '') as String,
         mode: m['mode'] as String,
         openedAtMs: m['opened_at_ms'] as int,
         closedAtMs: m['closed_at_ms'] as int?,
@@ -643,10 +515,6 @@ class RiskConfig {
   final double maxDailyLossInr;
   final int maxConcurrentPositions;
   final double maxCapitalOutlayPct;
-  final int maxOrderQty;
-  final double maxOrderValueInr;
-  final int maxLtpAgeSeconds;
-  final bool enforceMarketHours;
   final bool killSwitchActive;
 
   const RiskConfig({
@@ -654,10 +522,6 @@ class RiskConfig {
     this.maxDailyLossInr = 2500.0,
     this.maxConcurrentPositions = 2,
     this.maxCapitalOutlayPct = 50.0,
-    this.maxOrderQty = 300,
-    this.maxOrderValueInr = 75000.0,
-    this.maxLtpAgeSeconds = 5,
-    this.enforceMarketHours = true,
     this.killSwitchActive = false,
   });
 
@@ -666,10 +530,6 @@ class RiskConfig {
     double? maxDailyLossInr,
     int? maxConcurrentPositions,
     double? maxCapitalOutlayPct,
-    int? maxOrderQty,
-    double? maxOrderValueInr,
-    int? maxLtpAgeSeconds,
-    bool? enforceMarketHours,
     bool? killSwitchActive,
   }) =>
       RiskConfig(
@@ -678,10 +538,6 @@ class RiskConfig {
         maxConcurrentPositions:
             maxConcurrentPositions ?? this.maxConcurrentPositions,
         maxCapitalOutlayPct: maxCapitalOutlayPct ?? this.maxCapitalOutlayPct,
-        maxOrderQty: maxOrderQty ?? this.maxOrderQty,
-        maxOrderValueInr: maxOrderValueInr ?? this.maxOrderValueInr,
-        maxLtpAgeSeconds: maxLtpAgeSeconds ?? this.maxLtpAgeSeconds,
-        enforceMarketHours: enforceMarketHours ?? this.enforceMarketHours,
         killSwitchActive: killSwitchActive ?? this.killSwitchActive,
       );
 }
