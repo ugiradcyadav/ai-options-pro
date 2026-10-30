@@ -24,6 +24,9 @@ class AppState extends ChangeNotifier {
     await AiRecalibrationEngine.instance.initialize();
     DhanDataEngine.instance.onDataUpdated = () {
       _refreshOperationalState();
+      if (latestSignal == null || latestSignal!.strike == 0) {
+        _evaluateLiveSignalForIndex(selectedIndex);
+      }
       notifyListeners();
     };
 
@@ -33,6 +36,9 @@ class AppState extends ChangeNotifier {
 
     await DhanDataEngine.instance.initializeAndStart();
     await _refreshOperationalState();
+      if (latestSignal == null || latestSignal!.strike == 0) {
+        _evaluateLiveSignalForIndex(selectedIndex);
+      }
     isInitialized = true;
     notifyListeners();
   }
@@ -41,6 +47,9 @@ class AppState extends ChangeNotifier {
     tradingMode = mode;
     notifyListeners();
     await _refreshOperationalState();
+      if (latestSignal == null || latestSignal!.strike == 0) {
+        _evaluateLiveSignalForIndex(selectedIndex);
+      }
   }
 
   Future<void> setSelectedUnderlying(UnderlyingIndex idx) async {
@@ -163,6 +172,9 @@ class AppState extends ChangeNotifier {
 
     await ForeverDatabase.instance.upsertPosition(position);
     await _refreshOperationalState();
+      if (latestSignal == null || latestSignal!.strike == 0) {
+        _evaluateLiveSignalForIndex(selectedIndex);
+      }
     return true;
   }
 
@@ -212,5 +224,8 @@ class AppState extends ChangeNotifier {
 
     await ForeverDatabase.instance.upsertPosition(closed);
     await _refreshOperationalState();
+      if (latestSignal == null || latestSignal!.strike == 0) {
+        _evaluateLiveSignalForIndex(selectedIndex);
+      }
   }
 }

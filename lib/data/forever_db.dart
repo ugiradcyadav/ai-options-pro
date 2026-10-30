@@ -1,4 +1,6 @@
+import 'dart:convert';
 import 'dart:io';
+import 'package:intl/intl.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 import '../core/models.dart';
@@ -12,129 +14,254 @@ class ForeverDatabase {
   Future<Database> get database async {
     if (_db != null) return _db!;
     final dbFolder = await getDatabasesPath();
-    final dbPath = p.join(dbFolder, 'ai_options_forever_v1.db');
+    final dbPath = p.join(dbFolder, 'ai_options_forever_v2.db');
     _db = await openDatabase(
       dbPath,
-      version: 1,
+      version: 2,
       onConfigure: (db) async {
         await db.rawQuery('PRAGMA journal_mode = WAL;');
         await db.rawQuery('PRAGMA synchronous = NORMAL;');
       },
       onCreate: (db, version) async {
-        await db.execute('''
-          CREATE TABLE bars_1m (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp_ms INTEGER NOT NULL,
-            index_name TEXT NOT NULL,
-            expiry TEXT NOT NULL,
-            strike INTEGER NOT NULL,
-            option_type TEXT NOT NULL,
-            strike_offset INTEGER NOT NULL,
-            underlying_spot REAL NOT NULL,
-            open REAL NOT NULL,
-            high REAL NOT NULL,
-            low REAL NOT NULL,
-            close REAL NOT NULL,
-            interval_volume INTEGER NOT NULL,
-            absolute_oi INTEGER NOT NULL,
-            oi_change_1m INTEGER NOT NULL,
-            oi_change_5m INTEGER NOT NULL,
-            oi_change_15m INTEGER NOT NULL,
-            oi_change_60m INTEGER NOT NULL,
-            iv REAL NOT NULL,
-            delta REAL NOT NULL,
-            gamma REAL NOT NULL,
-            theta REAL NOT NULL,
-            vega REAL NOT NULL,
-            spread_pct REAL NOT NULL,
-            ob_imbalance REAL NOT NULL,
-            next_3m_return REAL
-          );
-        ''');
-
-        await db.execute(
-          'CREATE INDEX idx_bars_lookup ON bars_1m(index_name, strike, option_type, timestamp_ms);',
-        );
-
-        await db.execute('''
-          CREATE TABLE signals_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp_ms INTEGER NOT NULL,
-            index_name TEXT NOT NULL,
-            expiry TEXT NOT NULL,
-            strike INTEGER NOT NULL,
-            action TEXT NOT NULL,
-            confidence_pct REAL NOT NULL,
-            htf_oi_reason TEXT NOT NULL,
-            reasons TEXT NOT NULL,
-            entry_premium REAL NOT NULL,
-            sl_premium REAL NOT NULL,
-            target_premium REAL NOT NULL,
-            lot_size INTEGER NOT NULL,
-            required_capital REAL NOT NULL,
-            available_capital REAL NOT NULL,
-            risk_ok INTEGER NOT NULL,
-            risk_note TEXT NOT NULL,
-            model_version TEXT NOT NULL
-          );
-        ''');
-
-        await db.execute('''
-          CREATE TABLE trade_orders (
-            order_id TEXT PRIMARY KEY,
-            timestamp_ms INTEGER NOT NULL,
-            index_name TEXT NOT NULL,
-            expiry TEXT NOT NULL,
-            strike INTEGER NOT NULL,
-            option_type TEXT NOT NULL,
-            side TEXT NOT NULL,
-            quantity INTEGER NOT NULL,
-            price REAL NOT NULL,
-            status TEXT NOT NULL,
-            mode TEXT NOT NULL,
-            reason TEXT NOT NULL
-          );
-        ''');
-
-        await db.execute('''
-          CREATE TABLE positions (
-            position_id TEXT PRIMARY KEY,
-            security_id TEXT NOT NULL,
-            index_name TEXT NOT NULL,
-            expiry TEXT NOT NULL,
-            strike INTEGER NOT NULL,
-            option_type TEXT NOT NULL,
-            quantity INTEGER NOT NULL,
-            avg_entry_price REAL NOT NULL,
-            current_ltp REAL NOT NULL,
-            stop_loss_price REAL NOT NULL,
-            target_price REAL NOT NULL,
-            is_open INTEGER NOT NULL,
-            mode TEXT NOT NULL,
-            opened_at_ms INTEGER NOT NULL,
-            closed_at_ms INTEGER,
-            realized_pnl REAL NOT NULL
-          );
-        ''');
-
-        await db.execute('''
-          CREATE TABLE saved_strategies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            index_name TEXT NOT NULL,
-            timeframe TEXT NOT NULL,
-            win_rate REAL NOT NULL,
-            net_pnl REAL NOT NULL,
-            last_run_ms INTEGER NOT NULL
-          );
-        ''');
+        await _createTables(db);
+      },
+      onUpgrade: (db, oldV, newV) async {
+        await _createTables(db);
       },
     );
     return _db!;
   }
 
-  /// Stores a newly closed 1-minute bar and backfills the `next_3m_return` on the bar from 3 minutes ago
-  /// so Monday 5-day self-recalibration has exact supervised labels ready with zero extra CPU pass.
+  Future<void> _createTables(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS bars_1m (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp_ms INTEGER NOT NULL,
+        index_name TEXT NOT NULL,
+        expiry TEXT NOT NULL,
+        strike INTEGER NOT NULL,
+        option_type TEXT NOT NULL,
+        strike_offset INTEGER NOT NULL,
+        underlying_spot REAL NOT NULL,
+        open REAL NOT NULL,
+        high REAL NOT NULL,
+        low REAL NOT NULL,
+        close REAL NOT NULL,
+        interval_volume INTEGER NOT NULL,
+        absolute_oi INTEGER NOT NULL,
+        oi_change_1m INTEGER NOT NULL,
+        oi_change_5m INTEGER NOT NULL,
+        oi_change_15m INTEGER NOT NULL,
+        oi_change_60m INTEGER NOT NULL,
+        iv REAL NOT NULL,
+        delta REAL NOT NULL,
+        gamma REAL NOT NULL,
+        theta REAL NOT NULL,
+        vega REAL NOT NULL,
+        spread_pct REAL NOT NULL,
+        ob_imbalance REAL NOT NULL,
+        next_3m_return REAL
+      );
+    ''');
+
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_bars_lookup ON bars_1m(index_name, strike, option_type, timestamp_ms);',
+    );
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS signals_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp_ms INTEGER NOT NULL,
+        index_name TEXT NOT NULL,
+        expiry TEXT NOT NULL,
+        strike INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        confidence_pct REAL NOT NULL,
+        htf_oi_reason TEXT NOT NULL,
+        reasons TEXT NOT NULL,
+        entry_premium REAL NOT NULL,
+        sl_premium REAL NOT NULL,
+        target_premium REAL NOT NULL,
+        lot_size INTEGER NOT NULL,
+        required_capital REAL NOT NULL,
+        available_capital REAL NOT NULL,
+        risk_ok INTEGER NOT NULL,
+        risk_note TEXT NOT NULL,
+        model_version TEXT NOT NULL
+      );
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS trade_orders (
+        order_id TEXT PRIMARY KEY,
+        correlation_id TEXT,
+        timestamp_ms INTEGER NOT NULL,
+        security_id TEXT,
+        index_name TEXT NOT NULL,
+        expiry TEXT NOT NULL,
+        strike INTEGER NOT NULL,
+        option_type TEXT NOT NULL,
+        side TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        filled_qty INTEGER NOT NULL,
+        price REAL NOT NULL,
+        status TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        reason TEXT NOT NULL
+      );
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS positions (
+        position_id TEXT PRIMARY KEY,
+        security_id TEXT NOT NULL,
+        index_name TEXT NOT NULL,
+        expiry TEXT NOT NULL,
+        strike INTEGER NOT NULL,
+        option_type TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        avg_entry_price REAL NOT NULL,
+        current_ltp REAL NOT NULL,
+        stop_loss_price REAL NOT NULL,
+        target_price REAL NOT NULL,
+        protective_sl_order_id TEXT,
+        is_open INTEGER NOT NULL,
+        exit_failed INTEGER DEFAULT 0,
+        exit_failure_note TEXT DEFAULT '',
+        mode TEXT NOT NULL,
+        opened_at_ms INTEGER NOT NULL,
+        closed_at_ms INTEGER,
+        realized_pnl REAL NOT NULL
+      );
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS saved_strategies (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        index_name TEXT NOT NULL,
+        timeframe TEXT NOT NULL,
+        win_rate REAL NOT NULL,
+        net_pnl REAL NOT NULL,
+        last_run_ms INTEGER NOT NULL
+      );
+    ''');
+
+    // T5: Persistent Risk State table (Kill switch & daily limits survive restart)
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS risk_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        kill_switch_active INTEGER NOT NULL DEFAULT 0,
+        max_daily_loss_inr REAL NOT NULL DEFAULT 2500.0,
+        max_concurrent_positions INTEGER NOT NULL DEFAULT 2,
+        updated_at_ms INTEGER NOT NULL
+      );
+    ''');
+
+    // T16: Append-only immutable Audit Log table
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp_ms INTEGER NOT NULL,
+        ist_time TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+      );
+    ''');
+  }
+
+  /// T16: Append-only audit writer
+  Future<void> appendAuditLog({
+    required String eventType,
+    required String mode,
+    required String summary,
+    required Map<String, dynamic> payload,
+  }) async {
+    final db = await database;
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final istNow = DateTime.now().toUtc().add(const Duration(hours: 5, minutes: 30));
+    final istStr = DateFormat('yyyy-MM-dd HH:mm:ss.SSS').format(istNow);
+    await db.insert('audit_log', {
+      'timestamp_ms': nowMs,
+      'ist_time': istStr,
+      'event_type': eventType,
+      'mode': mode,
+      'summary': summary,
+      'payload_json': jsonEncode(payload),
+    });
+  }
+
+  Future<List> getAuditLogs({int limit = 100}) async {
+    final db = await database;
+    return db.query('audit_log', orderBy: 'id DESC', limit: limit);
+  }
+
+  Future<String> exportAuditLogJson() async {
+    final rows = await getAuditLogs(limit: 500);
+    return const JsonEncoder.withIndent('  ').convert(rows);
+  }
+
+  /// T5.1: Load persisted RiskConfig including Kill Switch state
+  Future<RiskConfig> loadPersistedRiskConfig() async {
+    final db = await database;
+    final rows = await db.query('risk_state', where: 'id = 1', limit: 1);
+    if (rows.isEmpty) {
+      return const RiskConfig();
+    }
+    final r = rows.first;
+    return RiskConfig(
+      killSwitchActive: ((r['kill_switch_active'] ?? 0) as int) == 1,
+      maxDailyLossInr: ((r['max_daily_loss_inr'] ?? 2500.0) as num).toDouble(),
+      maxConcurrentPositions:
+          ((r['max_concurrent_positions'] ?? 2) as num).toInt(),
+    );
+  }
+
+  /// T5.1: Save Kill Switch and Risk Limits persistently
+  Future<void> savePersistedRiskConfig(RiskConfig cfg) async {
+    final db = await database;
+    await db.insert(
+      'risk_state',
+      {
+        'id': 1,
+        'kill_switch_active': cfg.killSwitchActive ? 1 : 0,
+        'max_daily_loss_inr': cfg.maxDailyLossInr,
+        'max_concurrent_positions': cfg.maxConcurrentPositions,
+        'updated_at_ms': DateTime.now().millisecondsSinceEpoch,
+      },
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  /// T5.2: Compute today's net realized P&L (wins + losses) from closed positions keyed to IST trading date
+  Future<double> computeTodayNetRealizedPnlIst({String? mode}) async {
+    final db = await database;
+    final istNow = DateTime.now().toUtc().add(const Duration(hours: 5, minutes: 30));
+    final istMidnightUtc = DateTime.utc(istNow.year, istNow.month, istNow.day)
+        .subtract(const Duration(hours: 5, minutes: 30));
+    final startOfIstDayMs = istMidnightUtc.millisecondsSinceEpoch;
+
+    final whereClause = mode != null
+        ? 'is_open = 0 AND closed_at_ms >= ? AND mode = ?'
+        : 'is_open = 0 AND closed_at_ms >= ?';
+    final args = mode != null ? [startOfIstDayMs, mode] : [startOfIstDayMs];
+
+    final rows = await db.query(
+      'positions',
+      columns: ['realized_pnl'],
+      where: whereClause,
+      whereArgs: args,
+    );
+
+    double netPnl = 0.0;
+    for (final r in rows) {
+      netPnl += ((r['realized_pnl'] ?? 0.0) as num).toDouble();
+    }
+    return netPnl;
+  }
+
   Future<void> insertOneMinBar(OneMinEnrichedBar bar) async {
     final db = await database;
     await db.transaction((txn) async {
@@ -173,7 +300,6 @@ class ForeverDatabase {
     });
   }
 
-  /// Fetches recent 1m bars for charting, strike comparison, or backtesting
   Future<List<OneMinEnrichedBar>> getRecentBars({
     required String indexName,
     int? strike,
@@ -203,7 +329,6 @@ class ForeverDatabase {
     return rows.reversed.map(OneMinEnrichedBar.fromMap).toList();
   }
 
-  /// Fetches the last 5 trading days of labeled 1m bars for Monday Self-Recalibration
   Future<List<OneMinEnrichedBar>> getFiveDayRecalibrationDataset() async {
     final db = await database;
     final cutoffMs =
@@ -223,7 +348,7 @@ class ForeverDatabase {
     await db.insert('signals_log', signal.toMap());
   }
 
-  Future<List<Map<String, dynamic>>> getRecentSignals({int limit = 30}) async {
+  Future<List> getRecentSignals({int limit = 30}) async {
     final db = await database;
     return db.query('signals_log', orderBy: 'timestamp_ms DESC', limit: limit);
   }
@@ -296,14 +421,14 @@ class ForeverDatabase {
     });
   }
 
-  Future<List<Map<String, dynamic>>> getSavedStrategies() async {
+  Future<List> getSavedStrategies() async {
     final db = await database;
     return db.query('saved_strategies', orderBy: 'last_run_ms DESC', limit: 20);
   }
 
   Future<double> getDatabaseSizeMb() async {
     final dbFolder = await getDatabasesPath();
-    final file = File(p.join(dbFolder, 'ai_options_forever_v1.db'));
+    final file = File(p.join(dbFolder, 'ai_options_forever_v2.db'));
     if (!await file.exists()) return 0.1;
     final bytes = await file.length();
     return bytes / (1024.0 * 1024.0);

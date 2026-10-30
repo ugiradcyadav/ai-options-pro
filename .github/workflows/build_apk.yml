@@ -28,20 +28,26 @@ jobs:
         run: |
           cp pubspec.yaml pubspec.yaml.bak
           cp -r lib lib_bak
+          cp -r test test_bak
           flutter create --platforms=android --project-name ai_options_pro --org com.aioptionspro.trading .
           cp pubspec.yaml.bak pubspec.yaml
           cp -r lib_bak/* lib/
-          rm -rf pubspec.yaml.bak lib_bak test
-          
-          # Inject Internet Permission
+          rm -rf test && mv test_bak test
+          rm -rf pubspec.yaml.bak lib_bak
           sed -i '/<application/i <uses-permission android:name="android.permission.INTERNET"/>' android/app/src/main/AndroidManifest.xml
-          
-          # Upgrade Kotlin version in settings.gradle to satisfy Gradle build
           sed -i 's/kotlin-version = ".*"/kotlin-version = "1.8.22"/g' android/settings.gradle || true
           sed -i 's/id "org.jetbrains.kotlin.android" version ".*"/id "org.jetbrains.kotlin.android" version "1.8.22"/g' android/settings.gradle || true
 
-      - name: Install Dependencies
-        run: flutter pub get
+      - name: Install Dependencies & Run T1-T6 Acceptance Tests
+        run: |
+          flutter pub get
+          flutter test test/acceptance_test.dart
+
+      - name: Generate & Verify Restorable Release Keystore Backup
+        run: |
+          keytool -genkey -v -keystore release-keystore.jks -keyalg RSA -keysize 2048 -validity 10000 -alias aioptionspro -storepass AiOptions2026 -keypass AiOptions2026 -dname "CN=AIOptionsPro, OU=Trading, O=AIOptionsPro, L=Delhi, S=Delhi, C=IN"
+          cp release-keystore.jks release-keystore-backup.jks
+          keytool -list -v -keystore release-keystore-backup.jks -storepass AiOptions2026
 
       - name: Build Compressed arm64 Release APK
         run: flutter build apk --release --target-platform android-arm64 --split-per-abi
