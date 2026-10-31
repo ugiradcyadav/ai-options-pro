@@ -8,9 +8,9 @@ import 'strike_selector.dart';
 class LiveMarketSnapshotResult {
   final double spotPrice;
   final double changePct;
-  final List<String> expiries;
+  final List expiries;
   final String activeExpiry;
-  final List<StrikeRowSnapshot> rows;
+  final List rows;
 
   const LiveMarketSnapshotResult({
     required this.spotPrice,
@@ -33,7 +33,22 @@ class LiveNseBridge {
         if (_nseCookie.isNotEmpty) 'Cookie': _nseCookie,
       };
 
-  /// Converts NSE date '03-Nov-2026' -> '2026-11-03'
+  static Future<double> fetchIndiaVix() async {
+    try {
+      final resp = await http
+          .get(Uri.parse(
+              'https://query1.finance.yahoo.com/v8/finance/chart/%5EINDIAVIX?interval=1m&range=1d'))
+          .timeout(const Duration(seconds: 6));
+      if (resp.statusCode == 200) {
+        final body = jsonDecode(resp.body);
+        final meta = body['chart']?['result']?[0]?['meta'];
+        final vix = (meta?['regularMarketPrice'] as num?)?.toDouble() ?? 0.0;
+        if (vix > 6.0 && vix < 60.0) return vix;
+      }
+    } catch (_) {}
+    return 14.6;
+  }
+
   static String nseDateToIso(String nseDate) {
     try {
       final dt = DateFormat('dd-MMM-yyyy').parse(nseDate.trim());
@@ -43,7 +58,6 @@ class LiveNseBridge {
     }
   }
 
-  /// Converts ISO date '2026-11-03' -> '03-Nov-2026'
   static String isoToNseDate(String isoDate) {
     try {
       final dt = DateFormat('yyyy-MM-dd').parse(isoDate.trim());
@@ -53,13 +67,11 @@ class LiveNseBridge {
     }
   }
 
-  /// Computes real SEBI Tuesday/Monthly expiries (e.g. 2026-11-03) if offline
   static List<String> computeUpcomingExpiries(UnderlyingIndex index) {
     final now = DateTime.now();
     final List<String> list = [];
     DateTime cursor = DateTime(now.year, now.month, now.day);
     while (list.length < 5) {
-      // Current NSE weekly index expiry schedule includes Tuesday (03 Nov)
       if (cursor.weekday == DateTime.tuesday ||
           cursor.weekday == DateTime.thursday) {
         list.add(DateFormat('yyyy-MM-dd').format(cursor));
@@ -87,7 +99,17 @@ class LiveNseBridge {
     } catch (_) {}
   }
 
-  /// Pulls 100% genuine Option Chain from NSE India Official API (matches Dhan LTP & OI)
+  static Future<LiveMarketSnapshotResult?> fetchRealSnapshot({
+    required UnderlyingIndex index,
+    required String expiry,
+    double indiaVix = 14.6,
+  }) async {
+    return fetchRealNseOptionChain(
+      index: index,
+      requestedIsoExpiry: expiry.isNotEmpty ? expiry : null,
+    );
+  }
+
   static Future<LiveMarketSnapshotResult?> fetchRealNseOptionChain({
     required UnderlyingIndex index,
     String? requestedIsoExpiry,
@@ -121,7 +143,7 @@ class LiveNseBridge {
       if (spot <= 0) return null;
 
       final rawExpList = records['expiryDates'] as List? ?? [];
-      final isoExpiries =
+      final List<String> isoExpiries =
           rawExpList.map((e) => nseDateToIso(e.toString())).toList();
       if (isoExpiries.isEmpty) return null;
 
@@ -132,15 +154,13 @@ class LiveNseBridge {
       final targetNseExp = isoToNseDate(chosenIso);
 
       final allData = records['data'] as List? ?? [];
-      final Map<int, Map> strikeMap = {};
+      final Map strikeMap = {};
       for (final item in allData) {
         if (item is Map) {
           final expStr = (item['expiryDate'] ?? '').toString();
           final sp = ((item['strikePrice'] ?? 0) as num).toInt();
-          if (sp > 0 && (expStr == targetNseExp || strikeMap[sp] == null)) {
-            if (expStr == targetNseExp) {
-              strikeMap[sp] = item;
-            }
+          if (sp > 0 && expStr == targetNseExp) {
+            strikeMap[sp] = item;
           }
         }
       }
@@ -155,7 +175,7 @@ class LiveNseBridge {
 
       for (final strike in strikeBand) {
         final offset = (strike - atmStrike) ~/ step;
-        final node = strikeMap[strike];
+        final node = strikeMap[strike] as Map?;
         if (node == null) continue;
 
         final ce = node['CE'] as Map? ?? {};
@@ -164,13 +184,11 @@ class LiveNseBridge {
         final ceLtp = ((ce['lastPrice'] ?? 0) as num).toDouble();
         final peLtp = ((pe['lastPrice'] ?? 0) as num).toDouble();
 
-        // Note: NSE API reports OI in contracts/shares; convert to exact shares matching Dhan
         final rawCeOi = ((ce['openInterest'] ?? 0) as num).toInt();
         final rawPeOi = ((pe['openInterest'] ?? 0) as num).toInt();
         final rawCeChg = ((ce['changeinOpenInterest'] ?? 0) as num).toInt();
         final rawPeChg = ((pe['changeinOpenInterest'] ?? 0) as num).toInt();
 
-        // Scale to shares if NSE returns lots (Dhan displaysOI in shares e.g. 35,06,815)
         final lotMultiplier = rawCeOi < 200000 ? index.defaultLotSize : 1;
         final ceOi = rawCeOi * lotMultiplier;
         final peOi = rawPeOi * lotMultiplier;

@@ -196,9 +196,9 @@ class DhanDataEngine {
     if (nseSnap != null && nseSnap.rows.isNotEmpty) {
       spotPrices[index] = nseSnap.spotPrice;
       spotChangePct[index] = nseSnap.changePct;
-      availableExpiries[index] = nseSnap.expiries;
+      availableExpiries[index] = List<String>.from(nseSnap.expiries);
       selectedExpiry[index] = nseSnap.activeExpiry;
-      optionChainRows[index] = nseSnap.rows;
+      optionChainRows[index] = List<StrikeRowSnapshot>.from(nseSnap.rows);
       final t1 = DateTime.now().millisecondsSinceEpoch;
       dataDelaySec = ((t1 - t0) / 1000.0).clamp(0.08, 2.5);
       lastSyncTimestampMs = t1;
