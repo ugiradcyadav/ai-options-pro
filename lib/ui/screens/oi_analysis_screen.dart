@@ -1,6 +1,6 @@
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart';
+import 'package:intl/intl.dart' hide TextDirection;
 import '../../core/models.dart';
 import '../../data/dhan_data_engine.dart';
 import '../../data/forever_db.dart';
