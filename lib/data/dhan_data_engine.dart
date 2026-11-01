@@ -175,7 +175,7 @@ class DhanDataEngine {
 
     final fallback = LiveNseBridge.computeUpcomingExpiries(index);
     if ((availableExpiries[index] ?? []).isEmpty) {
-      availableExpiries[index] = fallback;
+      availableExpiries[index] = fallback.map((e) => e.toString()).toList();
     }
     if ((selectedExpiry[index] ?? '').isEmpty) {
       selectedExpiry[index] = availableExpiries[index]!.first;
@@ -196,7 +196,7 @@ class DhanDataEngine {
     if (nseSnap != null && nseSnap.rows.isNotEmpty) {
       spotPrices[index] = nseSnap.spotPrice;
       spotChangePct[index] = nseSnap.changePct;
-      availableExpiries[index] = List<String>.from(nseSnap.expiries);
+      availableExpiries[index] = nseSnap.expiries.map((e) => e.toString()).toList();
       selectedExpiry[index] = nseSnap.activeExpiry;
       optionChainRows[index] = List<StrikeRowSnapshot>.from(nseSnap.rows);
       final t1 = DateTime.now().millisecondsSinceEpoch;
