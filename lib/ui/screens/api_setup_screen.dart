@@ -128,7 +128,7 @@ class _ApiSetupScreenState extends State<ApiSetupScreen> {
       await TotpAuthManager.ensureValidSession(forceRefresh: true);
     }
 
-    await DhanDataEngine.instance.initializeAndStart();
+    DhanDataEngine.instance.initializeAndStart();
     if (!mounted) return;
 
     setState(() {
@@ -138,7 +138,7 @@ class _ApiSetupScreenState extends State<ApiSetupScreen> {
     });
 
     widget.onConnectedSuccess();
-    if (mounted && widget.isFirstLaunch) {
+    if (mounted) {
       Navigator.of(context).pushReplacement(
         MaterialPageRoute(
           builder: (_) => MainTerminalShell(appState: globalAppState),

@@ -139,7 +139,7 @@ class LiveNseBridge {
       if (_nseCookie.isEmpty) {
         final h = await http
             .get(Uri.parse('https://www.nseindia.com/option-chain'),
-                headers: Map.from(_nseHeaders))
+                headers: Map<String, String>.from(_nseHeaders))
             .timeout(const Duration(seconds: 4));
         final rawCookie = h.headers['set-cookie'] ?? '';
         if (rawCookie.isNotEmpty) {
@@ -163,7 +163,7 @@ class LiveNseBridge {
           .get(
             Uri.parse(
                 'https://www.nseindia.com/api/option-chain-indices?symbol=${index.dhanSymbol}'),
-            headers: Map.from(_nseHeaders),
+            headers: Map<String, String>.from(_nseHeaders),
           )
           .timeout(const Duration(seconds: 5));
 

@@ -11,7 +11,7 @@ class AngelSmartApiEngine {
   static final AngelSmartApiEngine instance = AngelSmartApiEngine._();
   AngelSmartApiEngine._();
 
-  static const _kBrokerChoice = 'selected_broker_v1'; // 'ANGEL' or 'DHAN'
+  static const _kBrokerChoice = 'selected_broker_v1';
   static const _kAngelApiKey = 'angel_api_key_v1';
   static const _kAngelClientCode = 'angel_client_code_v1';
   static const _kAngelPin = 'angel_pin_v1';
@@ -27,12 +27,9 @@ class AngelSmartApiEngine {
   String feedToken = '';
   String lastError = '';
 
-  // Cached NFO option token directory: key = "NIFTY_2026-11-03_23050_CE" -> token
-  final Map _nfoTokenMap = {};
-  final Map _indexExpiries = {};
-  bool _scripMasterLoaded = false;
+  final Map _nfoTokenCache = {};
 
-  Future loadSavedConfig() async {
+  Future<void> loadSavedConfig() async {
     final prefs = await SharedPreferences.getInstance();
     apiKey = prefs.getString(_kAngelApiKey) ?? '';
     clientCode = prefs.getString(_kAngelClientCode) ?? '';
@@ -42,12 +39,12 @@ class AngelSmartApiEngine {
     feedToken = prefs.getString(_kAngelFeedToken) ?? '';
   }
 
-  static Future getSelectedBroker() async {
+  static Future<String> getSelectedBroker() async {
     final prefs = await SharedPreferences.getInstance();
     return prefs.getString(_kBrokerChoice) ?? 'ANGEL';
   }
 
-  static Future setSelectedBroker(String broker) async {
+  static Future<void> setSelectedBroker(String broker) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_kBrokerChoice, broker);
   }
@@ -58,20 +55,24 @@ class AngelSmartApiEngine {
       pin.trim().isNotEmpty &&
       totpSecret.trim().isNotEmpty;
 
-  Map get _headers => {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'X-UserType': 'USER',
-        'X-SourceID': 'WEB',
-        'X-ClientLocalIP': '192.168.1.1',
-        'X-ClientPublicIP': '106.193.147.98',
-        'X-MACAddress': '02:00:00:00:00:00',
-        'X-PrivateKey': apiKey.trim(),
-        if (jwtToken.isNotEmpty) 'Authorization': 'Bearer $jwtToken',
-      };
+  Map<String, String> _buildHeaders() {
+    final h = <String, String>{
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'X-UserType': 'USER',
+      'X-SourceID': 'WEB',
+      'X-ClientLocalIP': '192.168.1.1',
+      'X-ClientPublicIP': '106.193.147.98',
+      'X-MACAddress': '02:00:00:00:00:00',
+      'X-PrivateKey': apiKey.trim(),
+    };
+    if (jwtToken.isNotEmpty) {
+      h['Authorization'] = 'Bearer $jwtToken';
+    }
+    return h;
+  }
 
-  /// Authenticates with Angel One SmartAPI using ClientCode + PIN + TOTP (100% Free)
-  Future loginAndSave({
+  Future<bool> loginAndSave({
     required String newApiKey,
     required String newClientCode,
     required String newPin,
@@ -93,7 +94,7 @@ class AngelSmartApiEngine {
     return ensureSession(forceLogin: true);
   }
 
-  Future ensureSession({bool forceLogin = false}) async {
+  Future<bool> ensureSession({bool forceLogin = false}) async {
     await loadSavedConfig();
     if (!isConfigured) {
       lastError = 'Angel One credentials not configured.';
@@ -109,7 +110,7 @@ class AngelSmartApiEngine {
           .post(
             Uri.parse(
                 'https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword'),
-            headers: Map.from(_headers),
+            headers: _buildHeaders(),
             body: jsonEncode({
               'clientcode': clientCode,
               'password': pin,
@@ -120,7 +121,7 @@ class AngelSmartApiEngine {
 
       if (resp.statusCode == 200) {
         final body = jsonDecode(resp.body);
-        if (body['status'] == true && body['data'] != null) {
+        if (body is Map && body['status'] == true && body['data'] != null) {
           jwtToken = (body['data']['jwtToken'] ?? '').toString();
           feedToken = (body['data']['feedToken'] ?? '').toString();
           final prefs = await SharedPreferences.getInstance();
@@ -130,31 +131,31 @@ class AngelSmartApiEngine {
           return true;
         }
         lastError =
-            'Angel Login Rejected: ${body['message'] ?? resp.body}';
+            'Angel One Login Error: ${body['message'] ?? body['errorcode'] ?? resp.body}';
         return false;
       }
       lastError = 'Angel HTTP ${resp.statusCode}: ${resp.body}';
       return false;
     } catch (e) {
-      lastError = 'Angel Network Error: $e';
+      lastError = 'Angel Connection Error: $e';
       return false;
     }
   }
 
-  /// Fetches available cash balance from Angel One RMS Limit API
-  Future fetchRmsCapital() async {
+  Future<double?> fetchRmsCapital() async {
     try {
       final resp = await http
           .get(
             Uri.parse(
                 'https://apiconnect.angelone.in/rest/secure/angelbroking/user/v1/getRMS'),
-            headers: Map.from(_headers),
+            headers: _buildHeaders(),
           )
-          .timeout(const Duration(seconds: 7));
+          .timeout(const Duration(seconds: 6));
       if (resp.statusCode == 200) {
         final body = jsonDecode(resp.body);
-        if (body['status'] == true && body['data'] != null) {
-          final net = body['data']['net'] ?? body['data']['availablecash'] ?? '0';
+        if (body is Map && body['status'] == true && body['data'] != null) {
+          final net =
+              body['data']['net'] ?? body['data']['availablecash'] ?? '0';
           return double.tryParse(net.toString()) ?? 0.0;
         }
       }
@@ -165,15 +166,62 @@ class AngelSmartApiEngine {
   String _indexTokenForAngel(UnderlyingIndex index) {
     switch (index) {
       case UnderlyingIndex.nifty50:
-        return '99926000'; // Nifty 50 NSE token
+        return '99926000';
       case UnderlyingIndex.bankNifty:
-        return '99926009'; // Nifty Bank NSE token
+        return '99926009';
       case UnderlyingIndex.finNifty:
-        return '99926037'; // Nifty Fin Service NSE token
+        return '99926037';
     }
   }
 
-  /// Fetches live index spot & option chain quotes via Angel One Market Data Quote API (FULL mode)
+  /// Resolves a single strike's CE & PE tokens in <200ms using Angel's lightweight searchScrip API (no 45MB file!)
+  Future<void> _resolveStrikeTokensViaSearch(
+    UnderlyingIndex index,
+    String expiryIso,
+    int strike,
+  ) async {
+    final ceKey = '${index.dhanSymbol}_${expiryIso}_${strike}_CE';
+    final peKey = '${index.dhanSymbol}_${expiryIso}_${strike}_PE';
+    if (_nfoTokenCache.containsKey(ceKey) &&
+        _nfoTokenCache.containsKey(peKey)) {
+      return;
+    }
+
+    try {
+      final dt = DateFormat('yyyy-MM-dd').parse(expiryIso);
+      final ddMmmYy = DateFormat('ddMMMyy').format(dt).toUpperCase();
+      final searchStr = '${index.dhanSymbol}$ddMmmYy$strike';
+
+      final resp = await http
+          .post(
+            Uri.parse(
+                'https://apiconnect.angelone.in/rest/secure/angelbroking/order/v1/searchScrip'),
+            headers: _buildHeaders(),
+            body: jsonEncode({
+              'exchange': 'NFO',
+              'searchscrip': searchStr,
+            }),
+          )
+          .timeout(const Duration(seconds: 4));
+
+      if (resp.statusCode == 200) {
+        final body = jsonDecode(resp.body);
+        final dataList = body['data'] as List? ?? [];
+        for (final item in dataList) {
+          if (item is Map) {
+            final ts = (item['tradingsymbol'] ?? '').toString().toUpperCase();
+            final tok = (item['symboltoken'] ?? '').toString();
+            if (ts.endsWith('${strike}CE') && tok.isNotEmpty) {
+              _nfoTokenCache[ceKey] = tok;
+            } else if (ts.endsWith('${strike}PE') && tok.isNotEmpty) {
+              _nfoTokenCache[peKey] = tok;
+            }
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
   Future fetchLiveSpotAndChain({
     required UnderlyingIndex index,
     required String expiryIso,
@@ -183,7 +231,6 @@ class AngelSmartApiEngine {
       if (!ok) return null;
     }
 
-    // 1. Fetch Live Underlying Index Spot from Angel One NSE Quote API
     double spot = 0.0;
     double changePct = 0.0;
     try {
@@ -192,7 +239,7 @@ class AngelSmartApiEngine {
           .post(
             Uri.parse(
                 'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/'),
-            headers: Map.from(_headers),
+            headers: _buildHeaders(),
             body: jsonEncode({
               'mode': 'FULL',
               'exchangeTokens': {
@@ -200,7 +247,7 @@ class AngelSmartApiEngine {
               }
             }),
           )
-          .timeout(const Duration(seconds: 6));
+          .timeout(const Duration(seconds: 5));
 
       if (spotResp.statusCode == 200) {
         final body = jsonDecode(spotResp.body);
@@ -215,8 +262,6 @@ class AngelSmartApiEngine {
 
     if (spot <= 0) return null;
 
-    // 2. Ensure NFO Option Tokens are loaded for ATM-2..ATM+2 strikes
-    await _ensureOptionTokensLoaded(index);
     final band = StrikeSelectionEngine.getMonitoringStrikeBand(index, spot);
     final atm = StrikeSelectionEngine.computeAtmStrike(index, spot);
     final step = index.strikeStep;
@@ -225,9 +270,10 @@ class AngelSmartApiEngine {
     final List nfoTokensToQuery = [];
     final Map tokenToStrikeKey = {};
     for (final strike in band) {
+      await _resolveStrikeTokensViaSearch(index, expiryIso, strike);
       for (final opt in ['CE', 'PE']) {
         final k = '${index.dhanSymbol}_${expiryIso}_${strike}_$opt';
-        final tok = _nfoTokenMap[k]?.toString() ?? '';
+        final tok = _nfoTokenCache[k]?.toString() ?? '';
         if (tok.isNotEmpty) {
           nfoTokensToQuery.add(tok);
           tokenToStrikeKey[tok] = '${strike}_$opt';
@@ -235,36 +281,36 @@ class AngelSmartApiEngine {
       }
     }
 
-    final Map quoteByStrikeOpt = {};
-    if (nfoTokensToQuery.isNotEmpty) {
-      try {
-        final qResp = await http
-            .post(
-              Uri.parse(
-                  'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/'),
-              headers: Map.from(_headers),
-              body: jsonEncode({
-                'mode': 'FULL',
-                'exchangeTokens': {'NFO': nfoTokensToQuery}
-              }),
-            )
-            .timeout(const Duration(seconds: 7));
+    if (nfoTokensToQuery.isEmpty) return null;
 
-        if (qResp.statusCode == 200) {
-          final qBody = jsonDecode(qResp.body);
-          final fetched = qBody['data']?['fetched'] as List? ?? [];
-          for (final f in fetched) {
-            if (f is Map) {
-              final tok = (f['symbolToken'] ?? '').toString();
-              final sk = tokenToStrikeKey[tok];
-              if (sk != null) {
-                quoteByStrikeOpt[sk] = f;
-              }
+    final Map quoteByStrikeOpt = {};
+    try {
+      final qResp = await http
+          .post(
+            Uri.parse(
+                'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/'),
+            headers: _buildHeaders(),
+            body: jsonEncode({
+              'mode': 'FULL',
+              'exchangeTokens': {'NFO': nfoTokensToQuery}
+            }),
+          )
+          .timeout(const Duration(seconds: 6));
+
+      if (qResp.statusCode == 200) {
+        final qBody = jsonDecode(qResp.body);
+        final fetched = qBody['data']?['fetched'] as List? ?? [];
+        for (final f in fetched) {
+          if (f is Map) {
+            final tok = (f['symbolToken'] ?? '').toString();
+            final sk = tokenToStrikeKey[tok];
+            if (sk != null) {
+              quoteByStrikeOpt[sk] = f;
             }
           }
         }
-      } catch (_) {}
-    }
+      }
+    } catch (_) {}
 
     if (quoteByStrikeOpt.isEmpty) return null;
 
@@ -276,6 +322,8 @@ class AngelSmartApiEngine {
 
       final ceLtp = ((ceQ['ltp'] ?? 0) as num).toDouble();
       final peLtp = ((peQ['ltp'] ?? 0) as num).toDouble();
+      if (ceLtp <= 0 && peLtp <= 0) continue;
+
       final ceOi = ((ceQ['opnInterest'] ?? 0) as num).toInt();
       final peOi = ((peQ['opnInterest'] ?? 0) as num).toInt();
       final ceVol = ((ceQ['tradeVolume'] ?? 0) as num).toInt();
@@ -336,59 +384,12 @@ class AngelSmartApiEngine {
       );
     }
 
+    if (rows.isEmpty) return null;
+
     return {
       'spot': spot,
       'changePct': changePct,
       'rows': rows,
     };
-  }
-
-  Future _ensureOptionTokensLoaded(UnderlyingIndex index) async {
-    if (_scripMasterLoaded) return;
-    try {
-      final resp = await http
-          .get(Uri.parse(
-              'https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json'))
-          .timeout(const Duration(seconds: 12));
-      if (resp.statusCode == 200) {
-        final list = jsonDecode(resp.body) as List;
-        for (final item in list) {
-          if (item is Map &&
-              item['exch_seg'] == 'NFO' &&
-              item['instrumenttype'] == 'OPTIDX') {
-            final name = (item['name'] ?? '').toString();
-            if (name == 'NIFTY' || name == 'BANKNIFTY' || name == 'FINNIFTY') {
-              final rawExp = (item['expiry'] ?? '').toString(); // e.g. 03NOV2026
-              final sym = (item['symbol'] ?? '').toString();
-              final tok = (item['token'] ?? '').toString();
-              final strikeRaw =
-                  (((double.tryParse((item['strike'] ?? '0').toString()) ?? 0) /
-                          100.0))
-                      .round();
-              final optType = sym.endsWith('CE') ? 'CE' : 'PE';
-              final isoExp = _parseAngelExpiry(rawExp);
-              if (isoExp.isNotEmpty && strikeRaw > 0) {
-                _nfoTokenMap['${name}_${isoExp}_${strikeRaw}_$optType'] = tok;
-              }
-            }
-          }
-        }
-        _scripMasterLoaded = true;
-      }
-    } catch (_) {}
-  }
-
-  String _parseAngelExpiry(String raw) {
-    try {
-      final dt = DateFormat('ddMMMyyyy').parse(
-        raw.substring(0, 2) +
-            raw.substring(2, 3).toUpperCase() +
-            raw.substring(3, 5).toLowerCase() +
-            raw.substring(5),
-      );
-      return DateFormat('yyyy-MM-dd').format(dt);
-    } catch (_) {
-      return '';
-    }
   }
 }

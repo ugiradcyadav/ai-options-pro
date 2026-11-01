@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'core/totp_auth.dart';
+import 'data/angel_smartapi_engine.dart';
 import 'state/app_state.dart';
 import 'ui/screens/api_setup_screen.dart';
 import 'ui/screens/backtest_screen.dart';
@@ -37,6 +38,7 @@ class _AiOptionsProAppState extends State<AiOptionsProApp> {
 
   Future<void> _checkFirstLaunchGate() async {
     try {
+      await AngelSmartApiEngine.instance.loadSavedConfig();
       final creds = await TotpAuthManager.loadCredentials();
       if (!creds.isConfigured) {
         if (mounted) {
