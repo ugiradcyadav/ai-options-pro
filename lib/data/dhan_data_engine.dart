@@ -7,6 +7,7 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 import '../core/models.dart';
 import '../core/totp_auth.dart';
 import '../engine/math_greeks.dart';
+import 'angel_smartapi_engine.dart';
 import 'forever_db.dart';
 import 'live_nse_bridge.dart';
 import 'strike_selector.dart';
@@ -21,7 +22,7 @@ class DhanDataEngine {
 
   bool isConnected = false;
   int lastSyncTimestampMs = 0;
-  double dataDelaySec = 0.22;
+  double dataDelaySec = 0.20;
   int missingDataCount = 0;
   int reconciliationMismatches = 0;
   String lastAuditStatus = 'Reconciled (0 mismatches)';
@@ -72,25 +73,46 @@ class DhanDataEngine {
       };
 
   Future<bool> initializeAndStart() async {
+    final activeBroker = await AngelSmartApiEngine.getSelectedBroker();
+    await AngelSmartApiEngine.instance.loadSavedConfig();
+
+    if (activeBroker == 'ANGEL' && AngelSmartApiEngine.instance.isConfigured) {
+      final angelOk = await AngelSmartApiEngine.instance.ensureSession();
+      if (angelOk) {
+        final rms = await AngelSmartApiEngine.instance.fetchRmsCapital();
+        if (rms != null) availableTradingCapital = rms;
+        isConnected = true;
+        connectionStatusText = 'Angel One Live Connected';
+        lastSyncTimestampMs = DateTime.now().millisecondsSinceEpoch;
+        onDataUpdated?.call();
+
+        await fetchOptionChainSnapshot(UnderlyingIndex.nifty50);
+        onDataUpdated?.call();
+        unawaited(_syncRemainingIndices());
+        _startSynchronizedChainPoller();
+        return true;
+      }
+    }
+
     _credentials = await TotpAuthManager.ensureValidSession();
     if (_credentials == null || !_credentials!.isConfigured) {
-      isConnected = false;
-      connectionStatusText = 'API Credentials Required';
-      onDataUpdated?.call();
-      return false;
+      if (!AngelSmartApiEngine.instance.isConfigured) {
+        isConnected = false;
+        connectionStatusText = 'API Credentials Required';
+        onDataUpdated?.call();
+        return false;
+      }
     }
 
     final valid = await fetchFundLimits();
     isConnected = true;
-    connectionStatusText = valid ? 'Dhan Connected' : 'Dhan Auth Active';
+    connectionStatusText = valid ? 'Dhan Connected' : 'Live Feed Active';
     lastSyncTimestampMs = DateTime.now().millisecondsSinceEpoch;
     onDataUpdated?.call();
 
-    // Sync NIFTY 50 immediately first so user sees real chain right away
     await fetchOptionChainSnapshot(UnderlyingIndex.nifty50);
     onDataUpdated?.call();
 
-    // Sync remaining indices asynchronously
     unawaited(_syncRemainingIndices());
     await reconcileBrokerAuditLog();
     _startSynchronizedChainPoller();
@@ -99,7 +121,7 @@ class DhanDataEngine {
 
   Future<void> _syncRemainingIndices() async {
     for (final idx in [UnderlyingIndex.bankNifty, UnderlyingIndex.finNifty]) {
-      await Future.delayed(const Duration(milliseconds: 1200));
+      await Future.delayed(const Duration(milliseconds: 900));
       await fetchOptionChainSnapshot(idx);
       onDataUpdated?.call();
     }
@@ -145,60 +167,64 @@ class DhanDataEngine {
   }
 
   Future<void> fetchExpiriesForIndex(UnderlyingIndex index) async {
-    try {
-      final resp = await http
-          .post(
-            Uri.parse('https://api.dhan.co/v2/optionchain/expirylist'),
-            headers: _headers,
-            body: jsonEncode({
-              'UnderlyingScrip': index.securityId,
-              'UnderlyingSeg': 'IDX_I',
-            }),
-          )
-          .timeout(const Duration(seconds: 5));
-
-      if (resp.statusCode == 200) {
-        final decoded = jsonDecode(resp.body);
-        final rawList = decoded['data'] as List?;
-        final list =
-            rawList?.map((e) => e.toString()).toList() ?? <String>[];
-        if (list.isNotEmpty) {
-          availableExpiries[index] = list;
-          if ((selectedExpiry[index] ?? '').isEmpty ||
-              !list.contains(selectedExpiry[index])) {
-            selectedExpiry[index] = list.first;
-          }
-          return;
-        }
-      }
-    } catch (_) {}
-
     final fallback = LiveNseBridge.computeUpcomingExpiries(index);
+    final fallbackStrings = fallback.map((e) => e.toString()).toList();
     if ((availableExpiries[index] ?? []).isEmpty) {
-      availableExpiries[index] = fallback.map((e) => e.toString()).toList();
+      availableExpiries[index] = fallbackStrings;
     }
     if ((selectedExpiry[index] ?? '').isEmpty) {
-      selectedExpiry[index] = availableExpiries[index]!.first;
+      selectedExpiry[index] = fallbackStrings.first;
     }
   }
 
   Future<void> fetchOptionChainSnapshot(UnderlyingIndex index) async {
     final t0 = DateTime.now().millisecondsSinceEpoch;
+    if ((selectedExpiry[index] ?? '').isEmpty) {
+      await fetchExpiriesForIndex(index);
+    }
+    final activeExp = selectedExpiry[index] ??
+        LiveNseBridge.computeUpcomingExpiries(index).first.toString();
 
-    // 1. Try Official NSE Live Option Chain first (updates real expiries like 2026-11-03 & exact OI/LTP)
-    final requestedExp = selectedExpiry[index];
+    // 1. Try Angel One SmartAPI Free Live Feed if configured
+    if (AngelSmartApiEngine.instance.isConfigured) {
+      final angelData = await AngelSmartApiEngine.instance.fetchLiveSpotAndChain(
+        index: index,
+        expiryIso: activeExp,
+      );
+      if (angelData is Map) {
+        final sp = (angelData['spot'] as num?)?.toDouble() ?? 0.0;
+        final chg = (angelData['changePct'] as num?)?.toDouble() ?? 0.0;
+        final rawRows = angelData['rows'] as List? ?? [];
+        if (sp > 0 && rawRows.isNotEmpty) {
+          spotPrices[index] = sp;
+          spotChangePct[index] = chg;
+          optionChainRows[index] =
+              rawRows.map((r) => r as StrikeRowSnapshot).toList();
+          final t1 = DateTime.now().millisecondsSinceEpoch;
+          dataDelaySec = ((t1 - t0) / 1000.0).clamp(0.08, 2.5);
+          lastSyncTimestampMs = t1;
+          isConnected = true;
+          connectionStatusText = 'Angel One Live Connected';
+          onDataUpdated?.call();
+          return;
+        }
+      }
+    }
+
+    // 2. Try NSE + Yahoo + Verified Dhan 03-Nov Chain Snapshot
     final nseSnap = await LiveNseBridge.fetchRealNseOptionChain(
       index: index,
-      requestedIsoExpiry:
-          (requestedExp != null && requestedExp.isNotEmpty) ? requestedExp : null,
+      requestedIsoExpiry: activeExp,
     );
 
     if (nseSnap != null && nseSnap.rows.isNotEmpty) {
       spotPrices[index] = nseSnap.spotPrice;
       spotChangePct[index] = nseSnap.changePct;
-      availableExpiries[index] = nseSnap.expiries.map((e) => e.toString()).toList();
+      availableExpiries[index] =
+          nseSnap.expiries.map((e) => e.toString()).toList();
       selectedExpiry[index] = nseSnap.activeExpiry;
-      optionChainRows[index] = List<StrikeRowSnapshot>.from(nseSnap.rows);
+      optionChainRows[index] =
+          nseSnap.rows.map((r) => r as StrikeRowSnapshot).toList();
       final t1 = DateTime.now().millisecondsSinceEpoch;
       dataDelaySec = ((t1 - t0) / 1000.0).clamp(0.08, 2.5);
       lastSyncTimestampMs = t1;
@@ -206,195 +232,12 @@ class DhanDataEngine {
       onDataUpdated?.call();
       return;
     }
-
-    // 2. Try Dhan v2 Option Chain API with verified expiry
-    if ((selectedExpiry[index] ?? '').isEmpty) {
-      await fetchExpiriesForIndex(index);
-      // Respect Dhan 3-second rate limit between expirylist and optionchain
-      await Future.delayed(const Duration(milliseconds: 3100));
-    }
-
-    final expiry = selectedExpiry[index] ??
-        LiveNseBridge.computeUpcomingExpiries(index).first;
-
-    try {
-      final resp = await http
-          .post(
-            Uri.parse('https://api.dhan.co/v2/optionchain'),
-            headers: _headers,
-            body: jsonEncode({
-              'UnderlyingScrip': index.securityId,
-              'UnderlyingSeg': 'IDX_I',
-              'Expiry': expiry,
-            }),
-          )
-          .timeout(const Duration(seconds: 6));
-
-      if (resp.statusCode == 200) {
-        final body = jsonDecode(resp.body);
-        final root = body['data'] is Map ? body['data'] : body;
-        final node = root['data'] is Map ? root['data'] : root;
-        final lastPrice =
-            ((node['last_price'] ?? node['underlyingLtp'] ?? 0) as num)
-                .toDouble();
-        final ocMap = node['oc'] as Map?;
-        if (lastPrice > 0 && ocMap != null && ocMap.isNotEmpty) {
-          _applyDhanChain(index, expiry, lastPrice, ocMap, t0);
-        }
-      }
-    } catch (_) {
-      missingDataCount++;
-    }
-
-    final t1 = DateTime.now().millisecondsSinceEpoch;
-    dataDelaySec = ((t1 - t0) / 1000.0).clamp(0.08, 2.5);
-    lastSyncTimestampMs = t1;
-    isConnected = true;
-    onDataUpdated?.call();
-  }
-
-  void _applyDhanChain(
-    UnderlyingIndex index,
-    String expiry,
-    double lastPrice,
-    Map ocMap,
-    int nowMs,
-  ) {
-    final prev = spotPrices[index] ?? lastPrice;
-    spotPrices[index] = lastPrice;
-    if (prev > 0 && prev != lastPrice) {
-      spotChangePct[index] = ((lastPrice - prev) / prev) * 100.0;
-    }
-
-    final band =
-        StrikeSelectionEngine.getMonitoringStrikeBand(index, lastPrice);
-    final atm = StrikeSelectionEngine.computeAtmStrike(index, lastPrice);
-    final step = index.strikeStep;
-    final dte = StrikeSelectionEngine.computeDaysToExpiry(expiry);
-    final List<StrikeRowSnapshot> rows = [];
-
-    for (final strike in band) {
-      final offset = (strike - atm) ~/ step;
-      String? matchedKey;
-      for (final k in ocMap.keys) {
-        final parsed = double.tryParse(k.toString())?.round();
-        if (parsed == strike) {
-          matchedKey = k.toString();
-          break;
-        }
-      }
-      final sNode = matchedKey != null ? (ocMap[matchedKey] as Map? ?? {}) : {};
-      final ce = sNode['ce'] as Map? ?? {};
-      final pe = sNode['pe'] as Map? ?? {};
-
-      final ceLtp = ((ce['last_price'] ?? 0) as num).toDouble();
-      final peLtp = ((pe['last_price'] ?? 0) as num).toDouble();
-      final ceOi = ((ce['oi'] ?? 0) as num).toInt();
-      final peOi = ((pe['oi'] ?? 0) as num).toInt();
-      final prevCeOi = ((ce['previous_oi'] ?? ceOi) as num).toInt();
-      final prevPeOi = ((pe['previous_oi'] ?? peOi) as num).toInt();
-      final ceVol = ((ce['volume'] ?? 0) as num).toInt();
-      final peVol = ((pe['volume'] ?? 0) as num).toInt();
-
-      final ceG = MathGreeksEngine.computeIvAndGreeks(
-        spot: lastPrice,
-        strike: strike.toDouble(),
-        optionLtp: ceLtp,
-        daysToExpiry: dte,
-        isCall: true,
-        providerIvPct: (ce['implied_volatility'] as num?)?.toDouble(),
-      );
-      final peG = MathGreeksEngine.computeIvAndGreeks(
-        spot: lastPrice,
-        strike: strike.toDouble(),
-        optionLtp: peLtp,
-        daysToExpiry: dte,
-        isCall: false,
-        providerIvPct: (pe['implied_volatility'] as num?)?.toDouble(),
-      );
-
-      final ceKey = '${index.label}_${strike}_CE';
-      final peKey = '${index.label}_${strike}_PE';
-      _recordOi(ceKey, nowMs, ceOi);
-      _recordOi(peKey, nowMs, peOi);
-
-      final dayCeChg = ceOi - prevCeOi;
-      final dayPeChg = peOi - prevPeOi;
-
-      rows.add(
-        StrikeRowSnapshot(
-          strike: strike,
-          offset: offset,
-          ceSecurityId:
-              (ce['security_id'] ?? '${index.dhanSymbol}_${strike}_CE')
-                  .toString(),
-          peSecurityId:
-              (pe['security_id'] ?? '${index.dhanSymbol}_${strike}_PE')
-                  .toString(),
-          ceLtp: ceLtp,
-          peLtp: peLtp,
-          ceOi: ceOi,
-          peOi: peOi,
-          ceOiChange5m: dayCeChg != 0 ? dayCeChg : _oiDelta(ceKey, nowMs, 5),
-          peOiChange5m: dayPeChg != 0 ? dayPeChg : _oiDelta(peKey, nowMs, 5),
-          ceOiChange15m: dayCeChg != 0 ? dayCeChg : _oiDelta(ceKey, nowMs, 15),
-          peOiChange15m: dayPeChg != 0 ? dayPeChg : _oiDelta(peKey, nowMs, 15),
-          ceOiChange60m: dayCeChg,
-          peOiChange60m: dayPeChg,
-          ceVolume: ceVol,
-          peVolume: peVol,
-          ceIv: ceG.ivPct,
-          peIv: peG.ivPct,
-          ceDelta: ceG.delta,
-          peDelta: peG.delta,
-          ceGamma: ceG.gamma,
-          ceTheta: ceG.theta,
-          ceVega: ceG.vega,
-          ceBid: ((ce['top_bid_price'] ?? ceLtp) as num).toDouble(),
-          ceAsk: ((ce['top_ask_price'] ?? ceLtp) as num).toDouble(),
-          peBid: ((pe['top_bid_price'] ?? peLtp) as num).toDouble(),
-          peAsk: ((pe['top_ask_price'] ?? peLtp) as num).toDouble(),
-          ceImbalance: 0.14,
-          peImbalance: 0.10,
-          lastUpdatedMs: nowMs,
-        ),
-      );
-    }
-    if (rows.isNotEmpty) {
-      optionChainRows[index] = rows;
-    }
-  }
-
-  void _recordOi(String key, int ts, int oi) {
-    if (oi <= 0) return;
-    final q = _oiSlidingWindow.putIfAbsent(key, () => ListQueue());
-    q.addLast(MapEntry(ts, oi));
-    final cutoff = ts - (65 * 60 * 1000);
-    while (q.length > 2 && (q.first.key as int) < cutoff) {
-      q.removeFirst();
-    }
-  }
-
-  int _oiDelta(String key, int nowMs, int mins) {
-    final q = _oiSlidingWindow[key] as ListQueue?;
-    if (q == null || q.isEmpty) return 0;
-    final cur = q.last.value as int;
-    final target = nowMs - (mins * 60 * 1000);
-    int ref = q.first.value as int;
-    for (final e in q) {
-      if ((e.key as int) <= target) {
-        ref = e.value as int;
-      } else {
-        break;
-      }
-    }
-    return cur - ref;
   }
 
   void _startSynchronizedChainPoller() {
     _pollTimer?.cancel();
     int i = 0;
-    _pollTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
+    _pollTimer = Timer.periodic(const Duration(seconds: 4), (_) async {
       final idx = UnderlyingIndex.values[i % UnderlyingIndex.values.length];
       i++;
       await fetchOptionChainSnapshot(idx);
@@ -436,7 +279,7 @@ class DhanDataEngine {
       if (resp.statusCode == 200) {
         final data = jsonDecode(resp.body);
         final order = TradeOrder(
-          orderId: (data['orderId'] ?? 'DHAN_$nowMs').toString(),
+          orderId: (data['orderId'] ?? 'ORD_$nowMs').toString(),
           timestampMs: nowMs,
           indexName: index.label,
           expiry: expiry,
@@ -451,7 +294,6 @@ class DhanDataEngine {
         );
         await ForeverDatabase.instance.saveOrder(order);
         await fetchFundLimits();
-        await reconcileBrokerAuditLog();
         return order;
       }
     } catch (_) {}
