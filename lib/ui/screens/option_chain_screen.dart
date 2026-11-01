@@ -405,7 +405,8 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
                   ],
                 ),
                 const SizedBox(height: 8),
-                MultiStrikeComparisonChart(
+                // Interactive chart rendered below
+                  MultiStrikeComparisonChart(
                   s1: [
                     atmCe * 0.94,
                     atmCe * 0.96,
