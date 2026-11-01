@@ -86,9 +86,9 @@ class DhanDataEngine {
         lastSyncTimestampMs = DateTime.now().millisecondsSinceEpoch;
         onDataUpdated?.call();
 
-        await fetchOptionChainSnapshot(UnderlyingIndex.nifty50);
+        await Future.wait(UnderlyingIndex.values.map((idx) => fetchOptionChainSnapshot(idx)));
         onDataUpdated?.call();
-        unawaited(_syncRemainingIndices());
+        // All 3 synced in parallel
         _startSynchronizedChainPoller();
         return true;
       }
@@ -110,10 +110,10 @@ class DhanDataEngine {
     lastSyncTimestampMs = DateTime.now().millisecondsSinceEpoch;
     onDataUpdated?.call();
 
-    await fetchOptionChainSnapshot(UnderlyingIndex.nifty50);
+    await Future.wait(UnderlyingIndex.values.map((idx) => fetchOptionChainSnapshot(idx)));
     onDataUpdated?.call();
 
-    unawaited(_syncRemainingIndices());
+    // All 3 synced in parallel
     await reconcileBrokerAuditLog();
     _startSynchronizedChainPoller();
     return true;

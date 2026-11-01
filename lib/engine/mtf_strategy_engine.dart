@@ -2,15 +2,32 @@ import 'dart:math' as math;
 import '../core/models.dart';
 import 'ai_recalibration_engine.dart';
 
+class MarketSenseResult {
+  final String badge;
+  final String headline;
+
+  const MarketSenseResult({
+    required this.badge,
+    required this.headline,
+  });
+
+  String get bias => badge;
+  String get summary => headline;
+
+  String operator [](String key) {
+    if (key == 'bias' || key == 'badge') return badge;
+    return headline;
+  }
+}
+
 class MtfStrategyEngine {
-  /// Returns real-time Market Sense summary map for HomeScreen card
-  static Map evaluateMarketSense(List chainRows) {
+  static MarketSenseResult evaluateMarketSense(List chainRows) {
     if (chainRows.isEmpty) {
-      return {
-        'bias': 'Neutral',
-        'summary':
-            'Awaiting live option-chain OI & 1m momentum feed from broker.',
-      };
+      return const MarketSenseResult(
+        badge: 'Neutral',
+        headline:
+            'Syncing live option-chain OI, IV & 1m momentum feed from broker...',
+      );
     }
 
     int totalCeOi = 0;
@@ -29,26 +46,26 @@ class MtfStrategyEngine {
     final pcr = totalCeOi > 0 ? (totalPeOi / totalCeOi.toDouble()) : 1.0;
     final netFlow = totalPeChg - totalCeChg;
 
-    String bias = 'Neutral';
-    String actionHint = 'Balanced CE/PE writing near ATM.';
-    if (pcr >= 1.05 || netFlow > 500000) {
-      bias = 'Bullish';
-      actionHint =
-          'Strong Put writing support (PCR ${pcr.toStringAsFixed(2)}). Favor ATM/ATM+1 CE buyers on dips.';
-    } else if (pcr <= 0.92 || netFlow < -500000) {
-      bias = 'Bearish';
-      actionHint =
-          'Heavy Call writing overhead (PCR ${pcr.toStringAsFixed(2)}). Favor ATM/ATM-1 PE buyers.';
+    String badge = 'Neutral';
+    String headline = 'Balanced CE/PE writing near ATM.';
+    if (pcr >= 1.05 || netFlow > 400000) {
+      badge = 'Bullish';
+      headline =
+          'Put writing support active (PCR ${pcr.toStringAsFixed(2)} | Net OI +${_formatLakhs(netFlow)}). Favor ATM/ATM+1 CE buyers.';
+    } else if (pcr <= 0.92 || netFlow < -400000) {
+      badge = 'Bearish';
+      headline =
+          'Call writing overhead active (PCR ${pcr.toStringAsFixed(2)} | Net OI ${_formatLakhs(netFlow)}). Favor ATM/ATM-1 PE buyers.';
     } else {
-      bias = 'Range / Chop';
-      actionHint =
-          'PCR ${pcr.toStringAsFixed(2)} | PE OI ${_formatLakhs(totalPeOi)} vs CE OI ${_formatLakhs(totalCeOi)}.';
+      badge = 'Neutral';
+      headline =
+          'PCR ${pcr.toStringAsFixed(2)} | PE OI ${_formatLakhs(totalPeOi)} vs CE OI ${_formatLakhs(totalCeOi)} (Two-sided battle).';
     }
 
-    return {
-      'bias': bias,
-      'summary': actionHint,
-    };
+    return MarketSenseResult(
+      badge: badge,
+      headline: headline,
+    );
   }
 
   static AiSignal evaluateOneMinEntry({
@@ -62,7 +79,7 @@ class MtfStrategyEngine {
     required double todayRealizedLossInr,
   }) {
     if (chainRows.isEmpty) {
-      return _noTradeSignal(index, expiry, 'Empty Option Chain snapshot');
+      return _noTradeSignal(index, expiry, 'Waiting for live chain snapshot');
     }
 
     StrikeRowSnapshot? atmRow;
@@ -95,10 +112,10 @@ class MtfStrategyEngine {
 
     final pcr = totalCeOi > 0 ? (totalPeOi / totalCeOi.toDouble()) : 1.0;
     final netOiFlow = totalPeOiChg - totalCeOiChg;
-    final htfOiScore = (netOiFlow / 3000000.0).clamp(-1.0, 1.0);
+    final htfOiScore = (netOiFlow / 2500000.0).clamp(-1.0, 1.0);
 
-    double momScore = 0.08;
-    double avgImbalance = 0.12;
+    double momScore = 0.12;
+    double avgImbalance = 0.14;
     if (recent1mBars.length >= 3) {
       final latest = recent1mBars.last as OneMinEnrichedBar;
       final prev =
@@ -125,16 +142,13 @@ class MtfStrategyEngine {
     StrikeRowSnapshot bestPutRow = atmRow;
     for (final raw in chainRows) {
       final r = raw as StrikeRowSnapshot;
-      if (r.offset == 0 || r.offset == 1) bestCallRow = r;
-      if (r.offset == -1 || r.offset == 0) bestPutRow = r;
+      if (r.offset == 0) {
+        bestCallRow = r;
+        bestPutRow = r;
+      }
     }
 
-    final isBullishSetup = (pcr >= 0.95 && htfOiScore >= -0.15) ||
-        (momScore > 0.10 && avgImbalance > 0.04);
-    final isBearishSetup = (pcr < 0.95 && htfOiScore < -0.15) ||
-        (momScore < -0.10 && avgImbalance < -0.04);
-
-    final isCall = isBullishSetup || !isBearishSetup;
+    final isCall = pcr >= 0.96 || htfOiScore >= 0;
     final targetRow = isCall ? bestCallRow : bestPutRow;
     final strike = targetRow.strike;
     final entryPrem = isCall ? targetRow.ceLtp : targetRow.peLtp;
@@ -145,10 +159,10 @@ class MtfStrategyEngine {
 
     final confidence = AiRecalibrationEngine.instance.scoreEnsembleConfidence(
       isCallSignal: isCall,
-      htfOiScore: htfOiScore,
-      momentumScore: momScore,
-      orderBookImbalance: avgImbalance,
-      pcrScore: (pcr - 1.0).clamp(-1.0, 1.0),
+      htfOiScore: htfOiScore.abs(),
+      momentumScore: momScore.abs(),
+      orderBookImbalance: avgImbalance.abs(),
+      pcrScore: (pcr - 1.0).abs().clamp(0.1, 1.0),
       deltaQualityScore: isCall ? targetRow.ceDelta : targetRow.peDelta.abs(),
     );
 
@@ -160,8 +174,9 @@ class MtfStrategyEngine {
     final action = isCall ? SignalAction.buyCe : SignalAction.buyPe;
     final List<String> reasons = [
       'PCR: ${pcr.toStringAsFixed(2)} (${isCall ? "Put Writing Support" : "Call Writing Overhead"})',
-      'HTF OI Flow: ${htfOiScore >= 0 ? "+" : ""}${(htfOiScore * 100).toStringAsFixed(0)}%',
-      'HMM AI Conf: ${confidence.toStringAsFixed(1)}%',
+      '15m Net OI Flow: ${netOiFlow >= 0 ? "+" : ""}${_formatLakhs(netOiFlow)}',
+      'IV: ${(isCall ? targetRow.ceIv : targetRow.peIv).toStringAsFixed(1)}% | Delta: ${(isCall ? targetRow.ceDelta : targetRow.peDelta).toStringAsFixed(2)}',
+      'HMM Ensemble Conf: ${confidence.toStringAsFixed(1)}%',
     ];
 
     return AiSignal(
