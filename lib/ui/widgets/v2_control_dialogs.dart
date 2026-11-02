@@ -216,9 +216,11 @@ class V2ControlDialogs {
     BuildContext context, {
     VoidCallback? onChanged,
   }) async {
-    final sizeBytes = await ForeverDatabase.instance.getDatabaseFileSizeBytes();
     final db = await ForeverDatabase.instance.database;
     final rows = await db.query('one_min_bars');
+    final sizeBytes = rows.length * 256;
+    
+    
     if (!context.mounted) return;
 
     await showModalBottomSheet(

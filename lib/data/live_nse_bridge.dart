@@ -40,7 +40,7 @@ class LiveNseBridge {
     try {
       final resp = await http
           .get(Uri.parse(
-              'https://query1.finance.yahoo.com/v8/finance/chart/%5EINDIAVIX?interval=1m&range=1d&_ts=$nowMs'))
+              'https://query1.finance.yahoo.com/v8/finance/chart/%5EINDIAVIX?interval=1m&range=1d&_ts=${DateTime.now().millisecondsSinceEpoch}'))
           .timeout(const Duration(seconds: 5));
       if (resp.statusCode == 200) {
         final body = jsonDecode(resp.body);
@@ -113,7 +113,7 @@ class LiveNseBridge {
       final ticker = _tickerForIndex(index);
       final resp = await http
           .get(Uri.parse(
-              'https://query1.finance.yahoo.com/v8/finance/chart/$ticker?interval=1m&range=1d&_ts=$nowMs'))
+              'https://query1.finance.yahoo.com/v8/finance/chart/$ticker?interval=1m&range=1d&_ts=${DateTime.now().millisecondsSinceEpoch}'))
           .timeout(const Duration(seconds: 7));
       if (resp.statusCode == 200) {
         final json = jsonDecode(resp.body);

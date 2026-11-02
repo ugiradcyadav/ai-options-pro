@@ -66,7 +66,7 @@ class BacktestEngine {
   /// Async method called by BacktestScreen
   static Future runBacktest({
     required UnderlyingIndex index,
-    required String htfRule,
+    String timeframe = '15m', String htfRule = '15m',
     required RiskConfig riskConfig,
     double availableCapital = 25000.0,
   }) async {
