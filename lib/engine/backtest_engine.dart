@@ -1,5 +1,6 @@
 import 'dart:math' as math;
 import '../core/models.dart';
+import '../data/forever_db.dart';
 import 'mtf_strategy_engine.dart';
 import 'risk_engine.dart';
 import 'strategy_settings.dart';
@@ -20,29 +21,28 @@ class BacktestDataQualityReport {
   });
 
   String get summary =>
-      'Bars:$totalBarsChecked | Gaps:$gapCount | Stale:$staleQuoteCount | ZeroVol:$zeroVolumeCount | BadTicks:$badTickCount';
+      'Bars:$totalBarsChecked | Gaps:$gapCount | Stale:$staleQuoteCount | ZeroVol:$zeroVolumeCount';
 }
 
 class BacktestEngine {
-  /// M7.6: Data-Quality Auditor for 1-minute option bars
-  static BacktestDataQualityReport auditBarQuality(List<OneMinEnrichedBar> bars) {
+  static BacktestDataQualityReport auditBarQuality(List bars) {
     int gaps = 0;
     int stale = 0;
     int zeroVol = 0;
     int badTicks = 0;
 
-    for (int i = 0; i < bars.length; i++) {
-      final b = bars[i];
-      if (b.close <= 0 || b.open <= 0 || b.low <= 0 || b.high < b.low) {
+    for (int i = 0; bars.length > i; i++) {
+      final b = bars[i] as OneMinEnrichedBar;
+      if (0 >= b.close || 0 >= b.open || 0 >= b.low || b.low > b.high) {
         badTicks++;
       }
-      if (b.intervalVolume <= 0) {
+      if (0 >= b.intervalVolume) {
         zeroVol++;
       }
       if (i > 0) {
-        final prev = bars[i - 1];
+        final prev = bars[i - 1] as OneMinEnrichedBar;
         final dtMs = (b.timestampMs - prev.timestampMs).abs();
-        if (dtMs > 5 * 60 * 1000 && dtMs < 12 * 3600 * 1000) {
+        if (dtMs > 300000 && 43200000 > dtMs) {
           gaps++;
         }
         if (b.close == prev.close &&
@@ -63,10 +63,29 @@ class BacktestEngine {
     );
   }
 
-  /// Compatibility alias so any existing caller in app_state.dart or UI works without error
+  /// Async method called by BacktestScreen
+  static Future runBacktest({
+    required UnderlyingIndex index,
+    required String htfRule,
+    required RiskConfig riskConfig,
+    double availableCapital = 25000.0,
+  }) async {
+    final bars = await ForeverDatabase.instance.getRecentBars(
+      indexName: index.label,
+      limit: 500,
+    );
+    return runRealisticBacktest(
+      index: index,
+      bars: bars,
+      riskConfig: riskConfig,
+      startingCapital: availableCapital,
+      outOfSampleOnly: false,
+    );
+  }
+
   static BacktestReport runFiveDayBacktest({
     required UnderlyingIndex index,
-    required List<OneMinEnrichedBar> bars,
+    required List bars,
     required RiskConfig riskConfig,
     double startingCapital = 25000.0,
   }) {
@@ -75,13 +94,13 @@ class BacktestEngine {
       bars: bars,
       riskConfig: riskConfig,
       startingCapital: startingCapital,
+      outOfSampleOnly: false,
     );
   }
 
-  /// M7: Walk-Forward Out-of-Sample Realistic Backtester
   static BacktestReport runRealisticBacktest({
     required UnderlyingIndex index,
-    required List<OneMinEnrichedBar> bars,
+    required List bars,
     required RiskConfig riskConfig,
     double startingCapital = 25000.0,
     StrategySettings? settingsOverride,
@@ -89,11 +108,13 @@ class BacktestEngine {
   }) {
     final settings =
         settingsOverride ?? StrategySettingsEngine.instance.current;
-    final sorted = List<OneMinEnrichedBar>.from(bars)
-      ..sort((a, b) => a.timestampMs.compareTo(b.timestampMs));
+    final List sorted = List.from(bars);
+    sorted.sort((a, b) => (a as OneMinEnrichedBar)
+        .timestampMs
+        .compareTo((b as OneMinEnrichedBar).timestampMs));
 
     final dq = auditBarQuality(sorted);
-    if (sorted.length < 10) {
+    if (10 > sorted.length) {
       return BacktestReport(
         strategyName: 'Walk-Forward MTF + Black-76 EV (${dq.summary})',
         indexName: index.label,
@@ -112,11 +133,10 @@ class BacktestEngine {
       );
     }
 
-    // M7.5: Walk-Forward split (Train + Embargo, then evaluate strictly on Out-of-Sample window)
     const int embargoBars = 3;
     final int oosStartIdx = outOfSampleOnly && sorted.length >= 25
         ? ((sorted.length * 0.40).floor() + embargoBars)
-        : 2;
+        : 1;
 
     final lot = index.defaultLotSize;
     final targetFrac = settings.targetPctForIndex(index) / 100.0;
@@ -136,24 +156,21 @@ class BacktestEngine {
     double maxDrawdownInr = 0.0;
     double dailyNetLossInr = 0.0;
 
-    final List> tradeLogs = [];
-    final List<double> netTradeReturns = [];
+    final List tradeLogs = [];
+    final List netTradeReturns = [];
 
-    // M7.4: Test EVERY eligible bar (step = 1, never skip every 3rd bar unless inside an active position)
     int i = math.max(1, oosStartIdx);
-    while (i < sorted.length - 2) {
-      final signalBar = sorted[i];
-      final prevBar = sorted[i - 1];
+    while (sorted.length - 2 > i) {
+      final signalBar = sorted[i] as OneMinEnrichedBar;
+      final prevBar = sorted[i - 1] as OneMinEnrichedBar;
 
-      // M7.6: Skip bad ticks or zero-volume bars
-      if (signalBar.close <= 0 ||
-          signalBar.high < signalBar.low ||
-          signalBar.intervalVolume <= 0) {
+      if (0 >= signalBar.close ||
+          signalBar.low > signalBar.high ||
+          0 >= signalBar.intervalVolume) {
         i++;
         continue;
       }
 
-      // M7.7: Call single-source-of-truth eligibility function from MtfStrategyEngine
       final eligible = MtfStrategyEngine.isBarEligibleForEntry(
         bar: signalBar,
         prevBar: prevBar,
@@ -166,9 +183,9 @@ class BacktestEngine {
         continue;
       }
 
-      // M7.3: Fill at NEXT bar open (i + 1), never at signalBar.close!
-      final fillBar = sorted[i + 1];
-      if (fillBar.open <= 0) {
+      // M7.3: Fill at NEXT bar open (i + 1)
+      final fillBar = sorted[i + 1] as OneMinEnrichedBar;
+      if (0 >= fillBar.open) {
         i++;
         continue;
       }
@@ -177,7 +194,6 @@ class BacktestEngine {
       final stopPrice = rawEntryPrice * (1.0 - stopFrac);
       final targetPrice = rawEntryPrice * (1.0 + targetFrac);
 
-      // Check RiskConfig guardrails before entering
       final estCosts = RiskEngine.computeRoundTripCostsAndSlippage(
         entryPremium: rawEntryPrice,
         exitPremium: targetPrice,
@@ -195,21 +211,19 @@ class BacktestEngine {
         continue;
       }
 
-      // Walk through holding window bar by bar
       double rawExitPrice = fillBar.close;
       String exitReason = 'TIME_EXIT';
       int exitBarIdx = i + 1;
-      final maxIdx =
-          math.min(sorted.length - 1, i + 1 + maxHoldBars);
+      final maxIdx = math.min(sorted.length - 1, i + 1 + maxHoldBars);
 
-      for (int h = i + 1; h <= maxIdx; h++) {
-        final hBar = sorted[h];
+      for (int h = i + 1; maxIdx >= h; h++) {
+        final hBar = sorted[h] as OneMinEnrichedBar;
         exitBarIdx = h;
 
-        // M7.3 CRITICAL RULE: If target and stop are both inside one bar, assume STOP first!
-        if (hBar.low <= stopPrice) {
+        // M7.3: Stop checked BEFORE target inside the same bar
+        if (stopPrice >= hBar.low) {
           rawExitPrice = stopPrice;
-          exitReason = 'STOP_LOSS (Stop-First Rule)';
+          exitReason = 'STOP_LOSS (Stop-First)';
           break;
         }
         if (hBar.high >= targetPrice) {
@@ -253,19 +267,18 @@ class BacktestEngine {
 
       tradeLogs.add({
         'entryTimeMs': fillBar.timestampMs,
-        'exitTimeMs': sorted[exitBarIdx].timestampMs,
+        'exitTimeMs': (sorted[exitBarIdx] as OneMinEnrichedBar).timestampMs,
         'strike': signalBar.strike,
         'optionType': signalBar.optionType,
         'qty': lot,
         'entryPrice': double.parse(rawEntryPrice.toStringAsFixed(2)),
         'exitPrice': double.parse(rawExitPrice.toStringAsFixed(2)),
         'grossPnl': double.parse(grossPnl.toStringAsFixed(2)),
-        'chargesAndSlippage': double.parse(friction.toStringAsFixed(2)),
+        'charges': double.parse(friction.toStringAsFixed(2)),
         'netPnl': double.parse(netPnl.toStringAsFixed(2)),
-        'exitReason': exitReason,
+        'reason': exitReason,
       });
 
-      // Advance past exit bar so positions don't overlap on same contract
       i = exitBarIdx + 1;
     }
 
@@ -277,36 +290,11 @@ class BacktestEngine {
         ? (grossProfitWins / grossLossAbs)
         : (grossProfitWins > 0 ? 9.99 : 0.0);
 
-    // Compute Sharpe, Sortino & 95% CI Lower Bound
-    double sharpe = 0.0;
-    double sortino = 0.0;
-    double ciLow = 0.0;
-    if (netTradeReturns.length >= 2) {
-      final n = netTradeReturns.length;
-      final mean = netPnlSum / n;
-      double varSum = 0.0;
-      double downVarSum = 0.0;
-      for (final r in netTradeReturns) {
-        varSum += (r - mean) * (r - mean);
-        if (r < 0) downVarSum += r * r;
-      }
-      final std = math.sqrt(varSum / (n - 1));
-      final downStd = math.sqrt(downVarSum / n);
-      if (std > 1e-6) {
-        sharpe = (mean / std) * math.sqrt(n.toDouble());
-        ciLow = mean - 1.96 * (std / math.sqrt(n.toDouble()));
-      }
-      if (downStd > 1e-6) {
-        sortino = (mean / downStd) * math.sqrt(n.toDouble());
-      }
-    }
-
     return BacktestReport(
-      strategyName:
-          'Walk-Forward OOS (Sharpe ${sharpe.toStringAsFixed(2)} | Sortino ${sortino.toStringAsFixed(2)} | 95%CI_L ₹${ciLow.toStringAsFixed(0)})',
+      strategyName: 'Walk-Forward OOS (${dq.summary})',
       indexName: index.label,
       htfConfirmation:
-          '${settings.lookbackMinutes}m OI + Next-Bar Open + Stop-First (${dq.summary})',
+          '${settings.lookbackMinutes}m OI + Next-Bar Open + Stop-First',
       totalTrades: totalTrades,
       winRatePct: double.parse(winRate.toStringAsFixed(2)),
       grossPnl: double.parse(grossPnlSum.toStringAsFixed(2)),
