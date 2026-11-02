@@ -193,7 +193,7 @@ class ForeverDatabase {
     });
   }
 
-  Future<List getAuditLogs({int limit = 100}) async {
+  Future<List> getAuditLogs({int limit = 100}) async {
     final db = await database;
     return db.query('audit_log', orderBy: 'id DESC', limit: limit);
   }
@@ -348,7 +348,7 @@ class ForeverDatabase {
     await db.insert('signals_log', signal.toMap());
   }
 
-  Future<List getRecentSignals({int limit = 30}) async {
+  Future<List> getRecentSignals({int limit = 30}) async {
     final db = await database;
     return db.query('signals_log', orderBy: 'timestamp_ms DESC', limit: limit);
   }
@@ -421,7 +421,7 @@ class ForeverDatabase {
     });
   }
 
-  Future<List getSavedStrategies() async {
+  Future<List> getSavedStrategies() async {
     final db = await database;
     return db.query('saved_strategies', orderBy: 'last_run_ms DESC', limit: 20);
   }

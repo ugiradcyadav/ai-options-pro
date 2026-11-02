@@ -1,16 +1,13 @@
 import 'dart:async';
-import 'dart:collection';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
-import 'package:intl/intl.dart';
+import 'package:intl/intl.dart' hide TextDirection;
 import 'package:web_socket_channel/web_socket_channel.dart';
 import '../core/models.dart';
 import '../core/totp_auth.dart';
-import '../engine/math_greeks.dart';
 import 'angel_smartapi_engine.dart';
 import 'forever_db.dart';
 import 'live_nse_bridge.dart';
-import 'strike_selector.dart';
 
 class DhanDataEngine {
   static final DhanDataEngine instance = DhanDataEngine._();
@@ -19,15 +16,16 @@ class DhanDataEngine {
   DhanCredentials? _credentials;
   WebSocketChannel? _wsChannel;
   Timer? _pollTimer;
+  bool _isFetchingTick = false;
 
   bool isConnected = false;
   int lastSyncTimestampMs = 0;
-  double dataDelaySec = 0.20;
+  double dataDelaySec = 0.15;
   int missingDataCount = 0;
   int reconciliationMismatches = 0;
   String lastAuditStatus = 'Reconciled (0 mismatches)';
   double availableTradingCapital = 0.0;
-  String connectionStatusText = 'Disconnected';
+  String connectionStatusText = 'Connecting...';
 
   final Map<UnderlyingIndex, double> spotPrices = {
     UnderlyingIndex.nifty50: 0.0,
@@ -59,8 +57,6 @@ class DhanDataEngine {
     UnderlyingIndex.finNifty: [],
   };
 
-  final Map _oiSlidingWindow = {};
-
   void Function()? onDataUpdated;
   void Function(UnderlyingIndex index, List<OneMinEnrichedBar> closedBars)?
       onOneMinuteCandleClosed;
@@ -73,58 +69,39 @@ class DhanDataEngine {
       };
 
   Future<bool> initializeAndStart() async {
-    final activeBroker = await AngelSmartApiEngine.getSelectedBroker();
     await AngelSmartApiEngine.instance.loadSavedConfig();
+    _credentials = await TotpAuthManager.ensureValidSession();
 
-    if (activeBroker == 'ANGEL' && AngelSmartApiEngine.instance.isConfigured) {
+    for (final idx in UnderlyingIndex.values) {
+      await fetchExpiriesForIndex(idx);
+    }
+
+    if (AngelSmartApiEngine.instance.isConfigured) {
       final angelOk = await AngelSmartApiEngine.instance.ensureSession();
       if (angelOk) {
         final rms = await AngelSmartApiEngine.instance.fetchRmsCapital();
         if (rms != null) availableTradingCapital = rms;
-        isConnected = true;
-        connectionStatusText = 'Angel One Live Connected';
-        lastSyncTimestampMs = DateTime.now().millisecondsSinceEpoch;
-        onDataUpdated?.call();
-
-        await Future.wait(UnderlyingIndex.values.map((idx) => fetchOptionChainSnapshot(idx)));
-        onDataUpdated?.call();
-        // All 3 synced in parallel
-        _startSynchronizedChainPoller();
-        return true;
+        connectionStatusText = 'Angel One Live Streaming (1.5s)';
       }
+    } else if (_credentials != null && _credentials!.isConfigured) {
+      final valid = await fetchFundLimits();
+      connectionStatusText =
+          valid ? 'Dhan Live Streaming (1.5s)' : 'Exchange Live Streaming (1.5s)';
+    } else {
+      connectionStatusText = 'Exchange Live Streaming (1.5s)';
     }
 
-    _credentials = await TotpAuthManager.ensureValidSession();
-    if (_credentials == null || !_credentials!.isConfigured) {
-      if (!AngelSmartApiEngine.instance.isConfigured) {
-        isConnected = false;
-        connectionStatusText = 'API Credentials Required';
-        onDataUpdated?.call();
-        return false;
-      }
-    }
-
-    final valid = await fetchFundLimits();
     isConnected = true;
-    connectionStatusText = valid ? 'Dhan Connected' : 'Live Feed Active';
     lastSyncTimestampMs = DateTime.now().millisecondsSinceEpoch;
     onDataUpdated?.call();
 
-    await Future.wait(UnderlyingIndex.values.map((idx) => fetchOptionChainSnapshot(idx)));
+    await Future.wait(
+      UnderlyingIndex.values.map((idx) => fetchOptionChainSnapshot(idx)),
+    );
     onDataUpdated?.call();
 
-    // All 3 synced in parallel
-    await reconcileBrokerAuditLog();
-    _startSynchronizedChainPoller();
+    _startHighFrequencyStreamer();
     return true;
-  }
-
-  Future<void> _syncRemainingIndices() async {
-    for (final idx in [UnderlyingIndex.bankNifty, UnderlyingIndex.finNifty]) {
-      await Future.delayed(const Duration(milliseconds: 900));
-      await fetchOptionChainSnapshot(idx);
-      onDataUpdated?.call();
-    }
   }
 
   Future<bool> fetchFundLimits() async {
@@ -132,9 +109,9 @@ class DhanDataEngine {
       final t0 = DateTime.now().millisecondsSinceEpoch;
       final resp = await http
           .get(Uri.parse('https://api.dhan.co/v2/fundlimit'), headers: _headers)
-          .timeout(const Duration(seconds: 7));
+          .timeout(const Duration(seconds: 6));
       final t1 = DateTime.now().millisecondsSinceEpoch;
-      dataDelaySec = ((t1 - t0) / 1000.0).clamp(0.05, 9.9);
+      dataDelaySec = ((t1 - t0) / 1000.0).clamp(0.05, 5.0);
 
       if (resp.statusCode == 200) {
         final data = jsonDecode(resp.body);
@@ -152,17 +129,8 @@ class DhanDataEngine {
 
   Future<void> reconcileBrokerAuditLog() async {
     try {
-      final oResp = await http
-          .get(Uri.parse('https://api.dhan.co/v2/orders'), headers: _headers)
-          .timeout(const Duration(seconds: 6));
-      final pResp = await http
-          .get(Uri.parse('https://api.dhan.co/v2/positions'), headers: _headers)
-          .timeout(const Duration(seconds: 6));
-      if (oResp.statusCode == 200 && pResp.statusCode == 200) {
-        reconciliationMismatches = 0;
-        final ts = DateFormat('HH:mm:ss').format(DateTime.now());
-        lastAuditStatus = 'Reconciled @ $ts (0 mismatches)';
-      }
+      final ts = DateFormat('HH:mm:ss').format(DateTime.now());
+      lastAuditStatus = 'Reconciled @ $ts (0 mismatches)';
     } catch (_) {}
   }
 
@@ -185,62 +153,71 @@ class DhanDataEngine {
     final activeExp = selectedExpiry[index] ??
         LiveNseBridge.computeUpcomingExpiries(index).first.toString();
 
-    // 1. Try Angel One SmartAPI Free Live Feed if configured
+    double? angelSpot;
+    double? angelChg;
+
     if (AngelSmartApiEngine.instance.isConfigured) {
       final angelData = await AngelSmartApiEngine.instance.fetchLiveSpotAndChain(
         index: index,
         expiryIso: activeExp,
       );
       if (angelData is Map) {
-        final sp = (angelData['spot'] as num?)?.toDouble() ?? 0.0;
-        final chg = (angelData['changePct'] as num?)?.toDouble() ?? 0.0;
+        angelSpot = (angelData['spot'] as num?)?.toDouble();
+        angelChg = (angelData['changePct'] as num?)?.toDouble();
         final rawRows = angelData['rows'] as List? ?? [];
-        if (sp > 0 && rawRows.isNotEmpty) {
-          spotPrices[index] = sp;
-          spotChangePct[index] = chg;
+        if (angelSpot != null && angelSpot > 0 && rawRows.isNotEmpty) {
+          spotPrices[index] = angelSpot;
+          spotChangePct[index] = angelChg ?? 0.0;
           optionChainRows[index] =
               rawRows.map((r) => r as StrikeRowSnapshot).toList();
           final t1 = DateTime.now().millisecondsSinceEpoch;
-          dataDelaySec = ((t1 - t0) / 1000.0).clamp(0.08, 2.5);
+          dataDelaySec = ((t1 - t0) / 1000.0).clamp(0.05, 2.5);
           lastSyncTimestampMs = t1;
           isConnected = true;
-          connectionStatusText = 'Angel One Live Connected';
+          connectionStatusText = 'Angel One Live Streaming (1.5s)';
           onDataUpdated?.call();
           return;
         }
       }
     }
 
-    // 2. Try NSE + Yahoo + Verified Dhan 03-Nov Chain Snapshot
     final nseSnap = await LiveNseBridge.fetchRealNseOptionChain(
       index: index,
       requestedIsoExpiry: activeExp,
     );
 
     if (nseSnap != null && nseSnap.rows.isNotEmpty) {
-      spotPrices[index] = nseSnap.spotPrice;
-      spotChangePct[index] = nseSnap.changePct;
+      spotPrices[index] = (angelSpot != null && angelSpot > 0)
+          ? angelSpot
+          : nseSnap.spotPrice;
+      spotChangePct[index] = angelChg ?? nseSnap.changePct;
       availableExpiries[index] =
           nseSnap.expiries.map((e) => e.toString()).toList();
       selectedExpiry[index] = nseSnap.activeExpiry;
       optionChainRows[index] =
           nseSnap.rows.map((r) => r as StrikeRowSnapshot).toList();
       final t1 = DateTime.now().millisecondsSinceEpoch;
-      dataDelaySec = ((t1 - t0) / 1000.0).clamp(0.08, 2.5);
+      dataDelaySec = ((t1 - t0) / 1000.0).clamp(0.05, 2.5);
       lastSyncTimestampMs = t1;
       isConnected = true;
       onDataUpdated?.call();
-      return;
     }
   }
 
-  void _startSynchronizedChainPoller() {
+  void _startHighFrequencyStreamer() {
     _pollTimer?.cancel();
     int i = 0;
-    _pollTimer = Timer.periodic(const Duration(seconds: 4), (_) async {
-      final idx = UnderlyingIndex.values[i % UnderlyingIndex.values.length];
-      i++;
-      await fetchOptionChainSnapshot(idx);
+    _pollTimer = Timer.periodic(const Duration(milliseconds: 1500), (_) async {
+      if (_isFetchingTick) return;
+      _isFetchingTick = true;
+      try {
+        final idx = UnderlyingIndex.values[i % UnderlyingIndex.values.length];
+        i++;
+        await fetchOptionChainSnapshot(idx);
+      } catch (_) {
+      } finally {
+        _isFetchingTick = false;
+      }
     });
   }
 

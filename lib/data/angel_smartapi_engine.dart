@@ -1,11 +1,10 @@
 import 'dart:convert';
 import 'package:http/http.dart' as http;
-import 'package:intl/intl.dart';
+import 'package:intl/intl.dart' hide TextDirection;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../core/models.dart';
 import '../core/totp_auth.dart';
 import '../engine/math_greeks.dart';
-import 'forever_db.dart';
 import 'strike_selector.dart';
 
 class AngelSmartApiEngine {
@@ -29,9 +28,8 @@ class AngelSmartApiEngine {
   String lastError = '';
 
   final Map _nfoTokenCache = {};
-  final Set _candlesSeeded = {};
 
-  Future loadSavedConfig() async {
+  Future<void> loadSavedConfig() async {
     final prefs = await SharedPreferences.getInstance();
     apiKey = prefs.getString(_kAngelApiKey) ?? '';
     clientCode = prefs.getString(_kAngelClientCode) ?? '';
@@ -41,12 +39,12 @@ class AngelSmartApiEngine {
     feedToken = prefs.getString(_kAngelFeedToken) ?? '';
   }
 
-  static Future getSelectedBroker() async {
+  static Future<String> getSelectedBroker() async {
     final prefs = await SharedPreferences.getInstance();
     return prefs.getString(_kBrokerChoice) ?? 'ANGEL';
   }
 
-  static Future setSelectedBroker(String broker) async {
+  static Future<void> setSelectedBroker(String broker) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_kBrokerChoice, broker);
   }
@@ -61,6 +59,7 @@ class AngelSmartApiEngine {
     final h = <String, String>{
       'Content-Type': 'application/json',
       'Accept': 'application/json',
+      'Cache-Control': 'no-cache',
       'X-UserType': 'USER',
       'X-SourceID': 'WEB',
       'X-ClientLocalIP': '192.168.1.1',
@@ -74,7 +73,7 @@ class AngelSmartApiEngine {
     return h;
   }
 
-  Future loginAndSave({
+  Future<bool> loginAndSave({
     required String newApiKey,
     required String newClientCode,
     required String newPin,
@@ -96,7 +95,7 @@ class AngelSmartApiEngine {
     return ensureSession(forceLogin: true);
   }
 
-  Future ensureSession({bool forceLogin = false}) async {
+  Future<bool> ensureSession({bool forceLogin = false}) async {
     await loadSavedConfig();
     if (!isConfigured) {
       lastError = 'Angel One credentials not configured.';
@@ -144,7 +143,7 @@ class AngelSmartApiEngine {
     }
   }
 
-  Future fetchRmsCapital() async {
+  Future<double?> fetchRmsCapital() async {
     try {
       final resp = await http
           .get(
@@ -176,8 +175,7 @@ class AngelSmartApiEngine {
     }
   }
 
-  /// Resolves strike tokens via Angel searchScrip with expiry-agnostic fallback & caching
-  Future _resolveStrikeTokensViaSearch(
+  Future<void> _resolveStrikeTokensViaSearch(
     UnderlyingIndex index,
     String expiryIso,
     int strike,
@@ -190,136 +188,43 @@ class AngelSmartApiEngine {
     }
 
     try {
-      final dt = DateFormat('yyyy-MM-dd').parse(expiryIso);
-      final ddMmmYy = DateFormat('ddMMMyy').format(dt).toUpperCase();
-      final queries = [
-        '${index.dhanSymbol}$ddMmmYy$strike',
-        '${index.dhanSymbol} $strike',
-      ];
-
-      for (final q in queries) {
-        final resp = await http
-            .post(
-              Uri.parse(
-                  'https://apiconnect.angelone.in/rest/secure/angelbroking/order/v1/searchScrip'),
-              headers: _buildHeaders(),
-              body: jsonEncode({
-                'exchange': 'NFO',
-                'searchscrip': q,
-              }),
-            )
-            .timeout(const Duration(seconds: 4));
-
-        if (resp.statusCode == 200) {
-          final body = jsonDecode(resp.body);
-          final dataList = body['data'] as List? ?? [];
-          for (final item in dataList) {
-            if (item is Map) {
-              final ts = (item['tradingsymbol'] ?? '').toString().toUpperCase();
-              final tok = (item['symboltoken'] ?? '').toString();
-              if (ts.startsWith(index.dhanSymbol) &&
-                  ts.endsWith('${strike}CE') &&
-                  tok.isNotEmpty) {
-                _nfoTokenCache.putIfAbsent(ceKey, () => tok);
-              } else if (ts.startsWith(index.dhanSymbol) &&
-                  ts.endsWith('${strike}PE') &&
-                  tok.isNotEmpty) {
-                _nfoTokenCache.putIfAbsent(peKey, () => tok);
-              }
-            }
-          }
-        }
-        if (_nfoTokenCache.containsKey(ceKey) &&
-            _nfoTokenCache.containsKey(peKey)) {
-          break;
-        }
-        await Future.delayed(const Duration(milliseconds: 220));
-      }
-    } catch (_) {}
-  }
-
-  /// Fetches real 1-minute historical OHLCV bars from Angel One getCandleData API
-  Future _seedAngelOneMinuteCandles({
-    required UnderlyingIndex index,
-    required String expiryIso,
-    required int atmStrike,
-    required String atmCeToken,
-    required double spot,
-    required StrikeRowSnapshot atmRow,
-  }) async {
-    if (_candlesSeeded.contains(index.label) || atmCeToken.isEmpty) return;
-    try {
-      final now = DateTime.now();
-      final fromDt = now.subtract(const Duration(days: 3));
-      final fmt = DateFormat('yyyy-MM-dd HH:mm');
-
       final resp = await http
           .post(
             Uri.parse(
-                'https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData'),
+                'https://apiconnect.angelone.in/rest/secure/angelbroking/order/v1/searchScrip'),
             headers: _buildHeaders(),
             body: jsonEncode({
               'exchange': 'NFO',
-              'symboltoken': atmCeToken,
-              'interval': 'ONE_MINUTE',
-              'fromdate': fmt.format(fromDt),
-              'todate': fmt.format(now),
+              'searchscrip': '${index.dhanSymbol} $strike',
             }),
           )
-          .timeout(const Duration(seconds: 6));
+          .timeout(const Duration(seconds: 4));
 
       if (resp.statusCode == 200) {
         final body = jsonDecode(resp.body);
-        final candles = body['data'] as List? ?? [];
-        if (candles.isNotEmpty) {
-          _candlesSeeded.add(index.label);
-          final startIdx = candles.length > 40 ? candles.length - 40 : 0;
-          for (int i = startIdx; i < candles.length; i++) {
-            final c = candles[i] as List;
-            final tsStr = c[0].toString();
-            final dt = DateTime.tryParse(tsStr) ?? now;
-            final o = (c[1] as num).toDouble();
-            final h = (c[2] as num).toDouble();
-            final l = (c[3] as num).toDouble();
-            final cl = (c[4] as num).toDouble();
-            final v = (c[5] as num).toInt();
-
-            await ForeverDatabase.instance.insertOneMinBar(
-              OneMinEnrichedBar(
-                timestampMs: dt.millisecondsSinceEpoch,
-                indexName: index.label,
-                expiry: expiryIso,
-                strike: atmStrike,
-                optionType: 'CE',
-                strikeOffset: 0,
-                underlyingSpot: spot,
-                open: o,
-                high: h,
-                low: l,
-                close: cl,
-                intervalVolume: v,
-                absoluteOi: atmRow.ceOi,
-                oiChange1m: atmRow.ceOiChange5m ~/ 5,
-                oiChange5m: atmRow.ceOiChange5m,
-                oiChange15m: atmRow.ceOiChange15m,
-                oiChange60m: atmRow.ceOiChange60m,
-                iv: atmRow.ceIv,
-                delta: atmRow.ceDelta,
-                gamma: atmRow.ceGamma,
-                theta: atmRow.ceTheta,
-                vega: atmRow.ceVega,
-                spreadPct: 0.20,
-                orderBookImbalance: atmRow.ceImbalance,
-                next3mReturn: 0.0,
-              ),
-            );
+        final dataList = body['data'] as List? ?? [];
+        for (final item in dataList) {
+          if (item is Map) {
+            final ts = (item['tradingsymbol'] ?? '').toString().toUpperCase();
+            final tok = (item['symboltoken'] ?? '').toString();
+            if (ts.startsWith(index.dhanSymbol) &&
+                ts.endsWith('${strike}CE') &&
+                tok.isNotEmpty &&
+                !_nfoTokenCache.containsKey(ceKey)) {
+              _nfoTokenCache[ceKey] = tok;
+            } else if (ts.startsWith(index.dhanSymbol) &&
+                ts.endsWith('${strike}PE') &&
+                tok.isNotEmpty &&
+                !_nfoTokenCache.containsKey(peKey)) {
+              _nfoTokenCache[peKey] = tok;
+            }
           }
         }
       }
     } catch (_) {}
   }
 
-  Future fetchLiveSpotAndChain({
+  Future<Map?> fetchLiveSpotAndChain({
     required UnderlyingIndex index,
     required String expiryIso,
   }) async {
@@ -328,11 +233,12 @@ class AngelSmartApiEngine {
       if (!ok) return null;
     }
 
+    final idxToken = _indexTokenForAngel(index);
     double spot = 0.0;
     double changePct = 0.0;
+
     try {
-      final idxToken = _indexTokenForAngel(index);
-      final spotResp = await http
+      var spotResp = await http
           .post(
             Uri.parse(
                 'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/'),
@@ -344,7 +250,24 @@ class AngelSmartApiEngine {
               }
             }),
           )
-          .timeout(const Duration(seconds: 5));
+          .timeout(const Duration(seconds: 4));
+
+      if (spotResp.statusCode == 401 || spotResp.statusCode == 403) {
+        await ensureSession(forceLogin: true);
+        spotResp = await http
+            .post(
+              Uri.parse(
+                  'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/'),
+              headers: _buildHeaders(),
+              body: jsonEncode({
+                'mode': 'FULL',
+                'exchangeTokens': {
+                  'NSE': [idxToken]
+                }
+              }),
+            )
+            .timeout(const Duration(seconds: 4));
+      }
 
       if (spotResp.statusCode == 200) {
         final body = jsonDecode(spotResp.body);
@@ -367,7 +290,12 @@ class AngelSmartApiEngine {
     final List nfoTokensToQuery = [];
     final Map tokenToStrikeKey = {};
     for (final strike in band) {
-      await _resolveStrikeTokensViaSearch(index, expiryIso, strike);
+      final ceKey = '${index.dhanSymbol}_${strike}_CE';
+      final peKey = '${index.dhanSymbol}_${strike}_PE';
+      if (!_nfoTokenCache.containsKey(ceKey) ||
+          !_nfoTokenCache.containsKey(peKey)) {
+        await _resolveStrikeTokensViaSearch(index, expiryIso, strike);
+      }
       for (final opt in ['CE', 'PE']) {
         final k = '${index.dhanSymbol}_${strike}_$opt';
         final tok = _nfoTokenCache[k]?.toString() ?? '';
@@ -378,43 +306,46 @@ class AngelSmartApiEngine {
       }
     }
 
-    if (nfoTokensToQuery.isEmpty) return null;
-
     final Map quoteByStrikeOpt = {};
-    try {
-      final qResp = await http
-          .post(
-            Uri.parse(
-                'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/'),
-            headers: _buildHeaders(),
-            body: jsonEncode({
-              'mode': 'FULL',
-              'exchangeTokens': {'NFO': nfoTokensToQuery}
-            }),
-          )
-          .timeout(const Duration(seconds: 6));
+    if (nfoTokensToQuery.isNotEmpty) {
+      try {
+        final qResp = await http
+            .post(
+              Uri.parse(
+                  'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/'),
+              headers: _buildHeaders(),
+              body: jsonEncode({
+                'mode': 'FULL',
+                'exchangeTokens': {'NFO': nfoTokensToQuery}
+              }),
+            )
+            .timeout(const Duration(seconds: 4));
 
-      if (qResp.statusCode == 200) {
-        final qBody = jsonDecode(qResp.body);
-        final fetched = qBody['data']?['fetched'] as List? ?? [];
-        for (final f in fetched) {
-          if (f is Map) {
-            final tok = (f['symbolToken'] ?? '').toString();
-            final sk = tokenToStrikeKey[tok];
-            if (sk != null) {
-              quoteByStrikeOpt[sk] = f;
+        if (qResp.statusCode == 200) {
+          final qBody = jsonDecode(qResp.body);
+          final fetched = qBody['data']?['fetched'] as List? ?? [];
+          for (final f in fetched) {
+            if (f is Map) {
+              final tok = (f['symbolToken'] ?? '').toString();
+              final sk = tokenToStrikeKey[tok];
+              if (sk != null) {
+                quoteByStrikeOpt[sk] = f;
+              }
             }
           }
         }
-      }
-    } catch (_) {}
+      } catch (_) {}
+    }
 
-    if (quoteByStrikeOpt.isEmpty) return null;
+    if (quoteByStrikeOpt.isEmpty) {
+      return {
+        'spot': spot,
+        'changePct': changePct,
+        'rows': const [],
+      };
+    }
 
     final List rows = [];
-    StrikeRowSnapshot? atmRowSnap;
-    String atmCeTok = '';
-
     for (final strike in band) {
       final offset = (strike - atm) ~/ step;
       final ceQ = quoteByStrikeOpt['${strike}_CE'] as Map? ?? {};
@@ -432,7 +363,6 @@ class AngelSmartApiEngine {
       final ceNetChg = ((ceQ['netChange'] ?? 0) as num).toDouble();
       final peNetChg = ((peQ['netChange'] ?? 0) as num).toDouble();
 
-      // Extract real 5-level Order Book Depth from Angel FULL quote
       double ceBidQty = 100.0;
       double ceAskQty = 100.0;
       double ceBestBid = ceLtp;
@@ -479,6 +409,8 @@ class AngelSmartApiEngine {
         optionLtp: ceLtp,
         daysToExpiry: dte,
         isCall: true,
+        bidPrice: ceBestBid,
+        askPrice: ceBestAsk,
       );
       final peG = MathGreeksEngine.computeIvAndGreeks(
         spot: spot,
@@ -486,6 +418,8 @@ class AngelSmartApiEngine {
         optionLtp: peLtp,
         daysToExpiry: dte,
         isCall: false,
+        bidPrice: peBestBid,
+        askPrice: peBestAsk,
       );
 
       final ceTok =
@@ -493,62 +427,45 @@ class AngelSmartApiEngine {
       final peTok =
           (peQ['symbolToken'] ?? '${index.dhanSymbol}_${strike}_PE').toString();
 
-      final snap = StrikeRowSnapshot(
-        strike: strike,
-        offset: offset,
-        ceSecurityId: ceTok,
-        peSecurityId: peTok,
-        ceLtp: ceLtp,
-        peLtp: peLtp,
-        ceOi: ceOi,
-        peOi: peOi,
-        ceOiChange5m: (ceNetChg * index.defaultLotSize * 12).round(),
-        peOiChange5m: (peNetChg * index.defaultLotSize * 12).round(),
-        ceOiChange15m: (ceNetChg * index.defaultLotSize * 35).round(),
-        peOiChange15m: (peNetChg * index.defaultLotSize * 35).round(),
-        ceOiChange60m: (ceNetChg * index.defaultLotSize * 85).round(),
-        peOiChange60m: (peNetChg * index.defaultLotSize * 85).round(),
-        ceVolume: ceVol,
-        peVolume: peVol,
-        ceIv: ceG.ivPct,
-        peIv: peG.ivPct,
-        ceDelta: ceG.delta,
-        peDelta: peG.delta,
-        ceGamma: ceG.gamma,
-        ceTheta: ceG.theta,
-        ceVega: ceG.vega,
-        ceBid: ceBestBid,
-        ceAsk: ceBestAsk,
-        peBid: peBestBid,
-        peAsk: peBestAsk,
-        ceImbalance: MathGreeksEngine.calculateOrderBookImbalance(
-          totalBidQty: ceBidQty,
-          totalAskQty: ceAskQty,
+      rows.add(
+        StrikeRowSnapshot(
+          strike: strike,
+          offset: offset,
+          ceSecurityId: ceTok,
+          peSecurityId: peTok,
+          ceLtp: ceLtp,
+          peLtp: peLtp,
+          ceOi: ceOi,
+          peOi: peOi,
+          ceOiChange5m: (ceNetChg * index.defaultLotSize * 12).round(),
+          peOiChange5m: (peNetChg * index.defaultLotSize * 12).round(),
+          ceOiChange15m: (ceNetChg * index.defaultLotSize * 35).round(),
+          peOiChange15m: (peNetChg * index.defaultLotSize * 35).round(),
+          ceOiChange60m: (ceNetChg * index.defaultLotSize * 85).round(),
+          peOiChange60m: (peNetChg * index.defaultLotSize * 85).round(),
+          ceVolume: ceVol,
+          peVolume: peVol,
+          ceIv: ceG.ivPct,
+          peIv: peG.ivPct,
+          ceDelta: ceG.delta,
+          peDelta: peG.delta,
+          ceGamma: ceG.gamma,
+          ceTheta: ceG.theta,
+          ceVega: ceG.vega,
+          ceBid: ceBestBid,
+          ceAsk: ceBestAsk,
+          peBid: peBestBid,
+          peAsk: peBestAsk,
+          ceImbalance: MathGreeksEngine.calculateOrderBookImbalance(
+            totalBidQty: ceBidQty,
+            totalAskQty: ceAskQty,
+          ),
+          peImbalance: MathGreeksEngine.calculateOrderBookImbalance(
+            totalBidQty: peBidQty,
+            totalAskQty: peAskQty,
+          ),
+          lastUpdatedMs: DateTime.now().millisecondsSinceEpoch,
         ),
-        peImbalance: MathGreeksEngine.calculateOrderBookImbalance(
-          totalBidQty: peBidQty,
-          totalAskQty: peAskQty,
-        ),
-        lastUpdatedMs: DateTime.now().millisecondsSinceEpoch,
-      );
-
-      if (offset == 0) {
-        atmRowSnap = snap;
-        atmCeTok = ceTok;
-      }
-      rows.add(snap);
-    }
-
-    if (rows.isEmpty) return null;
-
-    if (atmRowSnap != null && atmCeTok.isNotEmpty) {
-      await _seedAngelOneMinuteCandles(
-        index: index,
-        expiryIso: expiryIso,
-        atmStrike: atm,
-        atmCeToken: atmCeTok,
-        spot: spot,
-        atmRow: atmRowSnap,
       );
     }
 
