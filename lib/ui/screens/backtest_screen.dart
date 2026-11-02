@@ -40,16 +40,10 @@ class _BacktestScreenState extends State<BacktestScreen> {
 
   Future<void> _runBacktestNow() async {
     setState(() => _running = true);
-    final report = await BacktestEngine.runBacktest(
-      index: widget.appState.selectedIndex,
-      timeframe: _selectedTf,
-      useOiChangeFilter: _ruleOiChange,
-      useVolumeFilter: _ruleVolume,
-      useIvFilter: _ruleIv,
-      targetPct: _exitTarget ? 15.0 : 30.0,
-      stopLossPct: _exitSl ? 7.0 : 15.0,
-      timeExitMinutes: _exitTime ? 15 : 45,
-    );
+      final report = await BacktestEngine.runBacktest(
+        index: widget.appState.selectedIndex,
+        riskConfig: widget.appState.riskConfig,
+      );
     await _loadSaved();
     if (!mounted) return;
     setState(() {
