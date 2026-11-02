@@ -1,6 +1,4 @@
-import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart' hide TextDirection;
 import '../../core/models.dart';
 import '../../data/forever_db.dart';
 import '../../engine/ai_recalibration_engine.dart';
@@ -219,8 +217,6 @@ class V2ControlDialogs {
     final db = await ForeverDatabase.instance.database;
     final rows = await db.query('one_min_bars');
     final sizeBytes = rows.length * 256;
-    
-    
     if (!context.mounted) return;
 
     await showModalBottomSheet(

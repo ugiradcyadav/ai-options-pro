@@ -63,12 +63,15 @@ class BacktestEngine {
     );
   }
 
-  /// Async method called by BacktestScreen
   static Future runBacktest({
-    required UnderlyingIndex index,
-    String timeframe = '15m', String htfRule = '15m',
-    required RiskConfig riskConfig,
+    UnderlyingIndex index = UnderlyingIndex.nifty50,
+    String timeframe = '15m',
+    String htfRule = '15m',
+    RiskConfig riskConfig = const RiskConfig(),
     double availableCapital = 25000.0,
+    double startingCapital = 25000.0,
+    int days = 5,
+    int lotSize = 75,
   }) async {
     final bars = await ForeverDatabase.instance.getRecentBars(
       indexName: index.label,
@@ -78,7 +81,7 @@ class BacktestEngine {
       index: index,
       bars: bars,
       riskConfig: riskConfig,
-      startingCapital: availableCapital,
+      startingCapital: availableCapital > 0 ? availableCapital : startingCapital,
       outOfSampleOnly: false,
     );
   }
@@ -157,7 +160,6 @@ class BacktestEngine {
     double dailyNetLossInr = 0.0;
 
     final List tradeLogs = [];
-    final List netTradeReturns = [];
 
     int i = math.max(1, oosStartIdx);
     while (sorted.length - 2 > i) {
@@ -183,7 +185,6 @@ class BacktestEngine {
         continue;
       }
 
-      // M7.3: Fill at NEXT bar open (i + 1)
       final fillBar = sorted[i + 1] as OneMinEnrichedBar;
       if (0 >= fillBar.open) {
         i++;
@@ -220,7 +221,6 @@ class BacktestEngine {
         final hBar = sorted[h] as OneMinEnrichedBar;
         exitBarIdx = h;
 
-        // M7.3: Stop checked BEFORE target inside the same bar
         if (stopPrice >= hBar.low) {
           rawExitPrice = stopPrice;
           exitReason = 'STOP_LOSS (Stop-First)';
@@ -250,7 +250,6 @@ class BacktestEngine {
       grossPnlSum += grossPnl;
       totalFrictionSum += friction;
       netPnlSum += netPnl;
-      netTradeReturns.add(netPnl);
 
       if (netPnl > 0) {
         wins++;
