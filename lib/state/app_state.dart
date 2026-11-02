@@ -27,7 +27,8 @@ class AppState extends ChangeNotifier {
       if (latestSignal == null || latestSignal!.strike == 0) {
         _evaluateLiveSignalForIndex(selectedIndex);
       }
-      notifyListeners();
+      ForeverDatabase.instance.savePersistedRiskConfig(riskConfig);
+    notifyListeners();
     };
 
     DhanDataEngine.instance.onOneMinuteCandleClosed = (index, bars) {
@@ -40,11 +41,13 @@ class AppState extends ChangeNotifier {
         _evaluateLiveSignalForIndex(selectedIndex);
       }
     isInitialized = true;
+    ForeverDatabase.instance.savePersistedRiskConfig(riskConfig);
     notifyListeners();
   }
 
   Future<void> switchTradingMode(TradingMode mode) async {
     tradingMode = mode;
+    ForeverDatabase.instance.savePersistedRiskConfig(riskConfig);
     notifyListeners();
     await _refreshOperationalState();
       if (latestSignal == null || latestSignal!.strike == 0) {
@@ -54,6 +57,7 @@ class AppState extends ChangeNotifier {
 
   Future<void> setSelectedUnderlying(UnderlyingIndex idx) async {
     selectedIndex = idx;
+    ForeverDatabase.instance.savePersistedRiskConfig(riskConfig);
     notifyListeners();
     await DhanDataEngine.instance.fetchOptionChainSnapshot(idx);
     _evaluateLiveSignalForIndex(idx);
@@ -62,6 +66,7 @@ class AppState extends ChangeNotifier {
   Future<void> toggleKillSwitch() async {
     riskConfig =
         riskConfig.copyWith(killSwitchActive: !riskConfig.killSwitchActive);
+    ForeverDatabase.instance.savePersistedRiskConfig(riskConfig);
     notifyListeners();
   }
 
@@ -73,6 +78,7 @@ class AppState extends ChangeNotifier {
         isOpen: false, mode: modeStr);
     orders = await ForeverDatabase.instance.getOrders(mode: modeStr);
     databaseSizeMb = await ForeverDatabase.instance.getDatabaseSizeMb();
+    ForeverDatabase.instance.savePersistedRiskConfig(riskConfig);
     notifyListeners();
   }
 
@@ -106,7 +112,8 @@ class AppState extends ChangeNotifier {
           latestSignal!.riskWithinLimits) {
         ForeverDatabase.instance.logSignal(latestSignal!);
       }
-      notifyListeners();
+      ForeverDatabase.instance.savePersistedRiskConfig(riskConfig);
+    notifyListeners();
     });
   }
 

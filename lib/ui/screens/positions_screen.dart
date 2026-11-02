@@ -1,3 +1,4 @@
+import '../widgets/v2_control_dialogs.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import '../../core/models.dart';
@@ -25,10 +26,10 @@ class _PositionsScreenState extends State<PositionsScreen> {
       padding: const EdgeInsets.all(14),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
+        children: [V2ControlDialogs.buildPortfolioGreeksCard(widget.appState.openPositions, 23050.0), 
           // Open | Closed Toggle + Kill Switch
           Row(
-            children: [
+            children: [V2ControlDialogs.buildPortfolioGreeksCard(widget.appState.openPositions, 23050.0), 
               Expanded(
                 child: GestureDetector(
                   onTap: () => setState(() => _showOpen = true),
@@ -137,10 +138,10 @@ class _PositionsScreenState extends State<PositionsScreen> {
                 ),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
+                  children: [V2ControlDialogs.buildPortfolioGreeksCard(widget.appState.openPositions, 23050.0), 
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
+                      children: [V2ControlDialogs.buildPortfolioGreeksCard(widget.appState.openPositions, 23050.0), 
                         Text(
                           pos.indexName,
                           style: const TextStyle(
@@ -170,7 +171,7 @@ class _PositionsScreenState extends State<PositionsScreen> {
                     ),
                     const SizedBox(height: 4),
                     Row(
-                      children: [
+                      children: [V2ControlDialogs.buildPortfolioGreeksCard(widget.appState.openPositions, 23050.0), 
                         Container(
                           padding: const EdgeInsets.symmetric(
                             horizontal: 8,
@@ -202,7 +203,7 @@ class _PositionsScreenState extends State<PositionsScreen> {
                     const SizedBox(height: 8),
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
+                      children: [V2ControlDialogs.buildPortfolioGreeksCard(widget.appState.openPositions, 23050.0), 
                         Text(
                           'LTP ₹${pos.currentLtp.toStringAsFixed(2)}',
                           style: const TextStyle(
@@ -260,10 +261,10 @@ class _PositionsScreenState extends State<PositionsScreen> {
                         padding: const EdgeInsets.symmetric(vertical: 7),
                         child: Row(
                           mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
+                          children: [V2ControlDialogs.buildPortfolioGreeksCard(widget.appState.openPositions, 23050.0), 
                             Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
+                              children: [V2ControlDialogs.buildPortfolioGreeksCard(widget.appState.openPositions, 23050.0), 
                                 Text(
                                   '${o.side} ${o.optionType} ${o.strike} (${o.mode})',
                                   style: const TextStyle(
