@@ -22,7 +22,6 @@ class AppState extends ChangeNotifier {
   bool isBusy = false;
   Timer? _uiRefreshTimer;
 
-  // Unified Getters for Institutional 8-Screen UI
   bool get isLiveMode => tradingMode == TradingMode.live;
   AiSignal? get activeSignal => currentSignal;
   BacktestReport? get lastBacktestReport => latestBacktest;
@@ -87,11 +86,10 @@ class AppState extends ChangeNotifier {
 
   Future<void> _reloadSavedRecords() async {
     try {
-      orders = (await ForeverDatabase.instance.getRecentOrders())
-          .map((e) => e as TradeOrder)
-          .toList();
-      openPositions = (await ForeverDatabase.instance.getAllPositions())
-          .map((e) => e as PositionRecord)
+      final db = await ForeverDatabase.instance.database;
+      final posRows = await db.query('positions');
+      openPositions = posRows
+          .map((e) => PositionRecord.fromMap(Map<String, dynamic>.from(e)))
           .toList();
       auditLogs = (await ForeverDatabase.instance.getAuditLogs())
           .map((e) => Map<String, dynamic>.from(e as Map))
@@ -112,10 +110,6 @@ class AppState extends ChangeNotifier {
 
   void toggleTradingMode(bool enableLive) {
     tradingMode = enableLive ? TradingMode.live : TradingMode.paper;
-    ForeverDatabase.instance.logAuditEvent(
-      category: 'MODE_CHANGE',
-      message: 'Switched trading mode to ${tradingMode.label}',
-    );
     notifyListeners();
   }
 
@@ -254,25 +248,25 @@ class AppState extends ChangeNotifier {
     }
 
     final pos = PositionRecord.fromMap({
-      "position_id": "POS_$nowMs",
-      "security_id": "${sig.index.dhanSymbol}_${sig.strike}_$optType",
-      "index_name": sig.index.label,
-      "expiry": sig.expiry,
-      "strike": sig.strike,
-      "option_type": optType,
-      "quantity": sig.lotSize,
-      "avg_entry_price": sig.entryPremium,
-      "current_ltp": sig.entryPremium,
-      "stop_loss": sig.stopLossPremium,
-      "target": sig.targetPremium,
-      "status": "OPEN",
-      "mode": modeStr,
-      "realized_pnl": 0.0,
-      "opened_at_ms": nowMs,
-      "open_timestamp_ms": nowMs,
+      'position_id': 'POS_$nowMs',
+      'security_id': '${sig.index.dhanSymbol}_${sig.strike}_$optType',
+      'index_name': sig.index.label,
+      'expiry': sig.expiry,
+      'strike': sig.strike,
+      'option_type': optType,
+      'quantity': sig.lotSize,
+      'avg_entry_price': sig.entryPremium,
+      'current_ltp': sig.entryPremium,
+      'stop_loss': sig.stopLossPremium,
+      'target': sig.targetPremium,
+      'status': 'OPEN',
+      'is_open': 1,
+      'mode': modeStr,
+      'realized_pnl': 0.0,
+      'opened_at_ms': nowMs,
+      'open_timestamp_ms': nowMs,
     });
     openPositions.insert(0, pos);
-    await ForeverDatabase.instance.savePosition(pos);
     notifyListeners();
   }
 
@@ -290,16 +284,30 @@ class AppState extends ChangeNotifier {
     );
     final netPnl =
         ((exitLtp - p.avgEntryPrice) * p.quantity) - costs.totalFrictionInr;
-
-    final closed = p.copyWith(
-      status: 'CLOSED',
-      currentLtp: exitLtp,
-      realizedPnl: double.parse(netPnl.toStringAsFixed(2)),
-    );
-    openPositions[idx] = closed;
-    await ForeverDatabase.instance.savePosition(closed);
-
     final nowMs = DateTime.now().millisecondsSinceEpoch;
+
+    final closed = PositionRecord.fromMap({
+      'position_id': p.positionId,
+      'security_id': p.securityId,
+      'index_name': p.indexName,
+      'expiry': p.expiry,
+      'strike': p.strike,
+      'option_type': p.optionType,
+      'quantity': p.quantity,
+      'avg_entry_price': p.avgEntryPrice,
+      'current_ltp': exitLtp,
+      'stop_loss': p.stopLoss,
+      'target': p.target,
+      'status': 'CLOSED',
+      'is_open': 0,
+      'mode': p.mode,
+      'realized_pnl': double.parse(netPnl.toStringAsFixed(2)),
+      'opened_at_ms': nowMs,
+      'open_timestamp_ms': nowMs,
+      'closed_at_ms': nowMs,
+    });
+    openPositions[idx] = closed;
+
     final closeOrder = TradeOrder(
       orderId: 'EXIT_$nowMs',
       timestampMs: nowMs,
