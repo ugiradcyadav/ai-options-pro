@@ -1,238 +1,329 @@
+import 'dart:async';
 import 'package:flutter/foundation.dart';
 import '../core/models.dart';
 import '../data/dhan_data_engine.dart';
 import '../data/forever_db.dart';
 import '../engine/ai_recalibration_engine.dart';
-import '../engine/risk_engine.dart';
+import '../engine/backtest_engine.dart';
 import '../engine/mtf_strategy_engine.dart';
+import '../engine/risk_engine.dart';
 
 class AppState extends ChangeNotifier {
   TradingMode tradingMode = TradingMode.paper;
   UnderlyingIndex selectedIndex = UnderlyingIndex.nifty50;
   RiskConfig riskConfig = const RiskConfig();
 
-  bool isInitialized = false;
-  List<PositionRecord> openPositions = [];
-  List<PositionRecord> closedPositions = [];
   List<TradeOrder> orders = [];
-  AiSignal? latestSignal;
-  double todayRealizedLoss = 0.0;
-  double databaseSizeMb = 0.0;
+  List<PositionRecord> openPositions = [];
+  List<Map<String, dynamic>> auditLogs = [];
 
-  Future<void> initializeApp() async {
-    if (isInitialized) return;
+  AiSignal? currentSignal;
+  BacktestReport? latestBacktest;
+  bool isBusy = false;
+  Timer? _uiRefreshTimer;
+
+  // Unified Getters for Institutional 8-Screen UI
+  bool get isLiveMode => tradingMode == TradingMode.live;
+  AiSignal? get activeSignal => currentSignal;
+  BacktestReport? get lastBacktestReport => latestBacktest;
+
+  double get todayRealizedLossInr {
+    double loss = 0.0;
+    for (final p in openPositions) {
+      if (!p.isOpen && p.realizedPnl < 0) {
+        loss += p.realizedPnl.abs();
+      }
+      if (p.isOpen) {
+        final ltp = p.currentLtp > 0 ? p.currentLtp : p.avgEntryPrice;
+        final curPnl = (ltp - p.avgEntryPrice) * p.quantity;
+        if (curPnl < 0) {
+          loss += curPnl.abs();
+        }
+      }
+    }
+    return loss;
+  }
+
+  Future<void> initialize() async {
+    await initAppState();
+  }
+
+  Future<void> initAppState() async {
+    isBusy = true;
+    notifyListeners();
+
+    try {
+      riskConfig = await ForeverDatabase.instance.loadPersistedRiskConfig();
+    } catch (_) {}
+
     await AiRecalibrationEngine.instance.initialize();
-    DhanDataEngine.instance.onDataUpdated = () {
-      _refreshOperationalState();
-      if (latestSignal == null || latestSignal!.strike == 0) {
-        _evaluateLiveSignalForIndex(selectedIndex);
-      }
-      ForeverDatabase.instance.savePersistedRiskConfig(riskConfig);
-    notifyListeners();
-    };
-
-    DhanDataEngine.instance.onOneMinuteCandleClosed = (index, bars) {
-      _evaluateLiveSignalForIndex(index);
-    };
-
     await DhanDataEngine.instance.initializeAndStart();
-    await _refreshOperationalState();
-      if (latestSignal == null || latestSignal!.strike == 0) {
-        _evaluateLiveSignalForIndex(selectedIndex);
-      }
-    isInitialized = true;
-    ForeverDatabase.instance.savePersistedRiskConfig(riskConfig);
-    notifyListeners();
-  }
 
-  Future<void> switchTradingMode(TradingMode mode) async {
-    tradingMode = mode;
-    ForeverDatabase.instance.savePersistedRiskConfig(riskConfig);
-    notifyListeners();
-    await _refreshOperationalState();
-      if (latestSignal == null || latestSignal!.strike == 0) {
-        _evaluateLiveSignalForIndex(selectedIndex);
-      }
-  }
+    DhanDataEngine.instance.onDataUpdated = () {
+      _updateOpenPositionsLtp();
+      _evaluateCurrentIndexSignal();
+      notifyListeners();
+    };
 
-  Future<void> setSelectedUnderlying(UnderlyingIndex idx) async {
-    selectedIndex = idx;
-    ForeverDatabase.instance.savePersistedRiskConfig(riskConfig);
-    notifyListeners();
-    await DhanDataEngine.instance.fetchOptionChainSnapshot(idx);
-    _evaluateLiveSignalForIndex(idx);
-  }
+    await _reloadSavedRecords();
+    await _evaluateCurrentIndexSignal();
 
-  Future<void> toggleKillSwitch() async {
-    riskConfig =
-        riskConfig.copyWith(killSwitchActive: !riskConfig.killSwitchActive);
-    ForeverDatabase.instance.savePersistedRiskConfig(riskConfig);
-    notifyListeners();
-  }
-
-  Future<void> _refreshOperationalState() async {
-    final modeStr = tradingMode == TradingMode.live ? 'LIVE' : 'PAPER';
-    openPositions =
-        await ForeverDatabase.instance.getPositions(isOpen: true, mode: modeStr);
-    closedPositions = await ForeverDatabase.instance.getPositions(
-        isOpen: false, mode: modeStr);
-    orders = await ForeverDatabase.instance.getOrders(mode: modeStr);
-    databaseSizeMb = await ForeverDatabase.instance.getDatabaseSizeMb();
-    ForeverDatabase.instance.savePersistedRiskConfig(riskConfig);
-    notifyListeners();
-  }
-
-  void _evaluateLiveSignalForIndex(UnderlyingIndex idx) {
-    final chain = DhanDataEngine.instance.optionChainRows[idx] ?? [];
-    ForeverDatabase.instance
-        .getRecentBars(indexName: idx.label, limit: 60)
-        .then((bars) {
-      final expiry =
-          DhanDataEngine.instance.selectedExpiry[idx] ?? '2026-04-30';
-      final rawSig = MtfStrategyEngine.evaluateOneMinEntry(
-        index: idx,
-        expiry: expiry,
-        chainRows: chain,
-        recent1mBars: bars,
-        availableCapital: DhanDataEngine.instance.availableTradingCapital,
-        riskConfig: riskConfig,
-        openPositionsCount: openPositions.length,
-        todayRealizedLossInr: todayRealizedLoss,
-      );
-
-      latestSignal = RiskEngine.validateAndEnforceRisk(
-        rawSignal: rawSig,
-        config: riskConfig,
-        openPositionsCount: openPositions.length,
-        todayRealizedLossInr: todayRealizedLoss,
-        availableCapital: DhanDataEngine.instance.availableTradingCapital,
-      );
-
-      if (latestSignal!.action != SignalAction.noTrade &&
-          latestSignal!.riskWithinLimits) {
-        ForeverDatabase.instance.logSignal(latestSignal!);
-      }
-      ForeverDatabase.instance.savePersistedRiskConfig(riskConfig);
-    notifyListeners();
+    _uiRefreshTimer?.cancel();
+    _uiRefreshTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      _updateOpenPositionsLtp();
+      _evaluateCurrentIndexSignal();
+      notifyListeners();
     });
+
+    isBusy = false;
+    notifyListeners();
   }
 
-  Future<bool> approveAndExecuteSignal(AiSignal sig) async {
-    if (!sig.riskWithinLimits || sig.action == SignalAction.noTrade) {
-      return false;
+  void refreshFromEngine() {
+    _updateOpenPositionsLtp();
+    _evaluateCurrentIndexSignal();
+    notifyListeners();
+  }
+
+  Future<void> _reloadSavedRecords() async {
+    try {
+      orders = (await ForeverDatabase.instance.getRecentOrders())
+          .map((e) => e as TradeOrder)
+          .toList();
+      openPositions = (await ForeverDatabase.instance.getAllPositions())
+          .map((e) => e as PositionRecord)
+          .toList();
+      auditLogs = (await ForeverDatabase.instance.getAuditLogs())
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .toList();
+    } catch (_) {}
+  }
+
+  void setSelectedUnderlying(UnderlyingIndex index) {
+    selectedIndex = index;
+    DhanDataEngine.instance.fetchOptionChainSnapshot(index);
+    _evaluateCurrentIndexSignal();
+    notifyListeners();
+  }
+
+  void selectIndex(UnderlyingIndex index) {
+    setSelectedUnderlying(index);
+  }
+
+  void toggleTradingMode(bool enableLive) {
+    tradingMode = enableLive ? TradingMode.live : TradingMode.paper;
+    ForeverDatabase.instance.logAuditEvent(
+      category: 'MODE_CHANGE',
+      message: 'Switched trading mode to ${tradingMode.label}',
+    );
+    notifyListeners();
+  }
+
+  void setTradingMode(TradingMode mode) {
+    tradingMode = mode;
+    notifyListeners();
+  }
+
+  void updateRiskConfig(RiskConfig nextConfig) {
+    riskConfig = nextConfig;
+    ForeverDatabase.instance.savePersistedRiskConfig(nextConfig);
+    _evaluateCurrentIndexSignal();
+    notifyListeners();
+  }
+
+  void toggleKillSwitch(bool active) {
+    updateRiskConfig(riskConfig.copyWith(killSwitchActive: active));
+  }
+
+  Future<void> _evaluateCurrentIndexSignal() async {
+    final engine = DhanDataEngine.instance;
+    final rows = engine.optionChainRows[selectedIndex] ?? [];
+    final exp = engine.selectedExpiry[selectedIndex] ?? '2026-11-12';
+    final bars = await ForeverDatabase.instance.getRecentBars(
+      indexName: selectedIndex.label,
+      limit: 30,
+    );
+
+    final rawSig = MtfStrategyEngine.evaluateOneMinEntry(
+      index: selectedIndex,
+      expiry: exp,
+      chainRows: rows,
+      recent1mBars: bars,
+      availableCapital: engine.availableTradingCapital > 0
+          ? engine.availableTradingCapital
+          : 48200.0,
+      riskConfig: riskConfig,
+      openPositionsCount: openPositions.where((p) => p.isOpen).length,
+      todayRealizedLossInr: todayRealizedLossInr,
+    );
+
+    currentSignal = rawSig;
+  }
+
+  void _updateOpenPositionsLtp() {
+    final engine = DhanDataEngine.instance;
+    bool changed = false;
+    for (int i = 0; i < openPositions.length; i++) {
+      final p = openPositions[i];
+      if (!p.isOpen) continue;
+      UnderlyingIndex idx = UnderlyingIndex.nifty50;
+      for (final u in UnderlyingIndex.values) {
+        if (u.label == p.indexName) idx = u;
+      }
+      final rows = engine.optionChainRows[idx] ?? [];
+      for (final r in rows) {
+        if (r.strike == p.strike) {
+          final liveLtp =
+              p.optionType.toUpperCase() == 'CE' ? r.ceLtp : r.peLtp;
+          if (liveLtp > 0 && liveLtp != p.currentLtp) {
+            openPositions[i] = p.copyWith(currentLtp: liveLtp);
+            changed = true;
+          }
+          break;
+        }
+      }
+    }
+    if (changed) {
+      notifyListeners();
+    }
+  }
+
+  Future<void> executeActiveSignal() async {
+    final sig = currentSignal;
+    if (sig == null ||
+        sig.action == SignalAction.noTrade ||
+        sig.strike == 0 ||
+        sig.entryPremium <= 0) {
+      return;
+    }
+
+    final validated = RiskEngine.validateAndEnforceRisk(
+      rawSignal: sig,
+      config: riskConfig,
+      openPositionsCount: openPositions.where((p) => p.isOpen).length,
+      todayRealizedLossInr: todayRealizedLossInr,
+      availableCapital: DhanDataEngine.instance.availableTradingCapital > 0
+          ? DhanDataEngine.instance.availableTradingCapital
+          : 48200.0,
+    );
+
+    if (!validated.riskWithinLimits) {
+      currentSignal = validated;
+      notifyListeners();
+      return;
     }
 
     final nowMs = DateTime.now().millisecondsSinceEpoch;
-    final modeStr = tradingMode == TradingMode.live ? 'LIVE' : 'PAPER';
-    final optionType = sig.action == SignalAction.buyCe ? 'CE' : 'PE';
-    final securityId = '${sig.index.dhanSymbol}_${sig.strike}_$optionType';
-    final entryReason =
-        sig.reasons.isNotEmpty ? sig.reasons.first : 'Manual Signal Approval';
+    final optType = sig.action == SignalAction.buyCe ? 'CE' : 'PE';
+    final modeStr = isLiveMode ? 'LIVE' : 'PAPER';
 
-    if (tradingMode == TradingMode.live) {
-      final order = await DhanDataEngine.instance.placeLiveBrokerOrder(
-        securityId: securityId,
+    if (isLiveMode) {
+      final ord = await DhanDataEngine.instance.placeLiveBrokerOrder(
+        securityId: '${sig.index.dhanSymbol}_${sig.strike}_$optType',
         index: sig.index,
         expiry: sig.expiry,
         strike: sig.strike,
-        optionType: optionType,
+        optionType: optType,
         transactionType: 'BUY',
         quantity: sig.lotSize,
         price: sig.entryPremium,
-        reason: entryReason,
+        reason: sig.htfOiReason,
       );
-      if (order.status != 'Filled') return false;
+      orders.insert(0, ord);
+      if (ord.status != 'Filled') {
+        notifyListeners();
+        return;
+      }
     } else {
-      final paperOrder = TradeOrder(
+      final paperOrd = TradeOrder(
         orderId: 'PAPER_$nowMs',
         timestampMs: nowMs,
         indexName: sig.index.label,
         expiry: sig.expiry,
         strike: sig.strike,
-        optionType: optionType,
+        optionType: optType,
         side: 'BUY',
         quantity: sig.lotSize,
         price: sig.entryPremium,
         status: 'Filled',
-        mode: 'PAPER',
-        reason: entryReason,
+        mode: modeStr,
+        reason: sig.htfOiReason,
       );
-      await ForeverDatabase.instance.saveOrder(paperOrder);
+      orders.insert(0, paperOrd);
+      await ForeverDatabase.instance.saveOrder(paperOrd);
     }
 
-    final position = PositionRecord(
+    final pos = PositionRecord(
       positionId: 'POS_$nowMs',
-      securityId: securityId,
+      securityId: '${sig.index.dhanSymbol}_${sig.strike}_$optType',
       indexName: sig.index.label,
       expiry: sig.expiry,
       strike: sig.strike,
-      optionType: optionType,
+      optionType: optType,
       quantity: sig.lotSize,
       avgEntryPrice: sig.entryPremium,
       currentLtp: sig.entryPremium,
-      stopLossPrice: sig.stopLossPremium,
-      targetPrice: sig.targetPremium,
-      isOpen: true,
+      stopLossPremium: sig.stopLossPremium,
+      targetPremium: sig.targetPremium,
+      openTimestampMs: nowMs,
+      status: 'OPEN',
       mode: modeStr,
-      openedAtMs: nowMs,
+      realizedPnl: 0.0,
     );
-
-    await ForeverDatabase.instance.upsertPosition(position);
-    await _refreshOperationalState();
-      if (latestSignal == null || latestSignal!.strike == 0) {
-        _evaluateLiveSignalForIndex(selectedIndex);
-      }
-    return true;
+    openPositions.insert(0, pos);
+    await ForeverDatabase.instance.savePosition(pos);
+    notifyListeners();
   }
 
-  Future<void> closePosition(PositionRecord pos) async {
-    final nowMs = DateTime.now().millisecondsSinceEpoch;
+  Future<void> closePosition(String positionId) async {
+    final idx = openPositions.indexWhere((p) => p.positionId == positionId);
+    if (idx == -1) return;
+    final p = openPositions[idx];
+    if (!p.isOpen) return;
 
-    if (tradingMode == TradingMode.live) {
-      await DhanDataEngine.instance.placeLiveBrokerOrder(
-        securityId: pos.securityId,
-        index: selectedIndex,
-        expiry: pos.expiry,
-        strike: pos.strike,
-        optionType: pos.optionType,
-        transactionType: 'SELL',
-        quantity: pos.quantity,
-        price: pos.currentLtp,
-        reason: 'Manual User Exit',
-      );
-    } else {
-      final exitOrder = TradeOrder(
-        orderId: 'EXIT_$nowMs',
-        timestampMs: nowMs,
-        indexName: pos.indexName,
-        expiry: pos.expiry,
-        strike: pos.strike,
-        optionType: pos.optionType,
-        side: 'SELL',
-        quantity: pos.quantity,
-        price: pos.currentLtp,
-        status: 'Filled',
-        mode: 'PAPER',
-        reason: 'Manual User Exit',
-      );
-      await ForeverDatabase.instance.saveOrder(exitOrder);
-    }
-
-    final pnl = (pos.currentLtp - pos.avgEntryPrice) * pos.quantity;
-    final closed = pos.copyWith(
-      isOpen: false,
-      closedAtMs: nowMs,
-      realizedPnl: pnl,
+    final exitLtp = p.currentLtp > 0 ? p.currentLtp : p.avgEntryPrice;
+    final costs = RiskEngine.computeRoundTripCostsAndSlippage(
+      entryPremium: p.avgEntryPrice,
+      exitPremium: exitLtp,
+      quantity: p.quantity,
     );
+    final netPnl =
+        ((exitLtp - p.avgEntryPrice) * p.quantity) - costs.totalFrictionInr;
 
-    if (pnl < 0) {
-      todayRealizedLoss += pnl.abs();
-    }
+    final closed = p.copyWith(
+      status: 'CLOSED',
+      currentLtp: exitLtp,
+      realizedPnl: double.parse(netPnl.toStringAsFixed(2)),
+    );
+    openPositions[idx] = closed;
+    await ForeverDatabase.instance.savePosition(closed);
 
-    await ForeverDatabase.instance.upsertPosition(closed);
-    await _refreshOperationalState();
-      if (latestSignal == null || latestSignal!.strike == 0) {
-        _evaluateLiveSignalForIndex(selectedIndex);
-      }
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final closeOrder = TradeOrder(
+      orderId: 'EXIT_$nowMs',
+      timestampMs: nowMs,
+      indexName: p.indexName,
+      expiry: p.expiry,
+      strike: p.strike,
+      optionType: p.optionType,
+      side: 'SELL',
+      quantity: p.quantity,
+      price: exitLtp,
+      status: 'Filled',
+      mode: p.mode,
+      reason: 'Manual Square-Off (Net P&L ₹${netPnl.toStringAsFixed(1)})',
+    );
+    orders.insert(0, closeOrder);
+    await ForeverDatabase.instance.saveOrder(closeOrder);
+    notifyListeners();
+  }
+
+  Future<void> runBacktestForSelectedIndex() async {
+    final rep = await BacktestEngine.runBacktest(
+      index: selectedIndex,
+      riskConfig: riskConfig,
+    );
+    latestBacktest = rep as BacktestReport;
+    notifyListeners();
   }
 }

@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'core/totp_auth.dart';
 import 'data/dhan_data_engine.dart';
 import 'data/forever_db.dart';
 import 'engine/ai_recalibration_engine.dart';
@@ -21,19 +20,10 @@ Future<void> main() async {
     DeviceOrientation.portraitUp,
     DeviceOrientation.portraitDown,
   ]);
-  SystemChrome.setSystemUIOverlayStyle(
-    const SystemUIOverlayStyle(
-      statusBarColor: Colors.transparent,
-      statusBarIconBrightness: Brightness.light,
-      systemNavigationBarColor: QuantTheme.bgSecondary,
-      systemNavigationBarIconBrightness: Brightness.light,
-    ),
-  );
 
   try {
     await ForeverDatabase.instance.database;
     await StrategySettingsEngine.instance.load();
-    await TotpAuthManager.initializeDefaultIfEmpty();
     await AiRecalibrationEngine.instance.initialize();
     await globalAppState.initialize();
   } catch (e) {
@@ -124,7 +114,8 @@ class _MainTerminalShellState extends State<MainTerminalShell> {
           backgroundColor: QuantTheme.bgSecondary,
           selectedItemColor: QuantTheme.accent,
           unselectedItemColor: QuantTheme.textSecondary,
-          selectedLabelStyle: QuantTheme.heading(size: 10, color: QuantTheme.accent),
+          selectedLabelStyle:
+              QuantTheme.heading(size: 10, color: QuantTheme.accent),
           unselectedLabelStyle: QuantTheme.label(size: 10),
           items: const [
             BottomNavigationBarItem(

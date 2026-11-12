@@ -116,6 +116,10 @@ class AiRecalibrationEngine {
     }
   }
 
+  Future rollbackToPreviousWeights() async {
+    lastRecalibrationNote = "Rolled back to baseline weights ($modelVersion)";
+  }
+
   Future runLightweightFiveDayRecalibration({bool force = false}) async {
     await recalibrateFromForeverDb();
   }

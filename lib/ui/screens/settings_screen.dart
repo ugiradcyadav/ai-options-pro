@@ -217,7 +217,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               onTap: () {
                 Navigator.of(context).push(
                   MaterialPageRoute(
-                    builder: (_) => ApiSetupScreen(appState: widget.appState),
+                    builder: (_) => const ApiSetupScreen(),
                   ),
                 );
               },

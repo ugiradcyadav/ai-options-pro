@@ -87,7 +87,7 @@ class _SignalDetailsScreenState extends State<SignalDetailsScreen> {
         backgroundColor: QuantTheme.bgPanel,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(12),
-          border: const BorderSide(color: QuantTheme.border),
+          side: const BorderSide(color: QuantTheme.border),
         ),
         title: Row(
           children: [
