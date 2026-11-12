@@ -1,103 +1,58 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'core/totp_auth.dart';
+import 'data/dhan_data_engine.dart';
+import 'data/forever_db.dart';
+import 'engine/ai_recalibration_engine.dart';
 import 'engine/strategy_settings.dart';
-import 'data/angel_smartapi_engine.dart';
 import 'state/app_state.dart';
-import 'ui/screens/api_setup_screen.dart';
-import 'ui/screens/backtest_screen.dart';
-import 'ui/screens/charts_screen.dart';
 import 'ui/screens/home_screen.dart';
-import 'ui/screens/oi_analysis_screen.dart';
 import 'ui/screens/option_chain_screen.dart';
 import 'ui/screens/positions_screen.dart';
 import 'ui/screens/settings_screen.dart';
 import 'ui/screens/signals_screen.dart';
+import 'ui/theme/quant_theme.dart';
 
 final AppState globalAppState = AppState();
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await SystemChrome.setPreferredOrientations([
+    DeviceOrientation.portraitUp,
+    DeviceOrientation.portraitDown,
+  ]);
+  SystemChrome.setSystemUIOverlayStyle(
+    const SystemUIOverlayStyle(
+      statusBarColor: Colors.transparent,
+      statusBarIconBrightness: Brightness.light,
+      systemNavigationBarColor: QuantTheme.bgSecondary,
+      systemNavigationBarIconBrightness: Brightness.light,
+    ),
+  );
+
+  try {
+    await ForeverDatabase.instance.database;
+    await StrategySettingsEngine.instance.load();
+    await TotpAuthManager.initializeDefaultIfEmpty();
+    await AiRecalibrationEngine.instance.initialize();
+    await globalAppState.initialize();
+  } catch (e) {
+    debugPrint('Startup initialization note: $e');
+  }
+
   runApp(const AiOptionsProApp());
 }
 
-class AiOptionsProApp extends StatefulWidget {
+class AiOptionsProApp extends StatelessWidget {
   const AiOptionsProApp({super.key});
-
-  @override
-  State<AiOptionsProApp> createState() => _AiOptionsProAppState();
-}
-
-class _AiOptionsProAppState extends State<AiOptionsProApp> {
-  bool _checkingAuth = true;
-  bool _needsFirstLaunchSetup = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _checkFirstLaunchGate();
-  }
-
-  Future<void> _checkFirstLaunchGate() async {
-    try {
-      await AngelSmartApiEngine.instance.loadSavedConfig();
-      final creds = await TotpAuthManager.loadCredentials();
-      if (!creds.isConfigured) {
-        if (mounted) {
-          setState(() {
-            _needsFirstLaunchSetup = true;
-            _checkingAuth = false;
-          });
-        }
-      } else {
-        if (mounted) {
-          setState(() {
-            _needsFirstLaunchSetup = false;
-            _checkingAuth = false;
-          });
-        }
-        // Start live engine non-blocking so Dashboard opens immediately
-        globalAppState.initializeApp();
-      }
-    } catch (_) {
-      if (mounted) {
-        setState(() {
-          _needsFirstLaunchSetup = true;
-          _checkingAuth = false;
-        });
-      }
-    }
-  }
-
-  void _unlockAndOpenDashboard() {
-    setState(() {
-      _needsFirstLaunchSetup = false;
-      _checkingAuth = false;
-    });
-    globalAppState.initializeApp();
-  }
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'AI Options Pro',
+      title: 'AI Options Pro — Quant Terminal',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark().copyWith(
-        scaffoldBackgroundColor: const Color(0xFF080D1A),
-        colorScheme: const ColorScheme.dark(
-          primary: Color(0xFF1976D2),
-          secondary: Color(0xFF00E676),
-        ),
-      ),
-      home: _checkingAuth
-          ? const Scaffold(
-              body: Center(child: CircularProgressIndicator()),
-            )
-          : _needsFirstLaunchSetup
-              ? ApiSetupScreen(
-                  isFirstLaunch: true,
-                  onConnectedSuccess: _unlockAndOpenDashboard,
-                )
-              : MainTerminalShell(appState: globalAppState),
+      theme: QuantTheme.buildTheme(),
+      home: MainTerminalShell(appState: globalAppState),
     );
   }
 }
@@ -112,204 +67,94 @@ class MainTerminalShell extends StatefulWidget {
 }
 
 class _MainTerminalShellState extends State<MainTerminalShell> {
-  int _bottomNavIndex = 0;
-  String _analyticsSubView = 'oi_analysis';
-  String _moreSubView = 'settings';
+  int _currentIndex = 0;
 
-  void _handleQuickAction(String dest) {
+  @override
+  void initState() {
+    super.initState();
+    widget.appState.addListener(_onStateChanged);
+    DhanDataEngine.instance.onDataUpdated = _onStateChanged;
+  }
+
+  void _onStateChanged() {
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.appState.removeListener(_onStateChanged);
+    super.dispose();
+  }
+
+  void _switchToTab(int idx) {
     setState(() {
-      if (dest == 'oi_analysis' || dest == 'option_chain' || dest == 'charts') {
-        _analyticsSubView = dest;
-        _bottomNavIndex = 1;
-      } else if (dest == 'signals') {
-        _bottomNavIndex = 2;
-      } else if (dest == 'positions') {
-        _bottomNavIndex = 3;
-      } else if (dest == 'backtest') {
-        _moreSubView = 'backtest';
-        _bottomNavIndex = 4;
-      } else if (dest == 'settings') {
-        _moreSubView = 'settings';
-        _bottomNavIndex = 4;
-      }
+      _currentIndex = idx.clamp(0, 4);
     });
   }
 
   @override
   Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: widget.appState,
-      builder: (context, _) {
-        return Scaffold(
-          appBar: _bottomNavIndex == 0
-              ? null
-              : AppBar(
-                  backgroundColor: const Color(0xFF0B1325),
-                  elevation: 0,
-                  leading: IconButton(
-                    icon: const Icon(Icons.arrow_back, color: Colors.white),
-                    onPressed: () => setState(() => _bottomNavIndex = 0),
-                  ),
-                  title: Text(
-                    _currentHeaderTitle(),
-                    style: const TextStyle(
-                      fontSize: 16,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  actions: _buildHeaderSwitcher(),
-                ),
-          body: SafeArea(child: _buildBody()),
-          bottomNavigationBar: BottomNavigationBar(
-            currentIndex: _bottomNavIndex,
-            onTap: (i) => setState(() => _bottomNavIndex = i),
-            type: BottomNavigationBarType.fixed,
-            backgroundColor: const Color(0xFF0B1325),
-            selectedItemColor: const Color(0xFF40C4FF),
-            unselectedItemColor: Colors.white54,
-            selectedFontSize: 11,
-            unselectedFontSize: 11,
-            items: const [
-              BottomNavigationBarItem(
-                icon: Icon(Icons.home_outlined),
-                label: 'Home',
-              ),
-              BottomNavigationBarItem(
-                icon: Icon(Icons.bar_chart_rounded),
-                label: 'Charts',
-              ),
-              BottomNavigationBarItem(
-                icon: Icon(Icons.graphic_eq_rounded),
-                label: 'Signals',
-              ),
-              BottomNavigationBarItem(
-                icon: Icon(Icons.receipt_long_outlined),
-                label: 'Orders',
-              ),
-              BottomNavigationBarItem(
-                icon: Icon(Icons.menu_rounded),
-                label: 'More',
-              ),
-            ],
-          ),
-        );
-      },
+    final pages = <Widget>[
+      HomeScreen(appState: widget.appState, onNavigateTab: _switchToTab),
+      OptionChainScreen(appState: widget.appState),
+      SignalsScreen(appState: widget.appState),
+      PositionsScreen(appState: widget.appState),
+      SettingsScreen(appState: widget.appState),
+    ];
+
+    return Scaffold(
+      backgroundColor: QuantTheme.bgMain,
+      body: SafeArea(
+        child: IndexedStack(
+          index: _currentIndex,
+          children: pages,
+        ),
+      ),
+      bottomNavigationBar: Container(
+        decoration: const BoxDecoration(
+          color: QuantTheme.bgSecondary,
+          border: Border(top: BorderSide(color: QuantTheme.border, width: 1.0)),
+        ),
+        child: BottomNavigationBar(
+          currentIndex: _currentIndex,
+          onTap: _switchToTab,
+          type: BottomNavigationBarType.fixed,
+          backgroundColor: QuantTheme.bgSecondary,
+          selectedItemColor: QuantTheme.accent,
+          unselectedItemColor: QuantTheme.textSecondary,
+          selectedLabelStyle: QuantTheme.heading(size: 10, color: QuantTheme.accent),
+          unselectedLabelStyle: QuantTheme.label(size: 10),
+          items: const [
+            BottomNavigationBarItem(
+              icon: Icon(Icons.dashboard_outlined, size: 20),
+              activeIcon: Icon(Icons.dashboard, size: 20),
+              label: 'Home',
+            ),
+            BottomNavigationBarItem(
+              icon: Icon(Icons.candlestick_chart_outlined, size: 20),
+              activeIcon: Icon(Icons.candlestick_chart, size: 20),
+              label: 'Market',
+            ),
+            BottomNavigationBarItem(
+              icon: Icon(Icons.graphic_eq, size: 20),
+              activeIcon: Icon(Icons.radar, size: 20),
+              label: 'Signals',
+            ),
+            BottomNavigationBarItem(
+              icon: Icon(Icons.account_balance_wallet_outlined, size: 20),
+              activeIcon: Icon(Icons.account_balance_wallet, size: 20),
+              label: 'Orders',
+            ),
+            BottomNavigationBarItem(
+              icon: Icon(Icons.biotech_outlined, size: 20),
+              activeIcon: Icon(Icons.biotech, size: 20),
+              label: 'More',
+            ),
+          ],
+        ),
+      ),
     );
-  }
-
-  String _currentHeaderTitle() {
-    if (_bottomNavIndex == 1) {
-      if (_analyticsSubView == 'oi_analysis') return 'OI Analysis';
-      if (_analyticsSubView == 'option_chain') return 'Option Chain';
-      return 'Charts';
-    }
-    if (_bottomNavIndex == 2) return 'Signals';
-    if (_bottomNavIndex == 3) return 'Positions';
-    if (_bottomNavIndex == 4) {
-      return _moreSubView == 'backtest' ? 'Backtesting' : 'Settings';
-    }
-    return 'AI Options Pro';
-  }
-
-  List<Widget> _buildHeaderSwitcher() {
-    if (_bottomNavIndex == 1) {
-      return [
-        TextButton(
-          onPressed: () => setState(() => _analyticsSubView = 'oi_analysis'),
-          child: Text(
-            'OI',
-            style: TextStyle(
-              color: _analyticsSubView == 'oi_analysis'
-                  ? const Color(0xFF40C4FF)
-                  : Colors.white54,
-              fontSize: 12,
-            ),
-          ),
-        ),
-        TextButton(
-          onPressed: () => setState(() => _analyticsSubView = 'option_chain'),
-          child: Text(
-            'Chain',
-            style: TextStyle(
-              color: _analyticsSubView == 'option_chain'
-                  ? const Color(0xFF40C4FF)
-                  : Colors.white54,
-              fontSize: 12,
-            ),
-          ),
-        ),
-        TextButton(
-          onPressed: () => setState(() => _analyticsSubView = 'charts'),
-          child: Text(
-            'Charts',
-            style: TextStyle(
-              color: _analyticsSubView == 'charts'
-                  ? const Color(0xFF40C4FF)
-                  : Colors.white54,
-              fontSize: 12,
-            ),
-          ),
-        ),
-      ];
-    }
-    if (_bottomNavIndex == 4) {
-      return [
-        TextButton(
-          onPressed: () => setState(() => _moreSubView = 'backtest'),
-          child: Text(
-            'Backtest',
-            style: TextStyle(
-              color: _moreSubView == 'backtest'
-                  ? const Color(0xFF40C4FF)
-                  : Colors.white54,
-              fontSize: 12,
-            ),
-          ),
-        ),
-        TextButton(
-          onPressed: () => setState(() => _moreSubView = 'settings'),
-          child: Text(
-            'Settings',
-            style: TextStyle(
-              color: _moreSubView == 'settings'
-                  ? const Color(0xFF40C4FF)
-                  : Colors.white54,
-              fontSize: 12,
-            ),
-          ),
-        ),
-      ];
-    }
-    return const [];
-  }
-
-  Widget _buildBody() {
-    switch (_bottomNavIndex) {
-      case 0:
-        return HomeScreen(
-          appState: widget.appState,
-          onNavigateQuickAction: _handleQuickAction,
-        );
-      case 1:
-        if (_analyticsSubView == 'oi_analysis') {
-          return OiAnalysisScreen(appState: widget.appState);
-        } else if (_analyticsSubView == 'option_chain') {
-          return OptionChainScreen(appState: widget.appState);
-        }
-        return ChartsScreen(appState: widget.appState);
-      case 2:
-        return SignalsScreen(appState: widget.appState);
-      case 3:
-        return PositionsScreen(appState: widget.appState);
-      case 4:
-        return _moreSubView == 'backtest'
-            ? BacktestScreen(appState: widget.appState)
-            : SettingsScreen(appState: widget.appState);
-      default:
-        return HomeScreen(
-          appState: widget.appState,
-          onNavigateQuickAction: _handleQuickAction,
-        );
-    }
   }
 }
