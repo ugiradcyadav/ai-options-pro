@@ -253,23 +253,24 @@ class AppState extends ChangeNotifier {
       await ForeverDatabase.instance.saveOrder(paperOrd);
     }
 
-    final pos = PositionRecord(
-      positionId: 'POS_$nowMs',
-      securityId: '${sig.index.dhanSymbol}_${sig.strike}_$optType',
-      indexName: sig.index.label,
-      expiry: sig.expiry,
-      strike: sig.strike,
-      optionType: optType,
-      quantity: sig.lotSize,
-      avgEntryPrice: sig.entryPremium,
-      currentLtp: sig.entryPremium,
-      stopLossPremium: sig.stopLossPremium,
-      targetPremium: sig.targetPremium,
-      openTimestampMs: nowMs,
-      status: 'OPEN',
-      mode: modeStr,
-      realizedPnl: 0.0,
-    );
+    final pos = PositionRecord.fromMap({
+      "position_id": "POS_$nowMs",
+      "security_id": "${sig.index.dhanSymbol}_${sig.strike}_$optType",
+      "index_name": sig.index.label,
+      "expiry": sig.expiry,
+      "strike": sig.strike,
+      "option_type": optType,
+      "quantity": sig.lotSize,
+      "avg_entry_price": sig.entryPremium,
+      "current_ltp": sig.entryPremium,
+      "stop_loss": sig.stopLossPremium,
+      "target": sig.targetPremium,
+      "status": "OPEN",
+      "mode": modeStr,
+      "realized_pnl": 0.0,
+      "opened_at_ms": nowMs,
+      "open_timestamp_ms": nowMs,
+    });
     openPositions.insert(0, pos);
     await ForeverDatabase.instance.savePosition(pos);
     notifyListeners();

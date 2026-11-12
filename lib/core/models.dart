@@ -441,8 +441,8 @@ class PositionRecord {
     this.realizedPnl = 0.0,
   });
 
-  double get stopLoss => stopLossPremium;
-  double get target => targetPremium;
+  double get stopLoss => avgEntryPrice * 0.90;
+  double get target => avgEntryPrice * 1.18;
   double get unrealizedPnl => (currentLtp - avgEntryPrice) * quantity;
   double get pnlPct => avgEntryPrice > 0
       ? ((currentLtp - avgEntryPrice) / avgEntryPrice) * 100.0
