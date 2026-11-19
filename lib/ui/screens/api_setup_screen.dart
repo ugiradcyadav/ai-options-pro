@@ -2,16 +2,14 @@ import 'package:flutter/material.dart';
 import '../../core/totp_auth.dart';
 import '../../data/angel_smartapi_engine.dart';
 import '../../data/dhan_data_engine.dart';
-import '../../main.dart';
+import '../theme/quant_theme.dart';
 
 class ApiSetupScreen extends StatefulWidget {
   final VoidCallback onConnectedSuccess;
-  final bool isFirstLaunch;
 
   const ApiSetupScreen({
     super.key,
     required this.onConnectedSuccess,
-    this.isFirstLaunch = true,
   });
 
   @override
@@ -19,394 +17,320 @@ class ApiSetupScreen extends StatefulWidget {
 }
 
 class _ApiSetupScreenState extends State<ApiSetupScreen> {
-  String _selectedBroker = 'ANGEL'; // 'ANGEL' or 'DHAN'
+  String _selectedBroker = 'ANGEL'; // 'ANGEL' | 'DHAN'
+  bool _isBusy = false;
+  String _statusMessage = '';
+  bool _statusIsError = false;
 
-  // Angel One Controllers
+  // Angel One fields
   final _angelApiKeyCtrl = TextEditingController();
   final _angelClientCodeCtrl = TextEditingController();
   final _angelPinCtrl = TextEditingController();
-  final _angelTotpSecretCtrl = TextEditingController();
+  final _angelOtpCtrl = TextEditingController();
+  final _angelTotpSeedCtrl = TextEditingController();
+  bool _angelOptInTotp = false;
 
-  // Dhan Controllers
-  final _clientIdCtrl = TextEditingController();
-  final _pinSecretCtrl = TextEditingController();
-  final _totpSecretCtrl = TextEditingController();
-  final _accessTokenCtrl = TextEditingController();
-
-  bool _loading = false;
-  bool _isError = false;
-  String _statusMessage = '';
-  String _liveTotpPreview = '------';
+  // Dhan fields
+  final _dhanClientIdCtrl = TextEditingController();
+  final _dhanAccessTokenCtrl = TextEditingController();
+  final _dhanPinCtrl = TextEditingController();
+  final _dhanTotpSeedCtrl = TextEditingController();
+  bool _dhanOptInTotp = false;
 
   @override
   void initState() {
     super.initState();
-    _loadExisting();
+    _loadNonSecretFields();
   }
 
-  Future<void> _loadExisting() async {
+  Future<void> _loadNonSecretFields() async {
     final broker = await AngelSmartApiEngine.getSelectedBroker();
     await AngelSmartApiEngine.instance.loadSavedConfig();
     final dhanCreds = await TotpAuthManager.loadCredentials();
+
     if (!mounted) return;
     setState(() {
-      _selectedBroker = broker.toString();
+      _selectedBroker = broker;
       _angelApiKeyCtrl.text = AngelSmartApiEngine.instance.apiKey;
       _angelClientCodeCtrl.text = AngelSmartApiEngine.instance.clientCode;
-      _angelPinCtrl.text = AngelSmartApiEngine.instance.pin;
-      _angelTotpSecretCtrl.text = AngelSmartApiEngine.instance.totpSecret;
-
-      _clientIdCtrl.text = dhanCreds.clientId;
-      _pinSecretCtrl.text = dhanCreds.pinOrSecret;
-      _totpSecretCtrl.text = dhanCreds.totpSecret;
-      _accessTokenCtrl.text = dhanCreds.accessToken;
-
-      final activeSecret = _selectedBroker == 'ANGEL'
-          ? _angelTotpSecretCtrl.text
-          : _totpSecretCtrl.text;
-      if (activeSecret.isNotEmpty) {
-        _liveTotpPreview = TotpAuthManager.generateTotpCode(activeSecret);
-      }
+      _dhanClientIdCtrl.text = dhanCreds.clientId;
     });
   }
 
-  void _updateTotpPreview(String val) {
-    if (val.trim().length >= 8) {
+  Future<void> _connectAngelOne() async {
+    setState(() {
+      _isBusy = true;
+      _statusMessage = 'Authenticating Angel One SmartAPI...';
+      _statusIsError = false;
+    });
+
+    final ok = await AngelSmartApiEngine.instance.loginAndSave(
+      newApiKey: _angelApiKeyCtrl.text,
+      newClientCode: _angelClientCodeCtrl.text,
+      newPin: _angelPinCtrl.text,
+      newTotpSecret: _angelOptInTotp ? _angelTotpSeedCtrl.text : '',
+      oneTimeOtp: _angelOtpCtrl.text,
+      optInStoreTotp: _angelOptInTotp,
+    );
+
+    if (ok) {
+      await DhanDataEngine.instance.initializeAndStart();
+      if (!mounted) return;
       setState(() {
-        _liveTotpPreview = TotpAuthManager.generateTotpCode(val);
+        _isBusy = false;
+        _statusMessage = 'Angel One connected & session stored securely.';
+        _statusIsError = false;
+      });
+      widget.onConnectedSuccess();
+      if (mounted) Navigator.of(context).pop();
+    } else {
+      if (!mounted) return;
+      setState(() {
+        _isBusy = false;
+        _statusMessage = AngelSmartApiEngine.instance.lastError.isNotEmpty
+            ? AngelSmartApiEngine.instance.lastError
+            : 'Angel One authentication failed.';
+        _statusIsError = true;
       });
     }
   }
 
-  Future<void> _saveAndConnect() async {
+  Future<void> _connectDhan() async {
     setState(() {
-      _loading = true;
-      _isError = false;
-      _statusMessage = _selectedBroker == 'ANGEL'
-          ? 'Connecting to Angel One SmartAPI (Free Live Market Feed)...'
-          : 'Connecting to Dhan API & Live Option Chain...';
+      _isBusy = true;
+      _statusMessage = 'Verifying Dhan API session...';
+      _statusIsError = false;
     });
 
-    if (_selectedBroker == 'ANGEL') {
-      if (_angelApiKeyCtrl.text.trim().isEmpty ||
-          _angelClientCodeCtrl.text.trim().isEmpty ||
-          _angelPinCtrl.text.trim().isEmpty ||
-          _angelTotpSecretCtrl.text.trim().isEmpty) {
-        setState(() {
-          _loading = false;
-          _isError = true;
-          _statusMessage =
-              'Please fill all 4 Angel One fields (API Key, Client Code, PIN, and TOTP Secret).';
-        });
-        return;
-      }
+    await AngelSmartApiEngine.setSelectedBroker('DHAN');
+    await TotpAuthManager.saveCredentials(
+      clientId: _dhanClientIdCtrl.text,
+      accessToken: _dhanAccessTokenCtrl.text,
+      pin: _dhanOptInTotp ? '' : _dhanPinCtrl.text,
+      totpSecret: _dhanOptInTotp ? _dhanTotpSeedCtrl.text : '',
+      optInStoreTotp: _dhanOptInTotp,
+    );
 
-      final ok = await AngelSmartApiEngine.instance.loginAndSave(
-        newApiKey: _angelApiKeyCtrl.text,
-        newClientCode: _angelClientCodeCtrl.text,
-        newPin: _angelPinCtrl.text,
-        newTotpSecret: _angelTotpSecretCtrl.text,
-      );
+    final creds = await TotpAuthManager.ensureValidSession();
+    final ok =
+        creds != null && await TotpAuthManager.verifyDhanSession(creds);
 
-      if (!ok) {
-        if (!mounted) return;
-        setState(() {
-          _loading = false;
-          _isError = true;
-          _statusMessage = AngelSmartApiEngine.instance.lastError;
-        });
-        return;
-      }
+    if (ok) {
+      await DhanDataEngine.instance.initializeAndStart();
+      if (!mounted) return;
+      setState(() {
+        _isBusy = false;
+        _statusMessage = 'Dhan session verified & saved in encrypted storage.';
+        _statusIsError = false;
+      });
+      widget.onConnectedSuccess();
+      if (mounted) Navigator.of(context).pop();
     } else {
-      await AngelSmartApiEngine.setSelectedBroker('DHAN');
-      await TotpAuthManager.saveCredentials(
-        clientId: _clientIdCtrl.text,
-        pinOrSecret: _pinSecretCtrl.text,
-        totpSecret: _totpSecretCtrl.text,
-        accessToken: _accessTokenCtrl.text,
-      );
-      await TotpAuthManager.ensureValidSession(forceRefresh: true);
+      if (!mounted) return;
+      setState(() {
+        _isBusy = false;
+        _statusMessage = TotpAuthManager.lastAuthError.isNotEmpty
+            ? TotpAuthManager.lastAuthError
+            : 'Dhan authentication failed.';
+        _statusIsError = true;
+      });
     }
+  }
 
-    DhanDataEngine.instance.initializeAndStart();
-    if (!mounted) return;
-
-    setState(() {
-      _loading = false;
-      _isError = false;
-      _statusMessage = 'Connected! Opening Live Option Terminal...';
-    });
-
-    widget.onConnectedSuccess();
-    if (mounted) {
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(
-          builder: (_) => MainTerminalShell(appState: globalAppState),
-        ),
-      );
-    }
+  @override
+  void dispose() {
+    _angelApiKeyCtrl.dispose();
+    _angelClientCodeCtrl.dispose();
+    _angelPinCtrl.dispose();
+    _angelOtpCtrl.dispose();
+    _angelTotpSeedCtrl.dispose();
+    _dhanClientIdCtrl.dispose();
+    _dhanAccessTokenCtrl.dispose();
+    _dhanPinCtrl.dispose();
+    _dhanTotpSeedCtrl.dispose();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFF080D1A),
+      backgroundColor: QuantTheme.bgMain,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF0D1528),
-        title: const Text(
-          'Broker API & Auto-TOTP Setup',
-          style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-        ),
+        title: const Text('Broker API Setup (Encrypted)'),
       ),
       body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(14),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Broker Selector Tabs (Angel One Free Live Data vs Dhan)
+            // Broker Selector
             Row(
-              children: [
-                Expanded(
+              children: ['ANGEL', 'DHAN'].map((b) {
+                final active = _selectedBroker == b;
+                return Expanded(
                   child: GestureDetector(
-                    onTap: () => setState(() => _selectedBroker = 'ANGEL'),
+                    onTap: () => setState(() => _selectedBroker = b),
                     child: Container(
-                      padding: const EdgeInsets.symmetric(vertical: 11),
+                      margin: const EdgeInsets.symmetric(horizontal: 4),
+                      padding: const EdgeInsets.symmetric(vertical: 10),
                       alignment: Alignment.center,
                       decoration: BoxDecoration(
-                        color: _selectedBroker == 'ANGEL'
-                            ? const Color(0xFF00C853)
-                            : const Color(0xFF111C35),
-                        borderRadius: BorderRadius.circular(10),
-                        border: Border.all(color: const Color(0xFF1E325C)),
+                        color: active ? QuantTheme.accent : QuantTheme.bgPanel,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(
+                          color: active ? QuantTheme.accent : QuantTheme.border,
+                        ),
                       ),
-                      child: const Text(
-                        'Angel One (Free Data)',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 12,
+                      child: Text(
+                        b == 'ANGEL' ? 'Angel One SmartAPI' : 'Dhan HQ API',
+                        style: QuantTheme.heading(
+                          size: 12,
+                          color: active
+                              ? QuantTheme.bgMain
+                              : QuantTheme.textPrimary,
                         ),
                       ),
                     ),
                   ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: GestureDetector(
-                    onTap: () => setState(() => _selectedBroker = 'DHAN'),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(vertical: 11),
-                      alignment: Alignment.center,
-                      decoration: BoxDecoration(
-                        color: _selectedBroker == 'DHAN'
-                            ? const Color(0xFF1976D2)
-                            : const Color(0xFF111C35),
-                        borderRadius: BorderRadius.circular(10),
-                        border: Border.all(color: const Color(0xFF1E325C)),
-                      ),
-                      child: const Text(
-                        'Dhan API + NSE Feed',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 12,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ],
+                );
+              }).toList(),
             ),
-            const SizedBox(height: 14),
+            const SizedBox(height: 12),
+
+            QuantPanel(
+              backgroundColor: QuantTheme.bgSecondary,
+              child: Text(
+                'Security Policy (WP-1): Credentials are stored in Android EncryptedSharedPreferences. PIN and TOTP seed are never stored together.',
+                style: QuantTheme.label(size: 10, color: QuantTheme.accent),
+              ),
+            ),
+            const SizedBox(height: 12),
 
             if (_selectedBroker == 'ANGEL') ...[
-              _buildField(
-                label: 'Angel One SmartAPI Key *',
-                hint: '8-char API Key from smartapi.angelbroking.com',
-                controller: _angelApiKeyCtrl,
-                icon: Icons.vpn_key_outlined,
+              _inputField('Angel API Key', _angelApiKeyCtrl),
+              const SizedBox(height: 10),
+              _inputField('Client Code', _angelClientCodeCtrl),
+              const SizedBox(height: 10),
+              _inputField('MPIN (Used for login)', _angelPinCtrl,
+                  obscure: true),
+              const SizedBox(height: 10),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: Text('Opt-in: Store TOTP Seed (Disables PIN storage)',
+                    style: QuantTheme.label(
+                        size: 11, color: QuantTheme.textPrimary)),
+                value: _angelOptInTotp,
+                activeColor: QuantTheme.accent,
+                onChanged: (v) => setState(() => _angelOptInTotp = v),
               ),
-              const SizedBox(height: 12),
-              _buildField(
-                label: 'Angel One Client Code *',
-                hint: 'e.g. A123456 or S123456',
-                controller: _angelClientCodeCtrl,
-                icon: Icons.badge_outlined,
-              ),
-              const SizedBox(height: 12),
-              _buildField(
-                label: 'Angel One 4-Digit Login PIN *',
-                hint: 'Enter your Angel One MPIN',
-                controller: _angelPinCtrl,
-                icon: Icons.lock_outline,
-                obscure: true,
-              ),
-              const SizedBox(height: 12),
-              _buildField(
-                label: 'Angel One TOTP Secret Key (26-char Base32) *',
-                hint: 'From smartapi.angelbroking.com -> Enable TOTP',
-                controller: _angelTotpSecretCtrl,
-                icon: Icons.timer_outlined,
-                onChanged: _updateTotpPreview,
+              if (_angelOptInTotp)
+                _inputField('TOTP Base32 Secret Seed', _angelTotpSeedCtrl,
+                    obscure: true)
+              else
+                _inputField('Current 6-Digit Authenticator OTP', _angelOtpCtrl,
+                    keyboardType: TextInputType.number),
+              const SizedBox(height: 16),
+              SizedBox(
+                width: double.infinity,
+                height: 46,
+                child: ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: QuantTheme.positive,
+                    foregroundColor: QuantTheme.bgMain,
+                  ),
+                  onPressed: _isBusy ? null : _connectAngelOne,
+                  child: Text(
+                    _isBusy
+                        ? 'Connecting...'
+                        : 'Verify & Save Angel One Session',
+                    style:
+                        QuantTheme.heading(size: 12, color: QuantTheme.bgMain),
+                  ),
+                ),
               ),
             ] else ...[
-              _buildField(
-                label: 'Dhan Client ID *',
-                hint: 'e.g. 1101108080',
-                controller: _clientIdCtrl,
-                icon: Icons.badge_outlined,
+              _inputField('Dhan Client ID', _dhanClientIdCtrl),
+              const SizedBox(height: 10),
+              _inputField('Dhan Access Token', _dhanAccessTokenCtrl,
+                  obscure: true),
+              const SizedBox(height: 10),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: Text('Opt-in: Store TOTP Seed (Disables PIN storage)',
+                    style: QuantTheme.label(
+                        size: 11, color: QuantTheme.textPrimary)),
+                value: _dhanOptInTotp,
+                activeColor: QuantTheme.accent,
+                onChanged: (v) => setState(() => _dhanOptInTotp = v),
               ),
-              const SizedBox(height: 12),
-              _buildField(
-                label: 'Dhan 6-Digit Login PIN',
-                hint: 'Enter your 6-digit Dhan PIN',
-                controller: _pinSecretCtrl,
-                icon: Icons.lock_outline,
-                obscure: true,
-              ),
-              const SizedBox(height: 12),
-              _buildField(
-                label: 'Dhan TOTP Base32 Secret Key',
-                hint: 'e.g. TVTLGOXTN5OG3VUQ...',
-                controller: _totpSecretCtrl,
-                icon: Icons.timer_outlined,
-                onChanged: _updateTotpPreview,
-              ),
-              const SizedBox(height: 12),
-              _buildField(
-                label: 'Direct 24h Access Token (Optional)',
-                hint: 'Paste JWT Access Token',
-                controller: _accessTokenCtrl,
-                icon: Icons.vpn_key_outlined,
-              ),
-            ],
-
-            Padding(
-              padding: const EdgeInsets.only(top: 8, left: 4),
-              child: Text(
-                'Live Local RFC-6238 TOTP Code: $_liveTotpPreview',
-                style: const TextStyle(
-                  color: Color(0xFF00E676),
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
+              if (_dhanOptInTotp)
+                _inputField('TOTP Base32 Secret Seed', _dhanTotpSeedCtrl,
+                    obscure: true)
+              else
+                _inputField('PIN (Optional)', _dhanPinCtrl, obscure: true),
+              const SizedBox(height: 16),
+              SizedBox(
+                width: double.infinity,
+                height: 46,
+                child: ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: QuantTheme.accent,
+                    foregroundColor: QuantTheme.bgMain,
+                  ),
+                  onPressed: _isBusy ? null : _connectDhan,
+                  child: Text(
+                    _isBusy ? 'Verifying...' : 'Verify & Save Dhan Session',
+                    style:
+                        QuantTheme.heading(size: 12, color: QuantTheme.bgMain),
+                  ),
                 ),
               ),
-            ),
+            ],
 
             if (_statusMessage.isNotEmpty) ...[
-              const SizedBox(height: 14),
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: _isError
-                      ? const Color(0xFFD50000).withOpacity(0.15)
-                      : const Color(0xFF00C853).withOpacity(0.15),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                    color: _isError
-                        ? const Color(0xFFFF5252)
-                        : const Color(0xFF00E676),
-                  ),
-                ),
+              const SizedBox(height: 12),
+              QuantPanel(
+                borderColor: _statusIsError
+                    ? QuantTheme.negative
+                    : QuantTheme.positive,
                 child: Text(
                   _statusMessage,
-                  style: TextStyle(
-                    color: _isError
-                        ? const Color(0xFFFF5252)
-                        : const Color(0xFF00E676),
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
+                  style: QuantTheme.mono(
+                    size: 11,
+                    color: _statusIsError
+                        ? QuantTheme.negative
+                        : QuantTheme.positive,
                   ),
                 ),
               ),
             ],
-            const SizedBox(height: 18),
-            SizedBox(
-              width: double.infinity,
-              height: 48,
-              child: ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: _selectedBroker == 'ANGEL'
-                      ? const Color(0xFF00C853)
-                      : const Color(0xFF1976D2),
-                  foregroundColor: Colors.white,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                ),
-                onPressed: _loading ? null : _saveAndConnect,
-                icon: _loading
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: Colors.white,
-                        ),
-                      )
-                    : const Icon(Icons.bolt),
-                label: Text(
-                  _loading
-                      ? 'Connecting Live Feed...'
-                      : 'Save & Start Live Data Engine',
-                  style: const TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 14,
-                  ),
-                ),
-              ),
-            ),
           ],
         ),
       ),
     );
   }
 
-  Widget _buildField({
-    required String label,
-    required String hint,
-    required TextEditingController controller,
-    required IconData icon,
+  Widget _inputField(
+    String label,
+    TextEditingController ctrl, {
     bool obscure = false,
-    ValueChanged<String>? onChanged,
+    TextInputType keyboardType = TextInputType.text,
   }) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(
-          label,
-          style: const TextStyle(
-            color: Colors.white70,
-            fontSize: 12,
-            fontWeight: FontWeight.w600,
-          ),
+    return TextField(
+      controller: ctrl,
+      obscureText: obscure,
+      keyboardType: keyboardType,
+      style: QuantTheme.mono(size: 12),
+      decoration: InputDecoration(
+        labelText: label,
+        labelStyle: QuantTheme.label(size: 11),
+        filled: true,
+        fillColor: QuantTheme.bgPanel,
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(8),
+          borderSide: const BorderSide(color: QuantTheme.border),
         ),
-        const SizedBox(height: 6),
-        TextField(
-          controller: controller,
-          obscureText: obscure,
-          onChanged: onChanged,
-          style: const TextStyle(color: Colors.white, fontSize: 13),
-          decoration: InputDecoration(
-            hintText: hint,
-            hintStyle: const TextStyle(color: Colors.white30, fontSize: 12),
-            prefixIcon: Icon(icon, color: Colors.white54, size: 18),
-            filled: true,
-            fillColor: const Color(0xFF111C35),
-            contentPadding:
-                const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-            enabledBorder: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(10),
-              borderSide: const BorderSide(color: Color(0xFF1E325C)),
-            ),
-            focusedBorder: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(10),
-              borderSide: const BorderSide(color: Color(0xFF2979FF)),
-            ),
-          ),
-        ),
-      ],
+      ),
     );
   }
 }
