@@ -8,6 +8,7 @@ import '../../engine/math_greeks.dart';
 import '../../state/app_state.dart';
 import '../theme/quant_theme.dart';
 import 'oi_analysis_screen.dart';
+import 'pulse_flow_screen.dart';
 
 class OptionChainScreen extends StatefulWidget {
   final AppState appState;
@@ -16,7 +17,7 @@ class OptionChainScreen extends StatefulWidget {
   const OptionChainScreen({
     super.key,
     required this.appState,
-    this.initialWorkspaceTab = 'Option Chain',
+    this.initialWorkspaceTab = 'Pulse this.initialWorkspaceTab = 'Option Chain', Flow',
   });
 
   @override
@@ -92,6 +93,7 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
             scrollDirection: Axis.horizontal,
             child: Row(
               children: [
+                'Pulse & Flow',
                 'Charts',
                 'Option Chain',
                 'OI Analysis',
@@ -244,7 +246,9 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
           ),
           const SizedBox(height: 10),
 
-          if (_workspaceTab == 'Charts')
+          if (_workspaceTab == 'Pulse & Flow')
+            PulseFlowScreen(appState: widget.appState)
+          else if (_workspaceTab == 'Charts')
             _buildChartsWorkspace(idx, spot)
           else if (_workspaceTab == 'OI Analysis')
             OiAnalysisScreen(appState: widget.appState, embeddedMode: true)
