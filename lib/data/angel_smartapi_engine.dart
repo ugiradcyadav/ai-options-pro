@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
@@ -33,6 +34,11 @@ class AngelSmartApiEngine {
   String feedToken = '';
   String lastError = '';
 
+  String _resolvedLocalIp = '';
+  String _resolvedPublicIp = '';
+  // Android 11+ restricts hardware MAC access and returns 02:00:00:00:00:00
+  static const String _androidOsMac = '02:00:00:00:00:00';
+
   Future<void> loadSavedConfig() async {
     apiKey = await _secure.read(key: _kAngelApiKey) ?? '';
     clientCode = await _secure.read(key: _kAngelClientCode) ?? '';
@@ -57,14 +63,55 @@ class AngelSmartApiEngine {
       clientCode.trim().isNotEmpty &&
       (jwtToken.isNotEmpty || _pin.isNotEmpty || _totpKey.isNotEmpty);
 
-  /// WP-1: Clean headers without fake hardcoded public IP or MAC address
+  /// WP-1: Resolve real device local IP and real public IP once per session (required by Angel SmartAPI)
+  Future<void> _ensureRealNetworkInfo() async {
+    if (_resolvedLocalIp.isEmpty) {
+      try {
+        final ifaces = await NetworkInterface.list(
+          type: InternetAddressType.IPv4,
+          includeLoopback: false,
+        );
+        for (final iface in ifaces) {
+          for (final addr in iface.addresses) {
+            if (!addr.isLoopback && addr.address.isNotEmpty) {
+              _resolvedLocalIp = addr.address;
+              break;
+            }
+          }
+          if (_resolvedLocalIp.isNotEmpty) break;
+        }
+      } catch (_) {}
+      if (_resolvedLocalIp.isEmpty) _resolvedLocalIp = '127.0.0.1';
+    }
+
+    if (_resolvedPublicIp.isEmpty) {
+      try {
+        final resp = await http
+            .get(Uri.parse('https://api.ipify.org'))
+            .timeout(const Duration(seconds: 4));
+        if (resp.statusCode == 200) {
+          final ip = resp.body.trim();
+          if (RegExp(r'^\d{1,3}(\.\d{1,3}){3}$').hasMatch(ip)) {
+            _resolvedPublicIp = ip;
+          }
+        }
+      } catch (_) {}
+      if (_resolvedPublicIp.isEmpty) _resolvedPublicIp = _resolvedLocalIp;
+    }
+  }
+
   Map<String, String> _buildHeaders() {
+    final localIp = _resolvedLocalIp.isNotEmpty ? _resolvedLocalIp : '127.0.0.1';
+    final publicIp = _resolvedPublicIp.isNotEmpty ? _resolvedPublicIp : localIp;
     final h = <String, String>{
       'Content-Type': 'application/json',
       'Accept': 'application/json',
       'Cache-Control': 'no-cache',
       'X-UserType': 'USER',
       'X-SourceID': 'WEB',
+      'X-ClientLocalIP': localIp,
+      'X-ClientPublicIP': publicIp,
+      'X-MACAddress': _androidOsMac,
       'X-PrivateKey': apiKey.trim(),
     };
     if (jwtToken.isNotEmpty) {
@@ -73,7 +120,20 @@ class AngelSmartApiEngine {
     return h;
   }
 
-  /// WP-1: Never store PIN and TOTP key together. Only store TOTP key if user explicitly opts in.
+  String _extractSafeBrokerError(http.Response resp) {
+    try {
+      final decoded = jsonDecode(resp.body);
+      if (decoded is Map) {
+        final code = (decoded['errorcode'] ?? '').toString().trim();
+        final msg = (decoded['message'] ?? '').toString().trim();
+        if (code.isNotEmpty || msg.isNotEmpty) {
+          return 'Angel One rejected login (${code.isNotEmpty ? code : "HTTP ${resp.statusCode}"}): $msg';
+        }
+      }
+    } catch (_) {}
+    return 'Angel One login failed (HTTP ${resp.statusCode}).';
+  }
+
   Future<bool> loginAndSave({
     required String newApiKey,
     required String newClientCode,
@@ -123,6 +183,7 @@ class AngelSmartApiEngine {
     String ephemeralOtp = '',
   }) async {
     await loadSavedConfig();
+    await _ensureRealNetworkInfo();
     if (!forceLogin && jwtToken.isNotEmpty) {
       return true;
     }
@@ -163,11 +224,10 @@ class AngelSmartApiEngine {
           lastError = '';
           return true;
         }
-        // WP-1: Never place raw resp.body into error strings
-        lastError = 'Angel One login rejected by broker.';
+        lastError = _extractSafeBrokerError(resp);
         return false;
       }
-      lastError = 'Angel One login failed (HTTP ${resp.statusCode}).';
+      lastError = _extractSafeBrokerError(resp);
       return false;
     } catch (_) {
       lastError = 'Network error connecting to Angel One.';
@@ -177,6 +237,7 @@ class AngelSmartApiEngine {
 
   Future<double?> fetchRmsCapital() async {
     if (jwtToken.isEmpty) return null;
+    await _ensureRealNetworkInfo();
     try {
       final resp = await http
           .get(
@@ -208,17 +269,16 @@ class AngelSmartApiEngine {
     }
   }
 
-  /// WP-3: Normalize Angel One NFO openInterest (reported in shares/qty) into contracts (lots) using master lotSize
   static int normalizeAngelOiToLots(int rawOiQty, int lotSize) {
     if (rawOiQty <= 0 || lotSize <= 0) return 0;
     return (rawOiQty / lotSize).round();
   }
 
-  /// WP-3 & WP-4: Fetches live NSE index spot + ATM +/- 12 NFO option chain resolved strictly from ScripMasterEngine
   Future<Map<String, dynamic>?> fetchLiveSpotAndChain({
     required UnderlyingIndex index,
     required String expiryIso,
   }) async {
+    await _ensureRealNetworkInfo();
     if (jwtToken.isEmpty) {
       final ok = await ensureSession();
       if (!ok) return null;
@@ -236,7 +296,7 @@ class AngelSmartApiEngine {
     final idxToken = _indexTokenForAngel(index);
     double spot = 0.0;
     double changePct = 0.0;
-    int exchangeTsMs = DateTime.now().millisecondsSinceEpoch;
+    final exchangeTsMs = DateTime.now().millisecondsSinceEpoch;
 
     try {
       final spotResp = await http
@@ -272,7 +332,6 @@ class AngelSmartApiEngine {
 
     if (spot <= 0) return null;
 
-    // Resolve ATM +/- 12 strikes strictly from ScripMasterEngine for the chosen expiryIso
     final band =
         StrikeSelectionEngine.getMonitoringStrikeBand(index, spot, radius: 12);
     final atm = StrikeSelectionEngine.computeAtmStrike(index, spot);
@@ -281,7 +340,6 @@ class AngelSmartApiEngine {
         StrikeSelectionEngine.computeFractionalYearsToExpiryIst(expiryIso);
 
     final List<String> nfoTokens = [];
-    final Map<String, ResolvedContract> contractByToken = {};
     final Map<int, ResolvedContract> ceContracts = {};
     final Map<int, ResolvedContract> peContracts = {};
 
@@ -300,22 +358,20 @@ class AngelSmartApiEngine {
       );
       if (ceC != null) {
         nfoTokens.add(ceC.securityId);
-        contractByToken[ceC.securityId] = ceC;
         ceContracts[strike] = ceC;
       }
       if (peC != null) {
         nfoTokens.add(peC.securityId);
-        contractByToken[peC.securityId] = peC;
         peContracts[strike] = peC;
       }
     }
 
     if (nfoTokens.isEmpty) {
-      lastError = 'No contracts resolved in master for ${index.dhanSymbol} $expiryIso.';
+      lastError =
+          'No contracts resolved in master for ${index.dhanSymbol} $expiryIso.';
       return null;
     }
 
-    // Angel SmartAPI allows up to 50 tokens per batched FULL quote request
     final Map<String, Map> quoteByToken = {};
     for (int start = 0; start < nfoTokens.length; start += 50) {
       final end = (start + 50 > nfoTokens.length)
@@ -353,7 +409,6 @@ class AngelSmartApiEngine {
     final receivedAtMs = DateTime.now().millisecondsSinceEpoch;
     final db = ForeverDatabase.instance;
 
-    // Derive forward from put-call parity at ATM if both CE & PE real mid prices are present
     double? parityForward;
     final atmCeC = ceContracts[atm];
     final atmPeC = peContracts[atm];
@@ -397,11 +452,9 @@ class AngelSmartApiEngine {
       final ceVol = ((ceQ['tradeVolume'] ?? 0) as num).toInt();
       final peVol = ((peQ['tradeVolume'] ?? 0) as num).toInt();
 
-      // WP-2: Extract real depth bid/ask/qty only; keep null when absent (never default to LTP or 100.0)
       final ceDepthInfo = _extractRealDepth(ceQ['depth'] as Map?);
       final peDepthInfo = _extractRealDepth(peQ['depth'] as Map?);
 
-      // WP-3: Persist raw 1-minute snapshots & compute real OI diffs (null until history exists)
       await db.insertChainSnapshot(
         contractId: ceC.securityId,
         indexName: index.label,
