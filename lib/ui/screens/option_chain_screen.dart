@@ -17,7 +17,7 @@ class OptionChainScreen extends StatefulWidget {
   const OptionChainScreen({
     super.key,
     required this.appState,
-    this.initialWorkspaceTab = 'Pulse this.initialWorkspaceTab = 'Option Chain', Flow',
+    this.initialWorkspaceTab = 'Pulse & Flow',
   });
 
   @override
