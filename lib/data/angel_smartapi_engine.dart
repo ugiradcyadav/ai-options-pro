@@ -36,7 +36,6 @@ class AngelSmartApiEngine {
 
   String _resolvedLocalIp = '';
   String _resolvedPublicIp = '';
-  // Android 11+ restricts hardware MAC access and returns 02:00:00:00:00:00
   static const String _androidOsMac = '02:00:00:00:00:00';
 
   Future<void> loadSavedConfig() async {
@@ -63,9 +62,8 @@ class AngelSmartApiEngine {
       clientCode.trim().isNotEmpty &&
       (jwtToken.isNotEmpty || _pin.isNotEmpty || _totpKey.isNotEmpty);
 
-  /// WP-1: Resolve real device local IP and real public IP once per session (required by Angel SmartAPI)
   Future<void> _ensureRealNetworkInfo() async {
-    if (_resolvedLocalIp.isEmpty) {
+    if (_resolvedLocalIp.isEmpty || _resolvedLocalIp == '127.0.0.1') {
       try {
         final ifaces = await NetworkInterface.list(
           type: InternetAddressType.IPv4,
@@ -81,32 +79,40 @@ class AngelSmartApiEngine {
           if (_resolvedLocalIp.isNotEmpty) break;
         }
       } catch (_) {}
-      if (_resolvedLocalIp.isEmpty) _resolvedLocalIp = '127.0.0.1';
+      if (_resolvedLocalIp.isEmpty) _resolvedLocalIp = '192.168.1.1';
     }
 
-    if (_resolvedPublicIp.isEmpty) {
-      try {
-        final resp = await http
-            .get(Uri.parse('https://api.ipify.org'))
-            .timeout(const Duration(seconds: 4));
-        if (resp.statusCode == 200) {
-          final ip = resp.body.trim();
-          if (RegExp(r'^\d{1,3}(\.\d{1,3}){3}$').hasMatch(ip)) {
-            _resolvedPublicIp = ip;
+    if (_resolvedPublicIp.isEmpty || _resolvedPublicIp == '127.0.0.1') {
+      final ipRegex = RegExp(r'^\d{1,3}(\.\d{1,3}){3}$');
+      for (final url in [
+        'https://api4.ipify.org',
+        'https://checkip.amazonaws.com',
+        'https://ifconfig.me/ip',
+      ]) {
+        try {
+          final resp = await http
+              .get(Uri.parse(url))
+              .timeout(const Duration(seconds: 4));
+          if (resp.statusCode == 200) {
+            final ip = resp.body.trim();
+            if (ipRegex.hasMatch(ip)) {
+              _resolvedPublicIp = ip;
+              break;
+            }
           }
-        }
-      } catch (_) {}
+        } catch (_) {}
+      }
       if (_resolvedPublicIp.isEmpty) _resolvedPublicIp = _resolvedLocalIp;
     }
   }
 
-  Map<String, String> _buildHeaders() {
-    final localIp = _resolvedLocalIp.isNotEmpty ? _resolvedLocalIp : '127.0.0.1';
+  Map<String, String> _buildHeaders({bool includeAuth = true}) {
+    final localIp = _resolvedLocalIp.isNotEmpty ? _resolvedLocalIp : '192.168.1.1';
     final publicIp = _resolvedPublicIp.isNotEmpty ? _resolvedPublicIp : localIp;
     final h = <String, String>{
       'Content-Type': 'application/json',
       'Accept': 'application/json',
-      'Cache-Control': 'no-cache',
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36',
       'X-UserType': 'USER',
       'X-SourceID': 'WEB',
       'X-ClientLocalIP': localIp,
@@ -114,7 +120,7 @@ class AngelSmartApiEngine {
       'X-MACAddress': _androidOsMac,
       'X-PrivateKey': apiKey.trim(),
     };
-    if (jwtToken.isNotEmpty) {
+    if (includeAuth && jwtToken.isNotEmpty) {
       h['Authorization'] = 'Bearer $jwtToken';
     }
     return h;
@@ -124,14 +130,21 @@ class AngelSmartApiEngine {
     try {
       final decoded = jsonDecode(resp.body);
       if (decoded is Map) {
-        final code = (decoded['errorcode'] ?? '').toString().trim();
-        final msg = (decoded['message'] ?? '').toString().trim();
+        final code = (decoded['errorcode'] ??
+                decoded['errorCode'] ??
+                decoded['code'] ??
+                '')
+            .toString()
+            .trim();
+        final msg = (decoded['message'] ?? decoded['error'] ?? '')
+            .toString()
+            .trim();
         if (code.isNotEmpty || msg.isNotEmpty) {
-          return 'Angel One rejected login (${code.isNotEmpty ? code : "HTTP ${resp.statusCode}"}): $msg';
+          return '[v3.2] Angel rejected (${code.isNotEmpty ? code : "HTTP ${resp.statusCode}"}): $msg';
         }
       }
     } catch (_) {}
-    return 'Angel One login failed (HTTP ${resp.statusCode}).';
+    return '[v3.2] Angel login failed (HTTP ${resp.statusCode}, IP: $_resolvedPublicIp).';
   }
 
   Future<bool> loginAndSave({
@@ -196,7 +209,7 @@ class AngelSmartApiEngine {
             : '');
 
     if (apiKey.isEmpty || clientCode.isEmpty || usePin.isEmpty || useOtp.isEmpty) {
-      lastError = 'Broker login requires active session or interactive OTP/PIN.';
+      lastError = '[v3.2] Missing API Key, Client Code, MPIN, or 6-digit OTP.';
       return false;
     }
 
@@ -205,11 +218,12 @@ class AngelSmartApiEngine {
           .post(
             Uri.parse(
                 'https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword'),
-            headers: _buildHeaders(),
+            headers: _buildHeaders(includeAuth: false),
             body: jsonEncode({
               'clientcode': clientCode,
               'password': usePin,
               'totp': useOtp,
+              'state': 'live',
             }),
           )
           .timeout(const Duration(seconds: 10));
@@ -230,7 +244,7 @@ class AngelSmartApiEngine {
       lastError = _extractSafeBrokerError(resp);
       return false;
     } catch (_) {
-      lastError = 'Network error connecting to Angel One.';
+      lastError = '[v3.2] Network timeout connecting to Angel One.';
       return false;
     }
   }
