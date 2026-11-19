@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
+import 'http_safe_client.dart';
 import 'models.dart';
 
 class TotpAuthManager {
@@ -92,7 +93,7 @@ class TotpAuthManager {
       return false;
     }
     try {
-      final resp = await http
+      final resp = await SafeBrokerHttp
           .get(
             Uri.parse('https://api.dhan.co/v2/fundlimit'),
             headers: {

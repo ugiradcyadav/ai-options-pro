@@ -2,6 +2,8 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import '../../core/models.dart';
 import '../../data/dhan_data_engine.dart';
+import '../../data/forever_db.dart';
+import '../../data/scrip_master_engine.dart';
 import '../../engine/backtest_engine.dart';
 import '../../engine/strategy_settings.dart';
 import '../../state/app_state.dart';
@@ -23,10 +25,11 @@ class BacktestScreen extends StatefulWidget {
 }
 
 class _BacktestScreenState extends State<BacktestScreen> {
-  String _selectedTf = '5m';
   String _curveMode = 'Equity';
   bool _running = false;
   BacktestReport? _report;
+  ThreeWayBacktestReport? _threeWay;
+  List<FrictionStressRow> _stressRows = [];
 
   @override
   void initState() {
@@ -36,16 +39,41 @@ class _BacktestScreenState extends State<BacktestScreen> {
 
   Future<void> _executeBacktest() async {
     setState(() => _running = true);
-    final rep = await BacktestEngine.runBacktest(
-      index: widget.appState.selectedIndex,
-      timeframe: _selectedTf,
+    final idx = widget.appState.selectedIndex;
+    final bars = await ForeverDatabase.instance
+        .getRecentBars(indexName: idx.label, limit: 600);
+    final lotSize = ScripMasterEngine.instance.getLotSizeForIndex(idx) ?? 0;
+    final cap = DhanDataEngine.instance.availableTradingCapital ?? 0.0;
+
+    final rep = BacktestEngine.runRealisticBacktest(
+      index: idx,
+      bars: bars,
       riskConfig: widget.appState.riskConfig,
-      availableCapital: DhanDataEngine.instance.availableTradingCapital,
+      startingCapital: cap,
+      lotSize: lotSize,
       outOfSampleOnly: true,
     );
+    final threeWay = BacktestEngine.runThreeWayHoldout(
+      index: idx,
+      bars: bars,
+      riskConfig: widget.appState.riskConfig,
+      startingCapital: cap,
+      lotSize: lotSize,
+    );
+    final stress = BacktestEngine.runFrictionStressTest(
+      index: idx,
+      bars: bars,
+      riskConfig: widget.appState.riskConfig,
+      startingCapital: cap,
+      lotSize: lotSize,
+      outOfSampleOnly: true,
+    );
+
     if (!mounted) return;
     setState(() {
       _report = rep;
+      _threeWay = threeWay;
+      _stressRows = stress;
       _running = false;
     });
   }
@@ -83,7 +111,7 @@ class _BacktestScreenState extends State<BacktestScreen> {
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Text('Unified Walk-Forward OOS Backtester',
+                  Text('Research Lab: 3-Way OOS & Stress Test',
                       style: QuantTheme.heading(size: 13)),
                   GestureDetector(
                     onTap: () => V2ControlDialogs.openStrategySettingsSheet(
@@ -145,6 +173,7 @@ class _BacktestScreenState extends State<BacktestScreen> {
         ),
         const SizedBox(height: 10),
 
+        // 1. Primary OOS Results & Equity/Drawdown Curve
         QuantPanel(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -187,7 +216,7 @@ class _BacktestScreenState extends State<BacktestScreen> {
               const SizedBox(height: 10),
               if (rep == null || rep.totalTrades == 0)
                 Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  padding: const EdgeInsets.symmetric(vertical: 12),
                   child: Text(
                     'Insufficient recorded real-data trades for OOS evaluation. Keep broker connected to record live bars.',
                     style: QuantTheme.mono(size: 11, color: QuantTheme.warning),
@@ -218,7 +247,7 @@ class _BacktestScreenState extends State<BacktestScreen> {
                 ),
                 const SizedBox(height: 10),
                 SizedBox(
-                  height: 130,
+                  height: 125,
                   width: double.infinity,
                   child: CustomPaint(
                     painter: _EquityDrawdownCurvePainter(
@@ -243,20 +272,128 @@ class _BacktestScreenState extends State<BacktestScreen> {
                   icon: const Icon(Icons.play_arrow, size: 18),
                   label: Text(
                     _running
-                        ? 'Running OOS Walk-Forward...'
-                        : 'Run Unified OOS Backtest',
-                    style: QuantTheme.heading(size: 12, color: QuantTheme.bgMain),
+                        ? 'Running 3-Way & Stress Test...'
+                        : 'Run 3-Way Holdout & Stress Test',
+                    style:
+                        QuantTheme.heading(size: 12, color: QuantTheme.bgMain),
                   ),
                 ),
               ),
             ],
           ),
         ),
+        const SizedBox(height: 10),
+
+        // 2. 3-Way Split (50% Train / 25% Frozen OOS / 25% Final Holdout)
+        if (_threeWay != null)
+          QuantPanel(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('3-Way Chronological Holdout',
+                    style: QuantTheme.heading(size: 12)),
+                const SizedBox(height: 4),
+                Text(_threeWay!.summaryNote, style: QuantTheme.label(size: 10)),
+                const Divider(color: QuantTheme.border, height: 14),
+                if (!_threeWay!.hasSufficientBars)
+                  Text('Keep collecting live 1m bars to unlock 3-way split.',
+                      style: QuantTheme.mono(size: 10, color: QuantTheme.warning))
+                else
+                  Row(
+                    children: [
+                      _splitCol('TRAIN (50%)', _threeWay!.trainReport),
+                      _splitCol('FROZEN OOS', _threeWay!.frozenOosReport),
+                      _splitCol('HOLDOUT (25%)', _threeWay!.finalHoldoutReport),
+                    ],
+                  ),
+              ],
+            ),
+          ),
+        const SizedBox(height: 10),
+
+        // 3. Fee & Slippage Sensitivity Stress-Test (1.0x / 1.5x / 2.0x)
+        if (_stressRows.isNotEmpty)
+          QuantPanel(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Friction & Slippage Sensitivity (1.0x → 2.0x)',
+                    style: QuantTheme.heading(size: 12)),
+                const Divider(color: QuantTheme.border, height: 14),
+                ..._stressRows.map((s) => Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(s.label, style: QuantTheme.label(size: 10.5)),
+                          Row(
+                            children: [
+                              Text(
+                                'Net ₹${s.netPnlInr.toStringAsFixed(0)} (PF ${s.profitFactor.toStringAsFixed(2)})',
+                                style: QuantTheme.mono(
+                                  size: 10.5,
+                                  color: s.netPnlInr >= 0
+                                      ? QuantTheme.positive
+                                      : QuantTheme.negative,
+                                ),
+                              ),
+                              const SizedBox(width: 6),
+                              QuantBadge(
+                                text: s.totalTrades == 0
+                                    ? 'N/A'
+                                    : (s.survives ? 'PASS' : 'FAIL'),
+                                color: s.totalTrades == 0
+                                    ? QuantTheme.textSecondary
+                                    : (s.survives
+                                        ? QuantTheme.positive
+                                        : QuantTheme.negative),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    )),
+              ],
+            ),
+          ),
       ],
     );
 
     if (widget.embeddedMode) return body;
     return SingleChildScrollView(padding: const EdgeInsets.all(12), child: body);
+  }
+
+  Widget _splitCol(String title, BacktestReport r) {
+    return Expanded(
+      child: Container(
+        margin: const EdgeInsets.symmetric(horizontal: 2),
+        padding: const EdgeInsets.all(7),
+        decoration: BoxDecoration(
+          color: QuantTheme.bgSecondary,
+          borderRadius: BorderRadius.circular(7),
+          border: Border.all(color: QuantTheme.border),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(title, style: QuantTheme.heading(size: 9, color: QuantTheme.accent)),
+            const SizedBox(height: 4),
+            Text('Trades: ${r.totalTrades}', style: QuantTheme.mono(size: 9.5)),
+            Text('WR: ${r.winRatePct.toStringAsFixed(0)}%',
+                style: QuantTheme.mono(size: 9.5)),
+            Text(
+              '₹${r.netPnl.toStringAsFixed(0)}',
+              style: QuantTheme.mono(
+                size: 10,
+                color: r.netPnl >= 0
+                    ? QuantTheme.positive
+                    : QuantTheme.negative,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
 
@@ -264,8 +401,7 @@ class _EquityDrawdownCurvePainter extends CustomPainter {
   final List<double> points;
   final bool isDrawdown;
 
-  _EquityDrawdownCurvePainter(
-      {required this.points, required this.isDrawdown});
+  _EquityDrawdownCurvePainter({required this.points, required this.isDrawdown});
 
   @override
   void paint(Canvas canvas, Size size) {

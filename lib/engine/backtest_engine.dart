@@ -25,6 +25,46 @@ class BacktestDataQualityReport {
       'Bars:$totalBarsChecked | Gaps:$gapCount | Stale:$staleQuoteCount | ZeroVol:$zeroVolumeCount';
 }
 
+class FrictionStressRow {
+  final double multiplier;
+  final String label;
+  final int totalTrades;
+  final double winRatePct;
+  final double totalChargesInr;
+  final double netPnlInr;
+  final double profitFactor;
+  final double maxDrawdownInr;
+
+  const FrictionStressRow({
+    required this.multiplier,
+    required this.label,
+    required this.totalTrades,
+    required this.winRatePct,
+    required this.totalChargesInr,
+    required this.netPnlInr,
+    required this.profitFactor,
+    required this.maxDrawdownInr,
+  });
+
+  bool get survives => totalTrades > 0 && netPnlInr > 0;
+}
+
+class ThreeWayBacktestReport {
+  final BacktestReport trainReport;
+  final BacktestReport frozenOosReport;
+  final BacktestReport finalHoldoutReport;
+  final bool hasSufficientBars;
+  final String summaryNote;
+
+  const ThreeWayBacktestReport({
+    required this.trainReport,
+    required this.frozenOosReport,
+    required this.finalHoldoutReport,
+    required this.hasSufficientBars,
+    required this.summaryNote,
+  });
+}
+
 class BacktestEngine {
   static BacktestDataQualityReport auditBarQuality(List bars) {
     int gaps = 0;
@@ -34,7 +74,10 @@ class BacktestEngine {
 
     for (int i = 0; i < bars.length; i++) {
       final b = bars[i] as OneMinEnrichedBar;
-      if (b.close <= 0 || b.open <= 0 || b.low <= 0 || b.low > b.high) {
+      if (b.close <= 0 ||
+          b.open <= 0 ||
+          b.low <= 0 ||
+          b.low > b.high) {
         badTicks++;
       }
       if (b.intervalVolume <= 0) zeroVol++;
@@ -71,6 +114,7 @@ class BacktestEngine {
     RiskConfig riskConfig = const RiskConfig(),
     double? availableCapital,
     bool outOfSampleOnly = true,
+    double frictionMultiplier = 1.0,
   }) async {
     final optBars = await ForeverDatabase.instance.getRecentBars(
       indexName: index.label,
@@ -84,10 +128,139 @@ class BacktestEngine {
       startingCapital: availableCapital ?? 0.0,
       lotSize: lotSize,
       outOfSampleOnly: outOfSampleOnly,
+      frictionMultiplier: frictionMultiplier,
     );
   }
 
-  /// WP-8: Calls MtfStrategyEngine.evaluateEntry() with IST day-reset loss, real-minute hold, and gap-aware stop fills
+  /// 3-Way Chronological Split: 50% Train | embargo | 25% Frozen OOS | embargo | 25% Final Holdout
+  static ThreeWayBacktestReport runThreeWayHoldout({
+    required UnderlyingIndex index,
+    required List bars,
+    required RiskConfig riskConfig,
+    required double startingCapital,
+    required int lotSize,
+    StrategySettings? settingsOverride,
+  }) {
+    final allBars = bars.map((e) => e as OneMinEnrichedBar).toList()
+      ..sort((a, b) => a.timestampMs.compareTo(b.timestampMs));
+    final contractCount =
+        allBars.where((b) => b.optionType.toUpperCase() != 'SPOT').length;
+
+    const int embargo = 5;
+    if (contractCount < 40 || startingCapital <= 0 || lotSize <= 0) {
+      final empty = runRealisticBacktest(
+        index: index,
+        bars: const [],
+        riskConfig: riskConfig,
+        startingCapital: startingCapital,
+        lotSize: lotSize,
+        settingsOverride: settingsOverride,
+      );
+      return ThreeWayBacktestReport(
+        trainReport: empty,
+        frozenOosReport: empty,
+        finalHoldoutReport: empty,
+        hasSufficientBars: false,
+        summaryNote:
+            'Insufficient recorded bars ($contractCount found; need >= 40 for 3-way split).',
+      );
+    }
+
+    final trainEnd = (contractCount * 0.50).floor();
+    final oosStart = trainEnd + embargo;
+    final oosEnd = (contractCount * 0.75).floor();
+    final holdoutStart = oosEnd + embargo;
+
+    final trainRep = runRealisticBacktest(
+      index: index,
+      bars: allBars,
+      riskConfig: riskConfig,
+      startingCapital: startingCapital,
+      lotSize: lotSize,
+      settingsOverride: settingsOverride,
+      outOfSampleOnly: false,
+      startIdxOverride: 4,
+      endIdxOverride: trainEnd,
+    );
+
+    final oosRep = runRealisticBacktest(
+      index: index,
+      bars: allBars,
+      riskConfig: riskConfig,
+      startingCapital: startingCapital,
+      lotSize: lotSize,
+      settingsOverride: settingsOverride,
+      outOfSampleOnly: false,
+      startIdxOverride: oosStart,
+      endIdxOverride: oosEnd,
+    );
+
+    final holdoutRep = runRealisticBacktest(
+      index: index,
+      bars: allBars,
+      riskConfig: riskConfig,
+      startingCapital: startingCapital,
+      lotSize: lotSize,
+      settingsOverride: settingsOverride,
+      outOfSampleOnly: false,
+      startIdxOverride: holdoutStart,
+      endIdxOverride: contractCount - 2,
+    );
+
+    return ThreeWayBacktestReport(
+      trainReport: trainRep,
+      frozenOosReport: oosRep,
+      finalHoldoutReport: holdoutRep,
+      hasSufficientBars: true,
+      summaryNote:
+          '3-Way Split (50% Train / 25% Frozen OOS / 25% Holdout, $embargo-bar embargo)',
+    );
+  }
+
+  /// Reruns the exact same recorded bars under 1.0x, 1.5x, and 2.0x friction/slippage stress
+  static List<FrictionStressRow> runFrictionStressTest({
+    required UnderlyingIndex index,
+    required List bars,
+    required RiskConfig riskConfig,
+    required double startingCapital,
+    required int lotSize,
+    StrategySettings? settingsOverride,
+    bool outOfSampleOnly = true,
+  }) {
+    const scenarios = [
+      {'mult': 1.0, 'label': '1.0x Base (0.15% STT)'},
+      {'mult': 1.5, 'label': '1.5x Slippage Stress'},
+      {'mult': 2.0, 'label': '2.0x Severe Stress'},
+    ];
+
+    final results = <FrictionStressRow>[];
+    for (final sc in scenarios) {
+      final mult = sc['mult'] as double;
+      final rep = runRealisticBacktest(
+        index: index,
+        bars: bars,
+        riskConfig: riskConfig,
+        startingCapital: startingCapital,
+        lotSize: lotSize,
+        settingsOverride: settingsOverride,
+        outOfSampleOnly: outOfSampleOnly,
+        frictionMultiplier: mult,
+      );
+      results.add(FrictionStressRow(
+        multiplier: mult,
+        label: sc['label'] as String,
+        totalTrades: rep.totalTrades,
+        winRatePct: rep.winRatePct,
+        totalChargesInr: rep.totalCharges,
+        netPnlInr: rep.netPnl,
+        profitFactor: rep.profitFactor,
+        maxDrawdownInr: rep.maxDrawdown,
+      ));
+    }
+    return results;
+  }
+
+  /// Calls MtfStrategyEngine.evaluateEntry() chronologically with IST day-reset loss, real-minute hold, and gap-aware stop fills
   static BacktestReport runRealisticBacktest({
     required UnderlyingIndex index,
     required List bars,
@@ -96,6 +269,9 @@ class BacktestEngine {
     required int lotSize,
     StrategySettings? settingsOverride,
     bool outOfSampleOnly = true,
+    double frictionMultiplier = 1.0,
+    int? startIdxOverride,
+    int? endIdxOverride,
   }) {
     final settings = settingsOverride ?? StrategySettingsEngine.instance.current;
     final allBars = bars.map((e) => e as OneMinEnrichedBar).toList()
@@ -129,9 +305,12 @@ class BacktestEngine {
     }
 
     const int embargoBars = 5;
-    final int oosStartIdx = outOfSampleOnly && contractBars.length >= 25
+    final int defaultStart = outOfSampleOnly && contractBars.length >= 25
         ? ((contractBars.length * 0.40).floor() + embargoBars)
         : 4;
+    final int startIdx = math.max(4, startIdxOverride ?? defaultStart);
+    final int endIdx =
+        math.min(contractBars.length - 2, endIdxOverride ?? (contractBars.length - 2));
 
     int totalTrades = 0;
     int wins = 0;
@@ -149,21 +328,20 @@ class BacktestEngine {
     double todayNetRealizedPnlIst = 0.0;
     final List tradeLogs = [];
 
-    int i = math.max(4, oosStartIdx);
-    while (i < contractBars.length - 2) {
+    // Strictly chronological loop: next trade cannot start until prior trade settles
+    int i = startIdx;
+    while (i < endIdx) {
       final bar = contractBars[i];
       final barDay = _istDayKey(bar.timestampMs);
       if (barDay != currentIstDay) {
         currentIstDay = barDay;
-        todayNetRealizedPnlIst = 0.0; // WP-8: Reset daily P&L per IST day
+        todayNetRealizedPnlIst = 0.0;
       }
 
-      // Build causal spot window up to bar.timestampMs
       final causalSpots = spotBars
           .where((s) => s.timestampMs <= bar.timestampMs)
           .toList();
 
-      // Build single-strike snapshot from recorded contract bar for unified evaluateEntry()
       final isCallBar = bar.optionType.toUpperCase() == 'CE';
       final snap = StrikeRowSnapshot(
         strike: bar.strike,
@@ -222,7 +400,6 @@ class BacktestEngine {
         continue;
       }
 
-      // Fill at NEXT bar open (same IST day only — no overnight holds)
       final fillBar = contractBars[i + 1];
       if (_istDayKey(fillBar.timestampMs) != barDay || fillBar.open <= 0) {
         i++;
@@ -240,15 +417,11 @@ class BacktestEngine {
       String exitReason = 'TIME_EXIT';
       int exitBarIdx = i + 1;
 
-      for (int h = i + 1; h < contractBars.length; h++) {
+      for (int h = i + 1; h <= endIdx; h++) {
         final hBar = contractBars[h];
-        // WP-8: No overnight holds — exit on last bar of same IST day
-        if (_istDayKey(hBar.timestampMs) != barDay) {
-          break;
-        }
+        if (_istDayKey(hBar.timestampMs) != barDay) break;
         exitBarIdx = h;
 
-        // WP-8: Gap-aware stop fill (if bar opens below stop, fill at bar.open, not stopPrice)
         if (hBar.open <= stopPrice) {
           rawExit = hBar.open;
           exitReason = 'GAP_STOP_LOSS';
@@ -265,7 +438,6 @@ class BacktestEngine {
           break;
         }
         rawExit = hBar.close;
-        // WP-8: Max hold measured in real elapsed milliseconds, not bar count
         if (hBar.timestampMs - fillBar.timestampMs >= maxHoldMs) {
           exitReason = 'TIME_EXIT';
           break;
@@ -282,7 +454,7 @@ class BacktestEngine {
       );
 
       final grossPnl = (rawExit - rawEntry) * qty;
-      final friction = realizedCosts.totalFrictionInr;
+      final friction = realizedCosts.totalFrictionInr * frictionMultiplier;
       final netPnl = grossPnl - friction;
 
       totalTrades++;
@@ -330,7 +502,7 @@ class BacktestEngine {
 
     return BacktestReport(
       strategyName:
-          'Unified Walk-Forward ${outOfSampleOnly ? "OOS" : "Full"} (${dq.summary})',
+          'Unified Walk-Forward ${outOfSampleOnly ? "OOS" : "Window"} (${frictionMultiplier.toStringAsFixed(1)}x Friction)',
       indexName: index.label,
       htfConfirmation: 'Same evaluateEntry() • Gap-Aware Stops • 0.15% STT',
       totalTrades: totalTrades,

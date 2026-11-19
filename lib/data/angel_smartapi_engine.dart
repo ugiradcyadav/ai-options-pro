@@ -4,6 +4,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../core/models.dart';
+import '../core/http_safe_client.dart';
 import '../core/totp_auth.dart';
 import '../engine/math_greeks.dart';
 import 'forever_db.dart';
@@ -90,7 +91,7 @@ class AngelSmartApiEngine {
         'https://ifconfig.me/ip',
       ]) {
         try {
-          final resp = await http
+          final resp = await SafeBrokerHttp
               .get(Uri.parse(url))
               .timeout(const Duration(seconds: 4));
           if (resp.statusCode == 200) {
@@ -214,7 +215,7 @@ class AngelSmartApiEngine {
     }
 
     try {
-      final resp = await http
+      final resp = await SafeBrokerHttp
           .post(
             Uri.parse(
                 'https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword'),
@@ -253,7 +254,7 @@ class AngelSmartApiEngine {
     if (jwtToken.isEmpty) return null;
     await _ensureRealNetworkInfo();
     try {
-      final resp = await http
+      final resp = await SafeBrokerHttp
           .get(
             Uri.parse(
                 'https://apiconnect.angelone.in/rest/secure/angelbroking/user/v1/getRMS'),
@@ -313,7 +314,7 @@ class AngelSmartApiEngine {
     final exchangeTsMs = DateTime.now().millisecondsSinceEpoch;
 
     try {
-      final spotResp = await http
+      final spotResp = await SafeBrokerHttp
           .post(
             Uri.parse(
                 'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/'),
@@ -393,7 +394,7 @@ class AngelSmartApiEngine {
           : start + 50;
       final chunk = nfoTokens.sublist(start, end);
       try {
-        final qResp = await http
+        final qResp = await SafeBrokerHttp
             .post(
               Uri.parse(
                   'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/'),

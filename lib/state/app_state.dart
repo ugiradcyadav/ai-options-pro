@@ -213,15 +213,18 @@ class AppState extends ChangeNotifier {
     // Lookup live bid/ask for quote-driven paper fill & marketable limit cap
     double? bid;
     double? ask;
+    int? askQty;
     final rows = DhanDataEngine.instance.optionChainRows[sig.index] ?? const [];
     for (final r in rows) {
       if (r.ceSecurityId == sig.securityId) {
         bid = r.ceBid;
         ask = r.ceAsk;
+        askQty = r.ceAskQty;
         break;
       } else if (r.peSecurityId == sig.securityId) {
         bid = r.peBid;
         ask = r.peAsk;
+        askQty = r.peAskQty;
         break;
       }
     }
@@ -231,6 +234,7 @@ class AppState extends ChangeNotifier {
       mode: tradingMode,
       bestBid: bid,
       bestAsk: ask,
+      topBookAskQty: askQty,
     );
     await _reloadSavedRecords();
     notifyListeners();

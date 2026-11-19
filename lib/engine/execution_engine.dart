@@ -21,12 +21,15 @@ class ExecutionEngine {
   static final ExecutionEngine instance = ExecutionEngine._();
   ExecutionEngine._();
 
-  // WP-6 Non-Negotiable Rule: LIVE mode stays disabled until WP-1..WP-6 & 15 trading days paper run complete
+  // LIVE mode stays locked until 15 real-data paper trading days & static-IP rules are verified
   static const bool liveTradingUnlocked = false;
+
+  /// Default per-order liquidity cap: max 15% of observed top-of-book depth
+  static const double defaultOrderVolumeRatio = 0.15;
 
   final Set<String> _inFlightCorrelationIds = {};
 
-  /// WP-6: Computes marketable limit price with protection cap (never raw MARKET orders)
+  /// Computes marketable limit price with protection cap (never raw MARKET orders)
   static double computeMarketableLimitPrice({
     required bool isBuy,
     required double ltp,
@@ -36,21 +39,37 @@ class ExecutionEngine {
     final ref = isBuy
         ? ((bestAsk != null && bestAsk > 0) ? bestAsk : ltp)
         : ((bestBid != null && bestBid > 0) ? bestBid : ltp);
-    final spread = (bestBid != null && bestAsk != null && bestAsk >= bestBid)
-        ? (bestAsk - bestBid)
-        : (ref * 0.004);
+    final spread =
+        (bestBid != null && bestAsk != null && bestAsk >= bestBid)
+            ? (bestAsk - bestBid)
+            : (ref * 0.004);
     final buffer = math.min(ref * 0.015, math.max(0.10, 2.0 * spread));
     final raw = isBuy ? (ref + buffer) : math.max(0.05, ref - buffer);
-    // Round to NSE 0.05 tick size
     return (raw * 20.0).round() / 20.0;
   }
 
-  /// Executes an entry order through strict state machine: NEW -> SENT -> ACKED -> FILLED / REJECTED
+  /// Calculates realistic filled quantity under [orderVolumeRatio] depth cap (snapped to lotSize)
+  static int computeVolumeCappedFillQty({
+    required int requestedQty,
+    required int lotSize,
+    int? topBookQty,
+    double orderVolumeRatio = defaultOrderVolumeRatio,
+  }) {
+    if (requestedQty <= 0 || lotSize <= 0) return 0;
+    if (topBookQty == null || topBookQty <= 0) return requestedQty;
+    final maxAllowedRaw = (topBookQty * orderVolumeRatio).floor();
+    final maxAllowedLots = (maxAllowedRaw ~/ lotSize) * lotSize;
+    return math.min(requestedQty, maxAllowedLots);
+  }
+
+  /// Executes an entry order through: NEW -> SENT -> ACKED -> PARTIAL/FILLED / REJECTED / CANCELLED
   Future<ExecutionResult> executeEntry({
     required AiSignal signal,
     required TradingMode mode,
     double? bestBid,
     double? bestAsk,
+    int? topBookAskQty,
+    double orderVolumeRatio = defaultOrderVolumeRatio,
     String? correlationIdOverride,
   }) async {
     final nowMs = DateTime.now().millisecondsSinceEpoch;
@@ -78,8 +97,7 @@ class ExecutionEngine {
         mode: mode.label,
         reason: 'Idempotency guard blocked duplicate correlation ID',
       );
-      return ExecutionResult(
-          order: dup, success: false, message: dup.reason);
+      return ExecutionResult(order: dup, success: false, message: dup.reason);
     }
 
     if (mode == TradingMode.live && !liveTradingUnlocked) {
@@ -101,7 +119,7 @@ class ExecutionEngine {
         status: OrderLifecycleState.rejected.label,
         mode: mode.label,
         reason:
-            'LIVE mode locked until 15 real-data paper trading days & static-IP requirement are verified.',
+            'LIVE mode locked until 15 real-data paper trading days & static-IP rules are verified.',
       );
       await ForeverDatabase.instance.saveOrder(blocked);
       return ExecutionResult(
@@ -144,7 +162,6 @@ class ExecutionEngine {
         bestAsk: bestAsk,
       );
 
-      // State 1: NEW -> SENT
       var order = TradeOrder(
         orderId: 'ORD_$nowMs',
         clientCorrelationId: corrId,
@@ -166,19 +183,43 @@ class ExecutionEngine {
       );
       await ForeverDatabase.instance.saveOrder(order);
 
-      // Quote-driven realistic Paper Fill: fills at live Ask (never better than ask), capped by limitPrice
+      // Apply order_volume_ratio depth cap for realistic paper partial fills
+      final filledQty = computeVolumeCappedFillQty(
+        requestedQty: signal.quantity,
+        lotSize: signal.lotSize,
+        topBookQty: topBookAskQty,
+        orderVolumeRatio: orderVolumeRatio,
+      );
+
+      if (filledQty <= 0) {
+        order = order.copyWith(
+          status: OrderLifecycleState.cancelled.label,
+          filledQty: 0,
+          reason:
+              'CANCELLED: Top-of-book depth ($topBookAskQty) below ${(orderVolumeRatio * 100).toStringAsFixed(0)}% volume cap for 1 lot (${signal.lotSize})',
+        );
+        await ForeverDatabase.instance.saveOrder(order);
+        return ExecutionResult(
+            order: order, success: false, message: order.reason);
+      }
+
       final fillPrice = (bestAsk != null && bestAsk > 0)
           ? math.min(limitPrice, bestAsk)
           : signal.entryPremium;
 
+      final isPartial = filledQty < signal.quantity;
       order = order.copyWith(
-        status: OrderLifecycleState.filled.label,
-        filledQty: signal.quantity,
+        status: isPartial
+            ? OrderLifecycleState.partial.label
+            : OrderLifecycleState.filled.label,
+        filledQty: filledQty,
         price: fillPrice,
+        reason: isPartial
+            ? 'PARTIAL FILL ($filledQty/${signal.quantity} qty capped by ${(orderVolumeRatio * 100).toStringAsFixed(0)}% depth ratio; remainder cancelled)'
+            : signal.htfOiReason,
       );
       await ForeverDatabase.instance.saveOrder(order);
 
-      // WP-6: Construct typed PositionRecord directly (never hand-made Map)
       final pos = PositionRecord(
         positionId: 'POS_$nowMs',
         securityId: signal.securityId,
@@ -187,7 +228,7 @@ class ExecutionEngine {
         expiry: signal.expiry,
         strike: signal.strike,
         optionType: optType,
-        quantity: signal.quantity,
+        quantity: filledQty,
         avgEntryPrice: fillPrice,
         currentLtp: fillPrice,
         stopLossPrice: signal.stopLossPremium,
@@ -199,23 +240,25 @@ class ExecutionEngine {
       );
       await ForeverDatabase.instance.upsertPosition(pos);
       await ForeverDatabase.instance.logAuditEvent(
-        category: 'ORDER_FILLED',
+        category: isPartial ? 'ORDER_PARTIAL' : 'ORDER_FILLED',
         message:
-            'BUY ${pos.tradingSymbol} qty=${pos.quantity} @ ₹${fillPrice.toStringAsFixed(2)} (Limit ₹${limitPrice.toStringAsFixed(2)})',
+            'BUY ${pos.tradingSymbol} filled $filledQty/${signal.quantity} @ ₹${fillPrice.toStringAsFixed(2)} (Limit ₹${limitPrice.toStringAsFixed(2)})',
       );
 
       return ExecutionResult(
         order: order,
         position: pos,
         success: true,
-        message: 'Filled ${pos.quantity} qty @ ₹${fillPrice.toStringAsFixed(2)}',
+        message: isPartial
+            ? 'Partial Fill: $filledQty/${signal.quantity} qty @ ₹${fillPrice.toStringAsFixed(2)}'
+            : 'Filled $filledQty qty @ ₹${fillPrice.toStringAsFixed(2)}',
       );
     } finally {
       _inFlightCorrelationIds.remove(corrId);
     }
   }
 
-  /// WP-6: Closes an open position with marketable limit SELL, preserving openedAtMs & persisting net P&L
+  /// Closes an open position with marketable limit SELL, preserving openedAtMs & persisting net P&L
   Future<ExecutionResult> executeExit({
     required PositionRecord position,
     required double currentLtp,
@@ -232,7 +275,6 @@ class ExecutionEngine {
       bestAsk: bestAsk,
     );
 
-    // Quote-driven Paper Exit fills at live Bid
     final fillPrice = (bestBid != null && bestBid > 0)
         ? math.max(limitPrice, bestBid)
         : currentLtp;

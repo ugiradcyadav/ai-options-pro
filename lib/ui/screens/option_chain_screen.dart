@@ -4,7 +4,9 @@ import 'package:intl/intl.dart' hide TextDirection;
 import '../../core/models.dart';
 import '../../data/dhan_data_engine.dart';
 import '../../data/forever_db.dart';
+import '../../engine/iv_grid_engine.dart';
 import '../../engine/math_greeks.dart';
+import '../../engine/options_payoff_engine.dart';
 import '../../state/app_state.dart';
 import '../theme/quant_theme.dart';
 import 'oi_analysis_screen.dart';
@@ -27,10 +29,9 @@ class OptionChainScreen extends StatefulWidget {
 class _OptionChainScreenState extends State<OptionChainScreen> {
   late String _workspaceTab;
   String _chartTf = '5m';
-  String _indicatorTab = 'RSI';
   bool _compareSpotVsOption = true;
+  bool _payoffIsCall = true;
   int _selectedOffset = 0;
-  String _chainGraphTab = 'OI';
   int _touchedIdx = -1;
   List<OneMinEnrichedBar> _intradayBars = [];
   List<OneMinEnrichedBar> _spotBars = [];
@@ -280,32 +281,25 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
     }
 
     double? rsi14;
-    double macdVal = 0.0;
-    double macdSignal = 0.0;
-    double vwapVal = spot;
-
+    double macdVal = 0.0, macdSignal = 0.0, vwapVal = spot;
     if (_intradayBars.length >= 5) {
       double gainSum = 0.0, lossSum = 0.0, pvSum = 0.0, vSum = 0.0;
-      double ema12 = _intradayBars.first.close;
-      double ema26 = ema12;
+      double ema12 = _intradayBars.first.close, ema26 = ema12;
       for (int i = 1; i < _intradayBars.length; i++) {
-        final prev = _intradayBars[i - 1];
-        final cur = _intradayBars[i];
-        final diff = cur.close - prev.close;
+        final diff = _intradayBars[i].close - _intradayBars[i - 1].close;
         if (diff > 0) {
           gainSum += diff;
         } else {
           lossSum += diff.abs();
         }
-        final typical = (cur.high + cur.low + cur.close) / 3.0;
-        pvSum += typical * cur.intervalVolume;
+        final cur = _intradayBars[i];
+        pvSum += ((cur.high + cur.low + cur.close) / 3.0) * cur.intervalVolume;
         vSum += cur.intervalVolume;
         ema12 = (cur.close * (2.0 / 13.0)) + (ema12 * (1.0 - (2.0 / 13.0)));
         ema26 = (cur.close * (2.0 / 27.0)) + (ema26 * (1.0 - (2.0 / 27.0)));
       }
       if (lossSum > 1e-6) {
-        final rs = gainSum / lossSum;
-        rsi14 = 100.0 - (100.0 / (1.0 + rs));
+        rsi14 = 100.0 - (100.0 / (1.0 + gainSum / lossSum));
       }
       macdVal = ema12 - ema26;
       macdSignal = macdVal * 0.82;
@@ -382,11 +376,9 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
                   final w = constraints.maxWidth;
                   void handleTouch(Offset pos) {
                     if (barCount <= 0 || w <= 0) return;
-                    final idx =
+                    final i =
                         ((pos.dx / w).clamp(0.0, 0.999) * barCount).floor();
-                    if (idx != _touchedIdx) {
-                      setState(() => _touchedIdx = idx);
-                    }
+                    if (i != _touchedIdx) setState(() => _touchedIdx = i);
                   }
 
                   return GestureDetector(
@@ -414,10 +406,8 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
                     'RSI(14): ${rsi14?.toStringAsFixed(1) ?? "N/A"} | MACD: ${macdVal.toStringAsFixed(2)}/${macdSignal.toStringAsFixed(2)}',
                     style: QuantTheme.mono(size: 10, color: QuantTheme.accent),
                   ),
-                  Text(
-                    'VWAP: ₹${vwapVal.toStringAsFixed(2)}',
-                    style: QuantTheme.mono(size: 10, color: QuantTheme.warning),
-                  ),
+                  Text('VWAP: ₹${vwapVal.toStringAsFixed(2)}',
+                      style: QuantTheme.mono(size: 10, color: QuantTheme.warning)),
                 ],
               ),
             ],
@@ -427,8 +417,8 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
     );
   }
 
-  Widget _buildOptionChainWorkspace(
-      UnderlyingIndex idx, List<StrikeRowSnapshot> rows, bool hasLiveData) {
+  Widget _buildOptionChainWorkspace(UnderlyingIndex idx,
+      List<StrikeRowSnapshot> rows, bool hasLiveData) {
     if (!hasLiveData || rows.isEmpty) {
       return QuantPanel(
         child: Padding(
@@ -453,10 +443,8 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
       if (r.peOiChange15m != null) sumPe15 = (sumPe15 ?? 0) + r.peOiChange15m!;
       if (r.peOiChange60m != null) sumPe60 = (sumPe60 ?? 0) + r.peOiChange60m!;
     }
-
-    String fmtOptDiff(int? v) => v == null ? 'Collecting' : '${v >= 0 ? "+" : ""}$v lots';
-
-    // Display ATM +/- 5 strikes cleanly in the table (full ATM +/- 12 used for GEX/PCR)
+    String fmtOptDiff(int? v) =>
+        v == null ? 'Collecting' : '${v >= 0 ? "+" : ""}$v lots';
     final displayRows = rows.where((r) => r.offset.abs() <= 5).toList();
 
     return Column(
@@ -509,7 +497,6 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
                 final peBidAsk = (r.peBid != null && r.peAsk != null)
                     ? '${r.peBid!.toStringAsFixed(1)}/${r.peAsk!.toStringAsFixed(1)}'
                     : '--/--';
-
                 return GestureDetector(
                   onTap: () => setState(() {
                     _selectedOffset = r.offset;
@@ -701,10 +688,12 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
       UnderlyingIndex idx, List<StrikeRowSnapshot> rows, double spot) {
     if (rows.isEmpty || spot <= 0) {
       return QuantPanel(
-        child: Text('NO DATA — Connect broker API to compute Black-76 IV & Greeks.',
+        child: Text(
+            'NO DATA — Connect broker API to compute Black-76 IV, Greeks & Payoff.',
             style: QuantTheme.mono(size: 11, color: QuantTheme.negative)),
       );
     }
+
     final surf = MathGreeksEngine.evaluateIvSurface(rows, spot);
     final rv = MathGreeksEngine.computeVolForecast(
       recentSpotBars: _spotBars,
@@ -712,11 +701,22 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
       spot: spot,
       holdingMinutes: 15.0,
     );
-
+    final ivGrid = IvGridEngine.buildNoExtrapolationGrid(rows);
+    final cellByStrike = <int, IvGridCell>{
+      for (final c in ivGrid.cells) c.strike: c
+    };
+    final comparisons = OptionsPayoffEngine.compareNakedVsDebitSpread(
+      chainRows: rows,
+      spot: spot,
+      isCall: _payoffIsCall,
+      strikeStep: idx.strikeStep,
+    );
     final displayRows = rows.where((r) => r.offset.abs() <= 5).toList();
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        // 1. Multi-Leg Payoff Comparator (Naked ATM vs Vertical Debit Spread)
         QuantPanel(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -724,13 +724,107 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Text('Black-76 Volatility Surface & Underlying RV',
+                  Text('Options Lab: Naked vs. Debit Spread',
+                      style: QuantTheme.heading(size: 12)),
+                  Row(
+                    children: [true, false].map((isCe) {
+                      final active = _payoffIsCall == isCe;
+                      return GestureDetector(
+                        onTap: () => setState(() => _payoffIsCall = isCe),
+                        child: Container(
+                          margin: const EdgeInsets.only(left: 5),
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 8, vertical: 3),
+                          decoration: BoxDecoration(
+                            color: active
+                                ? (isCe
+                                    ? QuantTheme.positive
+                                    : QuantTheme.negative)
+                                : QuantTheme.bgSecondary,
+                            borderRadius: BorderRadius.circular(5),
+                          ),
+                          child: Text(
+                            isCe ? 'CALL' : 'PUT',
+                            style: QuantTheme.mono(
+                              size: 9.5,
+                              color: active
+                                  ? QuantTheme.bgMain
+                                  : QuantTheme.textSecondary,
+                            ),
+                          ),
+                        ),
+                      );
+                    }).toList(),
+                  ),
+                ],
+              ),
+              const Divider(color: QuantTheme.border, height: 14),
+              if (comparisons == null)
+                Text('Awaiting live ATM + OTM quotes to compare payoff.',
+                    style: QuantTheme.label(size: 11))
+              else
+                Row(
+                  children: comparisons.map((c) {
+                    return Expanded(
+                      child: Container(
+                        margin: const EdgeInsets.symmetric(horizontal: 3),
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: QuantTheme.bgSecondary,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: QuantTheme.border),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(c.strategyName,
+                                style: QuantTheme.heading(
+                                    size: 10, color: QuantTheme.accent)),
+                            const SizedBox(height: 5),
+                            Text(
+                                'Net Debit: ₹${c.netDebitInr.toStringAsFixed(0)}',
+                                style: QuantTheme.mono(size: 10)),
+                            Text(
+                                'Max Profit: ${c.maxProfitInr != null ? "₹${c.maxProfitInr!.toStringAsFixed(0)}" : "Unlimited"}',
+                                style: QuantTheme.mono(
+                                    size: 10, color: QuantTheme.positive)),
+                            Text(
+                                'Max Loss: ₹${c.maxLossInr.toStringAsFixed(0)}',
+                                style: QuantTheme.mono(
+                                    size: 10, color: QuantTheme.negative)),
+                            Text(
+                                'Breakeven: ${c.breakevenSpot?.toStringAsFixed(1) ?? "N/A"}',
+                                style: QuantTheme.mono(
+                                    size: 9.5,
+                                    color: QuantTheme.textSecondary)),
+                            Text(
+                                'Friction: ₹${c.estimatedFrictionInr.toStringAsFixed(0)}',
+                                style: QuantTheme.mono(
+                                    size: 9, color: QuantTheme.warning)),
+                          ],
+                        ),
+                      ),
+                    );
+                  }).toList(),
+                ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 10),
+
+        // 2. Black-76 Surface + No-Extrapolation IV Grid Summary
+        QuantPanel(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text('Black-76 Surface & No-Extrapolation IV Grid',
                       style: QuantTheme.heading(size: 11)),
                   QuantBadge(
-                    text: surf.hasButterflyArbitrage ? 'CONCAVE WARN' : 'OLS FIT',
-                    color: surf.hasButterflyArbitrage
-                        ? QuantTheme.negative
-                        : QuantTheme.positive,
+                    text: 'OBS:${ivGrid.observedCount} INT:${ivGrid.interpolatedCount}',
+                    color: QuantTheme.accent,
                   ),
                 ],
               ),
@@ -750,11 +844,6 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
                           ? '${surf.riskReversal25d!.toStringAsFixed(2)}%'
                           : 'N/A'),
                   QuantMetricCell(
-                      label: '25Δ BF',
-                      value: surf.butterfly25d != null
-                          ? '${surf.butterfly25d!.toStringAsFixed(2)}%'
-                          : 'N/A'),
-                  QuantMetricCell(
                       label: 'SPOT RV',
                       value: rv.ewmaForecastRvPct != null
                           ? '${rv.ewmaForecastRvPct!.toStringAsFixed(1)}%'
@@ -770,13 +859,15 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
               ),
               const SizedBox(height: 6),
               Text(
-                '${surf.surfaceNote} | 15m Exp Move: ${rv.expectedMovePoints != null ? "±${rv.expectedMovePoints!.toStringAsFixed(1)} pts" : "Collecting SPOT bars"}',
-                style: QuantTheme.label(size: 10),
+                '${surf.surfaceNote} | No extrapolation outside [${ivGrid.minObservedStrike ?? "-"}-${ivGrid.maxObservedStrike ?? "-"}]',
+                style: QuantTheme.label(size: 9.5),
               ),
             ],
           ),
         ),
         const SizedBox(height: 10),
+
+        // 3. Strike-wise Observed/Interpolated IV & CE/PE Greeks Table
         QuantPanel(
           padding: EdgeInsets.zero,
           child: Column(
@@ -791,15 +882,24 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Text('STRIKE', style: QuantTheme.heading(size: 10)),
-                    Text('CE/PE IV%', style: QuantTheme.heading(size: 10)),
-                    Text('CE/PE Δ', style: QuantTheme.heading(size: 10)),
-                    Text('CE/PE Γ', style: QuantTheme.heading(size: 10)),
-                    Text('CE/PE Θ', style: QuantTheme.heading(size: 10)),
+                    Text('STRIKE', style: QuantTheme.heading(size: 9.5)),
+                    Text('CE IV [SRC]', style: QuantTheme.heading(size: 9.5)),
+                    Text('PE IV [SRC]', style: QuantTheme.heading(size: 9.5)),
+                    Text('CE/PE Δ', style: QuantTheme.heading(size: 9.5)),
+                    Text('CE/PE Θ', style: QuantTheme.heading(size: 9.5)),
                   ],
                 ),
               ),
               ...displayRows.map((r) {
+                final cell = cellByStrike[r.strike];
+                final ceTag = cell?.ceSource.shortTag ?? 'N/A';
+                final peTag = cell?.peSource.shortTag ?? 'N/A';
+                final ceStr = cell?.ceIv != null
+                    ? '${cell!.ceIv!.toStringAsFixed(1)}% [$ceTag]'
+                    : 'N/A';
+                final peStr = cell?.peIv != null
+                    ? '${cell!.peIv!.toStringAsFixed(1)}% [$peTag]'
+                    : 'N/A';
                 return Container(
                   padding:
                       const EdgeInsets.symmetric(vertical: 7, horizontal: 10),
@@ -814,23 +914,29 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
                       Text('${r.strike}',
                           style: QuantTheme.mono(
                               size: 10, color: QuantTheme.accent)),
-                      Text(
-                        '${r.ceIv?.toStringAsFixed(1) ?? "--"}/${r.peIv?.toStringAsFixed(1) ?? "--"}%',
-                        style: QuantTheme.mono(size: 10),
-                      ),
+                      Text(ceStr,
+                          style: QuantTheme.mono(
+                            size: 9.5,
+                            color: cell?.ceSource == IvCellSource.interpolated
+                                ? QuantTheme.warning
+                                : QuantTheme.textPrimary,
+                          )),
+                      Text(peStr,
+                          style: QuantTheme.mono(
+                            size: 9.5,
+                            color: cell?.peSource == IvCellSource.interpolated
+                                ? QuantTheme.warning
+                                : QuantTheme.textPrimary,
+                          )),
                       Text(
                         '${r.ceDelta.toStringAsFixed(2)}/${r.peDelta.toStringAsFixed(2)}',
                         style: QuantTheme.mono(
-                            size: 10, color: QuantTheme.positive),
-                      ),
-                      Text(
-                        '${r.ceGamma.toStringAsFixed(4)}/${r.peGamma.toStringAsFixed(4)}',
-                        style: QuantTheme.mono(size: 9),
+                            size: 9.5, color: QuantTheme.positive),
                       ),
                       Text(
                         '${r.ceTheta.toStringAsFixed(1)}/${r.peTheta.toStringAsFixed(1)}',
                         style: QuantTheme.mono(
-                            size: 10, color: QuantTheme.warning),
+                            size: 9.5, color: QuantTheme.warning),
                       ),
                     ],
                   ),
