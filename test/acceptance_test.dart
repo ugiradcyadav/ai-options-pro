@@ -1,200 +1,258 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ai_options_pro/core/models.dart';
 import 'package:ai_options_pro/core/totp_auth.dart';
+import 'package:ai_options_pro/data/angel_smartapi_engine.dart';
+import 'package:ai_options_pro/data/scrip_master_engine.dart';
 import 'package:ai_options_pro/data/strike_selector.dart';
 import 'package:ai_options_pro/engine/ai_recalibration_engine.dart';
-import 'package:ai_options_pro/engine/backtest_engine.dart';
 import 'package:ai_options_pro/engine/dataset_label_engine.dart';
+import 'package:ai_options_pro/engine/execution_engine.dart';
+import 'package:ai_options_pro/engine/exit_manager.dart';
 import 'package:ai_options_pro/engine/math_greeks.dart';
+import 'package:ai_options_pro/engine/mtf_strategy_engine.dart';
 import 'package:ai_options_pro/engine/risk_engine.dart';
 
 void main() {
-  test('strike_selection: ATM Strike Selection & 6-Contract Buyer Band', () {
-    final atm = StrikeSelectionEngine.computeAtmStrike(
-        UnderlyingIndex.nifty50, 23053.10);
-    expect(atm, 23050);
+  test('WP4_WP5: Instrument master exact resolution, lot sizes & IST expiry', () {
+    final master = ScripMasterEngine.instance;
+    final fixture = [
+      {
+        'token': '55001',
+        'symbol': 'NIFTY24NOV2624000CE',
+        'name': 'NIFTY',
+        'expiry': '24NOV2026',
+        'strike': '2400000.000000',
+        'lotsize': '65',
+        'instrumenttype': 'OPTIDX',
+        'exch_seg': 'NFO',
+      },
+      {
+        'token': '55002',
+        'symbol': 'NIFTYNXT5024NOV2670000CE',
+        'name': 'NIFTYNXT50',
+        'expiry': '24NOV2026',
+        'strike': '7000000.000000',
+        'lotsize': '25',
+        'instrumenttype': 'OPTIDX',
+        'exch_seg': 'NFO',
+      },
+      {
+        'token': '55003',
+        'symbol': 'BANKNIFTY24NOV2652000PE',
+        'name': 'BANKNIFTY',
+        'expiry': '24NOV2026',
+        'strike': '5200000.000000',
+        'lotsize': '30',
+        'instrumenttype': 'OPTIDX',
+        'exch_seg': 'NFO',
+      },
+    ];
 
-    final band = StrikeSelectionEngine.getMonitoringStrikeBand(
-        UnderlyingIndex.nifty50, 23053.10);
-    expect(band, [22950, 23000, 23050, 23100, 23150]);
+    final loaded = master.loadFromAngelJsonList(
+      fixture,
+      referenceNowUtc: DateTime.utc(2026, 11, 19, 6, 0),
+    );
+    expect(loaded, 2); // NIFTYNXT50 must be excluded
+
+    final resolved = master.resolveOptionContract(
+      index: UnderlyingIndex.nifty50,
+      expiryIso: '2026-11-24',
+      strike: 24000,
+      optionType: OptionType.ce,
+    );
+    expect(resolved, isNotNull);
+    expect(resolved!.securityId, '55001');
+    expect(resolved.lotSize, 65);
+
+    // Unknown strike returns null (fail closed)
+    final missing = master.resolveOptionContract(
+      index: UnderlyingIndex.nifty50,
+      expiryIso: '2026-11-24',
+      strike: 99900,
+      optionType: OptionType.ce,
+    );
+    expect(missing, isNull);
+
+    // 15:30 IST == 10:00 UTC; at 10:00 UTC on expiry day, timeYears == 0
+    final tZero = StrikeSelectionEngine.computeFractionalYearsToExpiryIst(
+      '2026-11-24',
+      nowUtc: DateTime.utc(2026, 11, 24, 10, 0),
+    );
+    expect(tZero, 0.0);
+
+    // OI normalization from Angel qty to lots
+    expect(AngelSmartApiEngine.normalizeAngelOiToLots(6500, 65), 100);
   });
 
-  test('greeks_and_black76: M1 Price->IV->Price round-trip & M2 2nd-order Greeks', () {
-    const forward = 23110.0;
-    const strike = 23050.0;
-    const tYears = 5.0 / 365.0;
-    const trueSigma = 0.165;
+  test('WP7: Black-76 IV round-trip < 1e-6, Put-Call Parity & Grid GEX', () {
+    const f = 24050.0;
+    const k = 24000.0;
+    const t = 5.0 / 365.0;
+    const sigma = 0.16;
 
-    final callPrice = MathGreeksEngine.black76Price(
-      forward: forward,
-      strike: strike,
-      timeYears: tYears,
-      sigma: trueSigma,
-      isCall: true,
+    final cPrice = MathGreeksEngine.black76Price(
+        forward: f, strike: k, timeYears: t, sigma: sigma, isCall: true);
+    final pPrice = MathGreeksEngine.black76Price(
+        forward: f, strike: k, timeYears: t, sigma: sigma, isCall: false);
+
+    // Put-Call Parity forward recovery
+    final recoveredF = MathGreeksEngine.deriveForwardFromParity(
+      spot: 24000.0,
+      atmStrike: k,
+      atmCallMid: cPrice,
+      atmPutMid: pPrice,
+      timeYears: t,
     );
+    expect((recoveredF - f).abs(), lessThan(1e-4));
+
+    // IV round-trip accuracy < 1e-6
     final solved = MathGreeksEngine.solveBlack76IvDetailed(
-      forward: forward,
-      strike: strike,
-      timeYears: tYears,
-      marketMidPrice: callPrice,
+      forward: f,
+      strike: k,
+      timeYears: t,
+      marketMidPrice: cPrice,
       isCall: true,
     );
-    final recoveredSigma = solved['iv'] as double?;
-    expect(recoveredSigma, isNotNull);
+    final recSigma = solved['iv'] as double?;
+    expect(recSigma, isNotNull);
+    expect((recSigma! - sigma).abs(), lessThan(1e-6));
 
-    final roundTripPrice = MathGreeksEngine.black76Price(
-      forward: forward,
-      strike: strike,
-      timeYears: tYears,
-      sigma: recoveredSigma!,
+    // Price below intrinsic returns null
+    final badIv = MathGreeksEngine.solveBlack76IvDetailed(
+      forward: 24500.0,
+      strike: 24000.0,
+      timeYears: t,
+      marketMidPrice: 100.0,
       isCall: true,
     );
-    expect((roundTripPrice - callPrice).abs(), lessThan(0.01));
-
-    final g = MathGreeksEngine.computeIvAndGreeks(
-      spot: 23053.10,
-      strike: 23050.0,
-      optionLtp: callPrice,
-      daysToExpiry: 5.0,
-      isCall: true,
-    );
-    expect(g.delta, inInclusiveRange(0.45, 0.65));
-    expect(g.vanna.abs(), greaterThan(0.0));
-    expect(g.charm.abs(), greaterThan(0.0));
+    expect(badIv['iv'], isNull);
   });
 
-  test('honest_ai_metrics_A1_M6: Unclamped 50% accuracy on balanced labels', () {
-    final ai = AiRecalibrationEngine.instance;
-    final List features = [];
-    final List labels = [];
-    for (int i = 0; 40 > i; i++) {
-      features.add([0.1, -0.05, 0.02]);
-      labels.add(i % 2);
-    }
+  test('WP6: Risk gates (zero capital, Kelly 0, 0.15% STT, 15:15 IST square-off)', () {
+    // Zero capital -> size 0
+    expect(
+      RiskEngine.computeOptimalBuyerQuantity(
+        winProbability: 0.65,
+        entryPremium: 100.0,
+        stopLossPremium: 90.0,
+        targetPremium: 120.0,
+        lotSize: 65,
+        availableCapital: 0.0,
+        config: const RiskConfig(),
+      ),
+      0,
+    );
 
-    final res = ai.evaluateUnclampedOutOfSample(features, labels);
-    expect(res['accuracyPct'], closeTo(50.0, 0.01));
-    expect(ai.activeModel.displayAccuracyLabel, contains('Insufficient data'));
+    // Zero/negative edge -> Kelly returns 0 (no 1-lot bypass)
+    expect(
+      RiskEngine.computeOptimalBuyerQuantity(
+        winProbability: 0.35,
+        entryPremium: 100.0,
+        stopLossPremium: 90.0,
+        targetPremium: 110.0,
+        lotSize: 65,
+        availableCapital: 100000.0,
+        config: const RiskConfig(),
+        useModelProbability: true,
+      ),
+      0,
+    );
+
+    // Verify 0.15% sell-side STT
+    final costs = RiskEngine.computeRoundTripCostsAndSlippage(
+      entryPremium: 100.0,
+      exitPremium: 100.0,
+      quantity: 100,
+    );
+    expect(costs.sttInr, closeTo(15.0, 0.01));
+
+    // Marketable limit price is above ask for buy and below bid for sell
+    final buyLim = ExecutionEngine.computeMarketableLimitPrice(
+        isBuy: true, ltp: 100.0, bestBid: 99.8, bestAsk: 100.2);
+    expect(buyLim, greaterThan(100.2));
+
+    // 15:15 IST == 09:45 UTC
+    expect(
+      ExitManager.isAtOrPastForcedSquareOffIst(
+          nowUtc: DateTime.utc(2026, 11, 19, 9, 45)),
+      isTrue,
+    );
+    expect(
+      ExitManager.isAtOrPastForcedSquareOffIst(
+          nowUtc: DateTime.utc(2026, 11, 19, 9, 44)),
+      isFalse,
+    );
   });
 
-  test('dataset_no_lookahead_A2: Rejects features timestamped after entry', () {
-    const bar1 = OneMinEnrichedBar(
+  test('WP8: Fail-closed stale feed, symmetric rules, no-look-ahead & HMM single-pass', () {
+    // Stale / Disconnected feed MUST produce NO TRADE
+    final staleSig = MtfStrategyEngine.evaluateEntry(
+      index: UnderlyingIndex.nifty50,
+      expiry: '2026-11-24',
+      spot: 24000.0,
+      dataHealth: DataHealthStatus.disconnected,
+      chainRows: const [],
+      recentSpotBars: const [],
+      availableCapital: 50000.0,
+      riskConfig: const RiskConfig(),
+      openPositionsCount: 0,
+      todayNetRealizedPnlIst: 0.0,
+      openPositionsRiskInr: 0.0,
+    );
+    expect(staleSig.action, SignalAction.noTrade);
+
+    // No-look-ahead throws LookAheadViolationError
+    const b1 = OneMinEnrichedBar(
       timestampMs: 1000,
       indexName: 'NIFTY 50',
-      expiry: '2026-11-03',
-      strike: 23050,
+      expiry: '2026-11-24',
+      strike: 24000,
       optionType: 'CE',
       strikeOffset: 0,
-      underlyingSpot: 23050,
+      underlyingSpot: 24000,
       open: 100,
       high: 102,
       low: 99,
       close: 101,
-      intervalVolume: 1000,
-      absoluteOi: 3500000,
-      oiChange1m: 5000,
-      oiChange5m: 25000,
-      oiChange15m: 150000,
-      oiChange60m: 300000,
-      iv: 15.0,
+      intervalVolume: 500,
+      absoluteOi: 1000,
       delta: 0.5,
       gamma: 0.001,
-      theta: -12.0,
-      vega: 9.0,
-      spreadPct: 0.2,
-      orderBookImbalance: 0.1,
+      theta: -10,
+      vega: 8,
     );
-    const futureBar = OneMinEnrichedBar(
+    const bFuture = OneMinEnrichedBar(
       timestampMs: 2000,
       indexName: 'NIFTY 50',
-      expiry: '2026-11-03',
-      strike: 23050,
+      expiry: '2026-11-24',
+      strike: 24000,
       optionType: 'CE',
       strikeOffset: 0,
-      underlyingSpot: 23060,
+      underlyingSpot: 24010,
       open: 101,
-      high: 104,
+      high: 103,
       low: 100,
-      close: 103,
-      intervalVolume: 1200,
-      absoluteOi: 3520000,
-      oiChange1m: 6000,
-      oiChange5m: 30000,
-      oiChange15m: 160000,
-      oiChange60m: 310000,
-      iv: 15.1,
+      close: 102,
+      intervalVolume: 600,
+      absoluteOi: 1050,
       delta: 0.52,
       gamma: 0.001,
-      theta: -12.0,
-      vega: 9.0,
-      spreadPct: 0.2,
-      orderBookImbalance: 0.15,
+      theta: -10,
+      vega: 8,
+    );
+    expect(
+      () => DatasetLabelEngine.enforceNoLookAhead(1000, [b1, bFuture]),
+      throwsA(isA<LookAheadViolationError>()),
     );
 
-    bool threw = false;
-    try {
-      DatasetLabelEngine.enforceNoLookAhead(1000, [bar1, futureBar]);
-    } catch (e) {
-      if (e is LookAheadViolationError) threw = true;
-    }
-    expect(threw, isTrue);
-  });
+    // Unclamped ~50% accuracy on balanced labels
+    final ai = AiRecalibrationEngine.instance;
+    final feats = List.generate(40, (_) => [0.1, -0.05, 0.02]);
+    final labels = List.generate(40, (i) => i % 2);
+    expect(ai.evaluateUnclampedOutOfSample(feats, labels)['accuracyPct'],
+        closeTo(50.0, 0.01));
 
-  test('realistic_backtest_M7_and_kelly_M8: Zero-edge series yields negative net P&L & zero Kelly size', () {
-    final zeroEdgeQty = RiskEngine.computeOptimalBuyerQuantity(
-      winProbability: 0.35,
-      entryPremium: 100.0,
-      stopLossPremium: 90.0,
-      targetPremium: 110.0,
-      lotSize: 75,
-      availableCapital: 50000.0,
-      config: const RiskConfig(),
-    );
-    expect(zeroEdgeQty, 0);
-
-    final List synthBars = [];
-    for (int i = 0; 40 > i; i++) {
-      final p = 100.0 + ((i % 2 == 0) ? 0.2 : -0.2);
-      synthBars.add(
-        OneMinEnrichedBar(
-          timestampMs: 1700000000000 + i * 60000,
-          indexName: 'NIFTY 50',
-          expiry: '2026-11-03',
-          strike: 23050,
-          optionType: 'CE',
-          strikeOffset: 0,
-          underlyingSpot: 23050.0,
-          open: p,
-          high: p + 0.5,
-          low: p - 0.5,
-          close: p + 0.1,
-          intervalVolume: 1500,
-          absoluteOi: 3500000,
-          oiChange1m: 10000,
-          oiChange5m: 50000,
-          oiChange15m: 200000,
-          oiChange60m: 400000,
-          iv: 15.0,
-          delta: 0.50,
-          gamma: 0.001,
-          theta: -12.0,
-          vega: 9.0,
-          spreadPct: 0.30,
-          orderBookImbalance: 0.10,
-        ),
-      );
-    }
-
-    final report = BacktestEngine.runRealisticBacktest(
-      index: UnderlyingIndex.nifty50,
-      bars: synthBars,
-      riskConfig: const RiskConfig(),
-      outOfSampleOnly: false,
-    );
-    expect(report.totalTrades, greaterThan(0));
-    expect(report.netPnl, lessThan(0.0));
-
-    final otp = TotpAuthManager.generateTotpCode('JBSWY3DPEHPK3PXP');
-    expect(otp.length, 6);
+    // TOTP 6-digit format
+    expect(TotpAuthManager.generateTotpCode('JBSWY3DPEHPK3PXP').length, 6);
   });
 }

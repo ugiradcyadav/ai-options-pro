@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart' hide TextDirection;
 import '../../core/models.dart';
 import '../../data/dhan_data_engine.dart';
-import '../../data/forever_db.dart';
+import '../../engine/exit_manager.dart';
 import '../../engine/risk_engine.dart';
 import '../../state/app_state.dart';
 import '../theme/quant_theme.dart';
@@ -23,7 +23,7 @@ class PositionsScreen extends StatefulWidget {
 }
 
 class _PositionsScreenState extends State<PositionsScreen> {
-  late String _activeTab; // 'Positions' | 'Orders' | 'History' | 'Risk'
+  late String _activeTab;
   String _orderStatusFilter = 'ALL';
 
   @override
@@ -32,31 +32,16 @@ class _PositionsScreenState extends State<PositionsScreen> {
     _activeTab = widget.initialTab;
   }
 
-  Color _statusColor(String status) {
-    final s = status.toUpperCase();
-    if (s.contains('FILL') && !s.contains('PART')) return QuantTheme.positive;
-    if (s.contains('PART')) return QuantTheme.accent;
-    if (s.contains('PEND') || s.contains('ACCEPT') || s.contains('OPEN')) {
+  Color _statusColor(OrderLifecycleState st) {
+    if (st == OrderLifecycleState.filled) return QuantTheme.positive;
+    if (st == OrderLifecycleState.partial) return QuantTheme.accent;
+    if (st == OrderLifecycleState.acked || st == OrderLifecycleState.sent) {
       return QuantTheme.warning;
     }
-    if (s.contains('REJ') || s.contains('CANCEL')) return QuantTheme.negative;
-    return QuantTheme.textSecondary;
-  }
-
-  String _normalizeStatusBadge(String raw) {
-    final s = raw.toUpperCase();
-    if (s.contains('PART')) return 'PARTIALLY FILLED';
-    if (s.contains('FILL')) return 'FILLED';
-    if (s.contains('ACCEPT')) return 'ACCEPTED';
-    if (s.contains('PEND')) return 'PENDING';
-    if (s.contains('REJ')) return 'REJECTED';
-    if (s.contains('CANCEL')) return 'CANCELLED';
-    return s;
+    return QuantTheme.negative;
   }
 
   void _openPositionExecutionDetails(PositionRecord pos) {
-    final idx = widget.appState.selectedIndex;
-    final spot = DhanDataEngine.instance.spotPrices[idx] ?? pos.strike.toDouble();
     final curLtp = pos.currentLtp > 0 ? pos.currentLtp : pos.avgEntryPrice;
     final grossPnl = (curLtp - pos.avgEntryPrice) * pos.quantity;
     final costs = RiskEngine.computeRoundTripCostsAndSlippage(
@@ -65,73 +50,46 @@ class _PositionsScreenState extends State<PositionsScreen> {
       quantity: pos.quantity,
     );
     final netPnl = grossPnl - costs.totalFrictionInr;
-    final pnlPct = pos.avgEntryPrice > 0
-        ? ((curLtp - pos.avgEntryPrice) / pos.avgEntryPrice) * 100.0
-        : 0.0;
 
     showModalBottomSheet(
       context: context,
       backgroundColor: QuantTheme.bgPanel,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(14)),
-      ),
       builder: (ctx) => Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text(
-                  '${pos.indexName} ${pos.strike} ${pos.optionType} (${pos.mode})',
-                  style: QuantTheme.heading(size: 14),
-                ),
-                QuantBadge(
-                  text: pos.isOpen ? 'OPEN POSITION' : 'CLOSED',
-                  color: pos.isOpen ? QuantTheme.positive : QuantTheme.textSecondary,
-                ),
-              ],
-            ),
-            const Divider(color: QuantTheme.border, height: 16),
-            _kvRow('Position ID', pos.positionId),
-            _kvRow('Expiry & Underlying Spot', '${pos.expiry}  |  Spot ${spot.toStringAsFixed(2)}'),
-            _kvRow('Quantity', '${pos.quantity} qty'),
-            _kvRow('Average Entry Premium', '₹${pos.avgEntryPrice.toStringAsFixed(2)}'),
-            _kvRow('Current Market Premium', '₹${curLtp.toStringAsFixed(2)}',
-                color: QuantTheme.accent),
-            _kvRow('Stop-Loss / Target Level',
-                'SL ₹${pos.stopLoss.toStringAsFixed(2)}  |  Tgt ₹${pos.target.toStringAsFixed(2)}'),
-            _kvRow(
-              'Gross P&L',
-              '${grossPnl >= 0 ? "+" : ""}₹${grossPnl.toStringAsFixed(2)} (${pnlPct.toStringAsFixed(2)}%)',
-              color: grossPnl >= 0 ? QuantTheme.positive : QuantTheme.negative,
-            ),
-            _kvRow('Est. Statutory Charges + Slippage',
+            Text('${pos.indexName} ${pos.strike} ${pos.optionType} (${pos.mode})',
+                style: QuantTheme.heading(size: 14)),
+            const Divider(color: QuantTheme.border, height: 14),
+            _kvRow('Security ID', pos.securityId),
+            _kvRow('Qty & Avg Entry',
+                '${pos.quantity} @ ₹${pos.avgEntryPrice.toStringAsFixed(2)}'),
+            _kvRow('Current LTP', '₹${curLtp.toStringAsFixed(2)}'),
+            _kvRow('Stored SL / Target',
+                '₹${pos.stopLossPrice.toStringAsFixed(2)}  /  ₹${pos.targetPrice.toStringAsFixed(2)}'),
+            _kvRow('Est. Friction (0.15% STT)',
                 '₹${costs.totalFrictionInr.toStringAsFixed(2)}'),
-            _kvRow(
-              'Net Realizable P&L',
-              '${netPnl >= 0 ? "+" : ""}₹${netPnl.toStringAsFixed(2)}',
-              color: netPnl >= 0 ? QuantTheme.positive : QuantTheme.negative,
-            ),
-            const SizedBox(height: 14),
+            _kvRow('Net Realizable P&L',
+                '${netPnl >= 0 ? "+" : ""}₹${netPnl.toStringAsFixed(2)}',
+                color: netPnl >= 0
+                    ? QuantTheme.positive
+                    : QuantTheme.negative),
+            const SizedBox(height: 12),
             if (pos.isOpen)
               SizedBox(
                 width: double.infinity,
                 height: 44,
-                child: ElevatedButton.icon(
+                child: ElevatedButton(
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: QuantTheme.negative,
-                    foregroundColor: Colors.white,
-                  ),
+                      backgroundColor: QuantTheme.negative),
                   onPressed: () async {
                     Navigator.of(ctx).pop();
                     await widget.appState.closePosition(pos.positionId);
                     if (mounted) setState(() {});
                   },
-                  icon: const Icon(Icons.exit_to_app, size: 17),
-                  label: const Text('Square-Off / Close Position Now'),
+                  child: const Text('Square-Off Position Now'),
                 ),
               ),
           ],
@@ -149,6 +107,8 @@ class _PositionsScreenState extends State<PositionsScreen> {
         widget.appState.openPositions.where((p) => !p.isOpen).toList();
     final allOrders = widget.appState.orders;
     final riskCfg = widget.appState.riskConfig;
+    final availCap = engine.availableTradingCapital;
+    final liveSpot = engine.spotPrices[widget.appState.selectedIndex];
 
     double usedMargin = 0.0;
     double openUnrealizedPnl = 0.0;
@@ -158,26 +118,24 @@ class _PositionsScreenState extends State<PositionsScreen> {
       openUnrealizedPnl += (ltp - p.avgEntryPrice) * p.quantity;
     }
 
-    double realizedDayPnl = 0.0;
-    for (final p in closedPos) {
-      realizedDayPnl += p.realizedPnl;
-    }
-    final totalPnl = openUnrealizedPnl + realizedDayPnl;
-    final availCap = engine.availableTradingCapital > 0
-        ? engine.availableTradingCapital
-        : 48200.0;
-    final totalCapBase = availCap + usedMargin;
-    final totalPnlPct =
-        totalCapBase > 0 ? (totalPnl / totalCapBase) * 100.0 : 0.0;
-    final dayPnlPct =
-        totalCapBase > 0 ? (openUnrealizedPnl / totalCapBase) * 100.0 : 0.0;
+    final todayRealized = widget.appState.todayNetRealizedPnlIst;
+    final totalPnl = openUnrealizedPnl + todayRealized;
 
     return SingleChildScrollView(
       padding: const EdgeInsets.all(12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // 1. Top Internal Tabs: Positions | Orders | History | Risk
+          if (ExitManager.instance.persistentAlerts.isNotEmpty)
+            QuantPanel(
+              margin: const EdgeInsets.only(bottom: 10),
+              borderColor: QuantTheme.negative,
+              child: Text(
+                ExitManager.instance.persistentAlerts.first,
+                style: QuantTheme.mono(size: 11, color: QuantTheme.negative),
+              ),
+            ),
+
           Row(
             children: ['Positions', 'Orders', 'History', 'Risk'].map((t) {
               final active = _activeTab == t;
@@ -191,17 +149,12 @@ class _PositionsScreenState extends State<PositionsScreen> {
                     decoration: BoxDecoration(
                       color: active ? QuantTheme.accent : QuantTheme.bgPanel,
                       borderRadius: BorderRadius.circular(8),
-                      border: Border.all(
-                        color: active ? QuantTheme.accent : QuantTheme.border,
-                      ),
                     ),
                     child: Text(
                       t,
                       style: QuantTheme.heading(
                         size: 11,
-                        color: active
-                            ? QuantTheme.bgMain
-                            : QuantTheme.textPrimary,
+                        color: active ? QuantTheme.bgMain : QuantTheme.textPrimary,
                       ),
                     ),
                   ),
@@ -211,37 +164,18 @@ class _PositionsScreenState extends State<PositionsScreen> {
           ),
           const SizedBox(height: 10),
 
-          // 2. Dual Total P&L and Day P&L Summary Cards (Matches Reference Image)
           Row(
             children: [
               Expanded(
                 child: QuantPanel(
                   backgroundColor: QuantTheme.bgSecondary,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text('Total P&L', style: QuantTheme.label(size: 11)),
-                      const SizedBox(height: 4),
-                      Text(
+                  child: QuantMetricCell(
+                    label: 'TODAY NET P&L (IST)',
+                    value:
                         '${totalPnl >= 0 ? "+" : ""}₹${totalPnl.toStringAsFixed(0)}',
-                        style: QuantTheme.mono(
-                          size: 18,
-                          color: totalPnl >= 0
-                              ? QuantTheme.positive
-                              : QuantTheme.negative,
-                          weight: FontWeight.w800,
-                        ),
-                      ),
-                      Text(
-                        '(${totalPnlPct >= 0 ? "+" : ""}${totalPnlPct.toStringAsFixed(2)}%)',
-                        style: QuantTheme.mono(
-                          size: 11,
-                          color: totalPnl >= 0
-                              ? QuantTheme.positive
-                              : QuantTheme.negative,
-                        ),
-                      ),
-                    ],
+                    valueColor: totalPnl >= 0
+                        ? QuantTheme.positive
+                        : QuantTheme.negative,
                   ),
                 ),
               ),
@@ -249,32 +183,14 @@ class _PositionsScreenState extends State<PositionsScreen> {
               Expanded(
                 child: QuantPanel(
                   backgroundColor: QuantTheme.bgSecondary,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text('Day Unrealized P&L',
-                          style: QuantTheme.label(size: 11)),
-                      const SizedBox(height: 4),
-                      Text(
-                        '${openUnrealizedPnl >= 0 ? "+" : ""}₹${openUnrealizedPnl.toStringAsFixed(0)}',
-                        style: QuantTheme.mono(
-                          size: 18,
-                          color: openUnrealizedPnl >= 0
-                              ? QuantTheme.positive
-                              : QuantTheme.negative,
-                          weight: FontWeight.w800,
-                        ),
-                      ),
-                      Text(
-                        '(${dayPnlPct >= 0 ? "+" : ""}${dayPnlPct.toStringAsFixed(2)}%)',
-                        style: QuantTheme.mono(
-                          size: 11,
-                          color: openUnrealizedPnl >= 0
-                              ? QuantTheme.positive
-                              : QuantTheme.negative,
-                        ),
-                      ),
-                    ],
+                  child: QuantMetricCell(
+                    label: 'AVAILABLE CAPITAL',
+                    value: availCap != null
+                        ? '₹${availCap.toStringAsFixed(0)}'
+                        : 'NO DATA',
+                    valueColor: availCap != null
+                        ? QuantTheme.accent
+                        : QuantTheme.negative,
                   ),
                 ),
               ),
@@ -282,105 +198,46 @@ class _PositionsScreenState extends State<PositionsScreen> {
           ),
           const SizedBox(height: 10),
 
-          // 3. Aggregated Portfolio Greeks Banner (M2 First & Second-Order)
-          V2ControlDialogs.buildPortfolioGreeksCard(
-            openPos,
-            engine.spotPrices[widget.appState.selectedIndex] ?? 23050.0,
-          ),
+          V2ControlDialogs.buildPortfolioGreeksCard(openPos, liveSpot),
 
           if (_activeTab == 'Positions')
             _buildOpenPositionsView(openPos)
           else if (_activeTab == 'Orders')
             _buildOrdersView(allOrders)
           else if (_activeTab == 'History')
-            _buildHistoryView(closedPos, allOrders)
+            _buildHistoryView(closedPos)
           else
-            _buildRiskAndExposureView(
-              usedMargin: usedMargin,
-              availCap: availCap,
-              riskCfg: riskCfg,
-              openCount: openPos.length,
-            ),
+            _buildRiskView(usedMargin, availCap, riskCfg, openPos.length),
 
           const SizedBox(height: 12),
-
-          // 4. Risk Overview & Persisted Emergency Kill-Switch Footer
-          QuantPanel(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Row(
-                      children: [
-                        const Icon(Icons.shield_outlined,
-                            color: QuantTheme.positive, size: 16),
-                        const SizedBox(width: 6),
-                        Text('Risk Overview & Margin Telemetry',
-                            style: QuantTheme.heading(size: 12)),
-                      ],
-                    ),
-                    QuantBadge(
-                      text: riskCfg.killSwitchActive
-                          ? 'KILL SWITCH ACTIVE'
-                          : 'GUARDRAILS ACTIVE',
-                      color: riskCfg.killSwitchActive
-                          ? QuantTheme.negative
-                          : QuantTheme.positive,
-                    ),
-                  ],
-                ),
-                const Divider(color: QuantTheme.border, height: 14),
-                _kvRow('Used Margin / Outlay', '₹${usedMargin.toStringAsFixed(0)}'),
-                _kvRow('Available Margin', '₹${availCap.toStringAsFixed(0)}',
-                    color: QuantTheme.accent),
-                _kvRow('Max Risk per Trade',
-                    '${riskCfg.maxRiskPerTradePct.toStringAsFixed(1)}%'),
-                _kvRow(
-                  'Daily Loss Used / Max Limit',
-                  '₹${widget.appState.todayRealizedLossInr.toStringAsFixed(0)} / ₹${riskCfg.maxDailyLossInr.toStringAsFixed(0)}',
-                  color: widget.appState.todayRealizedLossInr >=
-                          riskCfg.maxDailyLossInr
-                      ? QuantTheme.negative
-                      : QuantTheme.textPrimary,
-                ),
-                const SizedBox(height: 10),
-                SizedBox(
-                  width: double.infinity,
-                  height: 44,
-                  child: ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: riskCfg.killSwitchActive
-                          ? QuantTheme.positive
-                          : QuantTheme.negative,
-                      foregroundColor: Colors.white,
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                    ),
-                    onPressed: () {
-                      final nextState = !riskCfg.killSwitchActive;
-                      widget.appState.updateRiskConfig(
-                        riskCfg.copyWith(killSwitchActive: nextState),
-                      );
-                      setState(() {});
-                    },
-                    icon: Icon(
-                      riskCfg.killSwitchActive
-                          ? Icons.lock_open
-                          : Icons.report_gmailerrorred,
-                      size: 18,
-                    ),
-                    label: Text(
-                      riskCfg.killSwitchActive
-                          ? 'Resume Trading (Deactivate Kill Switch)'
-                          : 'Emergency Stop / Activate Kill Switch',
-                      style: QuantTheme.heading(size: 12, color: Colors.white),
-                    ),
-                  ),
-                ),
-              ],
+          SizedBox(
+            width: double.infinity,
+            height: 44,
+            child: ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: riskCfg.killSwitchActive
+                    ? QuantTheme.positive
+                    : QuantTheme.negative,
+                foregroundColor: Colors.white,
+              ),
+              onPressed: () async {
+                if (riskCfg.killSwitchActive) {
+                  widget.appState.updateRiskConfig(
+                      riskCfg.copyWith(killSwitchActive: false));
+                } else {
+                  await widget.appState.activateKillSwitch(flattenAll: true);
+                }
+                if (mounted) setState(() {});
+              },
+              icon: Icon(
+                  riskCfg.killSwitchActive ? Icons.lock_open : Icons.gpp_bad,
+                  size: 18),
+              label: Text(
+                riskCfg.killSwitchActive
+                    ? 'Resume Trading (Deactivate Kill Switch)'
+                    : 'Emergency Kill Switch (Block & Flatten All)',
+                style: QuantTheme.heading(size: 12, color: Colors.white),
+              ),
             ),
           ),
         ],
@@ -393,37 +250,16 @@ class _PositionsScreenState extends State<PositionsScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text('Open Positions (${openPos.length})',
-                  style: QuantTheme.heading(size: 12)),
-              Text('Tap position for execution details',
-                  style: QuantTheme.label(size: 10, color: QuantTheme.accent)),
-            ],
-          ),
+          Text('Open Positions (${openPos.length})',
+              style: QuantTheme.heading(size: 12)),
           const Divider(color: QuantTheme.border, height: 14),
           if (openPos.isEmpty)
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 16),
-              child: Center(
-                child: Text(
-                  'No open positions. Execute a signal from Signals Center.',
-                  style: QuantTheme.label(size: 11),
-                ),
-              ),
-            )
+            Text('No open positions.', style: QuantTheme.label(size: 11))
           else
             ...openPos.map((raw) {
               final p = raw as PositionRecord;
-              final ltp =
-                  p.currentLtp > 0 ? p.currentLtp : p.avgEntryPrice;
+              final ltp = p.currentLtp > 0 ? p.currentLtp : p.avgEntryPrice;
               final pnl = (ltp - p.avgEntryPrice) * p.quantity;
-              final pnlPct = p.avgEntryPrice > 0
-                  ? ((ltp - p.avgEntryPrice) / p.avgEntryPrice) * 100.0
-                  : 0.0;
-              final isPos = pnl >= 0;
-
               return GestureDetector(
                 onTap: () => _openPositionExecutionDetails(p),
                 child: Container(
@@ -434,42 +270,31 @@ class _PositionsScreenState extends State<PositionsScreen> {
                     borderRadius: BorderRadius.circular(8),
                     border: Border.all(color: QuantTheme.border),
                   ),
-                  child: Column(
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            '${p.indexName} ${p.strike} ${p.optionType}',
-                            style: QuantTheme.heading(size: 13),
+                            '${p.indexName} ${p.strike} ${p.optionType}${p.legacyUnverified ? " [LEGACY]" : ""}',
+                            style: QuantTheme.heading(size: 12),
                           ),
                           Text(
-                            '${isPos ? "+" : ""}₹${pnl.toStringAsFixed(1)} (${isPos ? "+" : ""}${pnlPct.toStringAsFixed(2)}%)',
-                            style: QuantTheme.mono(
-                              size: 13,
-                              color: isPos
-                                  ? QuantTheme.positive
-                                  : QuantTheme.negative,
-                              weight: FontWeight.w800,
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 4),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          Text(
-                            'Qty: ${p.quantity} | Avg: ₹${p.avgEntryPrice.toStringAsFixed(2)} | LTP: ₹${ltp.toStringAsFixed(2)}',
+                            'Qty ${p.quantity} | Avg ₹${p.avgEntryPrice.toStringAsFixed(2)} | SL ₹${p.stopLossPrice.toStringAsFixed(1)} | Tgt ₹${p.targetPrice.toStringAsFixed(1)}',
                             style: QuantTheme.mono(
                                 size: 10, color: QuantTheme.textSecondary),
                           ),
-                          Text(
-                            'SL: ₹${p.stopLoss.toStringAsFixed(1)} | Tgt: ₹${p.target.toStringAsFixed(1)}',
-                            style: QuantTheme.mono(
-                                size: 10, color: QuantTheme.accent),
-                          ),
                         ],
+                      ),
+                      Text(
+                        '${pnl >= 0 ? "+" : ""}₹${pnl.toStringAsFixed(1)}',
+                        style: QuantTheme.mono(
+                          size: 12,
+                          color: pnl >= 0
+                              ? QuantTheme.positive
+                              : QuantTheme.negative,
+                        ),
                       ),
                     ],
                   ),
@@ -482,154 +307,69 @@ class _PositionsScreenState extends State<PositionsScreen> {
   }
 
   Widget _buildOrdersView(List allOrders) {
-    final filters = [
-      'ALL',
-      'FILLED',
-      'PENDING',
-      'ACCEPTED',
-      'PARTIALLY FILLED',
-      'REJECTED',
-      'CANCELLED'
-    ];
-    final filtered = _orderStatusFilter == 'ALL'
-        ? allOrders
-        : allOrders
-            .where((o) =>
-                _normalizeStatusBadge((o as TradeOrder).status) ==
-                _orderStatusFilter)
-            .toList();
-
     return QuantPanel(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('Order Book & Status Filter (${filtered.length})',
+          Text('Orders (${allOrders.length})',
               style: QuantTheme.heading(size: 12)),
-          const SizedBox(height: 8),
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Row(
-              children: filters.map((f) {
-                final active = _orderStatusFilter == f;
-                return GestureDetector(
-                  onTap: () => setState(() => _orderStatusFilter = f),
-                  child: Container(
-                    margin: const EdgeInsets.only(right: 6),
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-                    decoration: BoxDecoration(
-                      color:
-                          active ? QuantTheme.bgElevated : QuantTheme.bgSecondary,
-                      borderRadius: BorderRadius.circular(6),
-                      border: Border.all(
-                        color: active ? QuantTheme.accent : QuantTheme.border,
-                      ),
-                    ),
-                    child: Text(
-                      f,
-                      style: QuantTheme.mono(
-                        size: 9,
-                        color: active
-                            ? QuantTheme.accent
-                            : QuantTheme.textSecondary,
-                      ),
-                    ),
-                  ),
-                );
-              }).toList(),
-            ),
-          ),
           const Divider(color: QuantTheme.border, height: 14),
-          if (filtered.isEmpty)
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 14),
-              child: Text('No orders matching filter $_orderStatusFilter.',
-                  style: QuantTheme.label(size: 11)),
-            )
+          if (allOrders.isEmpty)
+            Text('No orders recorded.', style: QuantTheme.label(size: 11))
           else
-            ...filtered.map((raw) {
+            ...allOrders.take(20).map((raw) {
               final o = raw as TradeOrder;
-              final badgeText = _normalizeStatusBadge(o.status);
-              final badgeCol = _statusColor(badgeText);
-              final ts = DateFormat('dd MMM HH:mm:ss')
-                  .format(DateTime.fromMillisecondsSinceEpoch(o.timestampMs));
-              return Container(
-                margin: const EdgeInsets.only(bottom: 8),
-                padding: const EdgeInsets.all(9),
-                decoration: BoxDecoration(
-                  color: QuantTheme.bgSecondary,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: QuantTheme.border),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Text(
-                          '${o.side} ${o.indexName} ${o.strike} ${o.optionType} (${o.mode})',
-                          style: QuantTheme.heading(size: 11),
-                        ),
-                        QuantBadge(text: badgeText, color: badgeCol),
-                      ],
-                    ),
-                    const SizedBox(height: 4),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Text(
-                          'Qty: ${o.quantity} @ ₹${o.price.toStringAsFixed(2)}',
-                          style: QuantTheme.mono(size: 11),
-                        ),
-                        Text(ts,
-                            style: QuantTheme.mono(
-                                size: 9, color: QuantTheme.textSecondary)),
-                      ],
-                    ),
-                    if (o.reason.isNotEmpty) ...[
-                      const SizedBox(height: 2),
-                      Text(
-                        'Note: ${o.reason}',
-                        style: QuantTheme.label(size: 10),
-                      ),
-                    ],
-                  ],
-                ),
-              );
-            }),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildHistoryView(List closedPos, List allOrders) {
-    return QuantPanel(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text('Closed Trade History (${closedPos.length})',
-              style: QuantTheme.heading(size: 12)),
-          const Divider(color: QuantTheme.border, height: 14),
-          if (closedPos.isEmpty)
-            Text('No closed positions yet in current session.',
-                style: QuantTheme.label(size: 11))
-          else
-            ...closedPos.map((raw) {
-              final p = raw as PositionRecord;
-              final isWin = p.realizedPnl >= 0;
+              final st = o.lifecycleState;
               return Padding(
-                padding: const EdgeInsets.symmetric(vertical: 5),
+                padding: const EdgeInsets.symmetric(vertical: 4),
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Text('${p.indexName} ${p.strike} ${p.optionType} (${p.quantity}q)',
-                        style: QuantTheme.mono(size: 11)),
+                    Expanded(
+                      child: Text(
+                        '${o.side} ${o.indexName} ${o.strike} ${o.optionType} (${o.filledQty}/${o.quantity} @ ₹${o.price.toStringAsFixed(2)})',
+                        style: QuantTheme.mono(size: 10),
+                      ),
+                    ),
+                    QuantBadge(text: st.label, color: _statusColor(st)),
+                  ],
+                ),
+              );
+            }),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHistoryView(List closedPos) {
+    return QuantPanel(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Closed Positions (${closedPos.length})',
+              style: QuantTheme.heading(size: 12)),
+          const Divider(color: QuantTheme.border, height: 14),
+          if (closedPos.isEmpty)
+            Text('No closed trades.', style: QuantTheme.label(size: 11))
+          else
+            ...closedPos.map((raw) {
+              final p = raw as PositionRecord;
+              return Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
                     Text(
-                      '${isWin ? "+" : ""}₹${p.realizedPnl.toStringAsFixed(2)}',
+                      '${p.indexName} ${p.strike} ${p.optionType}${p.legacyUnverified ? " [LEGACY]" : ""}',
+                      style: QuantTheme.mono(size: 11),
+                    ),
+                    Text(
+                      '${p.realizedPnl >= 0 ? "+" : ""}₹${p.realizedPnl.toStringAsFixed(2)}',
                       style: QuantTheme.mono(
                         size: 11,
-                        color: isWin ? QuantTheme.positive : QuantTheme.negative,
+                        color: p.realizedPnl >= 0
+                            ? QuantTheme.positive
+                            : QuantTheme.negative,
                       ),
                     ),
                   ],
@@ -641,33 +381,24 @@ class _PositionsScreenState extends State<PositionsScreen> {
     );
   }
 
-  Widget _buildRiskAndExposureView({
-    required double usedMargin,
-    required double availCap,
-    required RiskConfig riskCfg,
-    required int openCount,
-  }) {
-    final exposurePct = (usedMargin + availCap) > 0
-        ? (usedMargin / (usedMargin + availCap)) * 100.0
-        : 0.0;
+  Widget _buildRiskView(
+      double usedMargin, double? availCap, RiskConfig riskCfg, int openCount) {
     return QuantPanel(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('Portfolio Exposure & Risk Guardrails',
+          Text('Risk Guardrails & Feed State',
               style: QuantTheme.heading(size: 12)),
           const Divider(color: QuantTheme.border, height: 14),
-          _kvRow('Capital Exposure %',
-              '${exposurePct.toStringAsFixed(1)}% (Max Allowed ${riskCfg.maxCapitalOutlayPct.toStringAsFixed(0)}%)'),
-          _kvRow('Concurrent Positions',
-              '$openCount / ${riskCfg.maxConcurrentPositions}'),
-          _kvRow('Max Risk Per Trade %',
-              '${riskCfg.maxRiskPerTradePct.toStringAsFixed(1)}%'),
-          _kvRow('Max Daily Loss Cap',
-              '₹${riskCfg.maxDailyLossInr.toStringAsFixed(0)}'),
-          _kvRow('Reconciliation Status',
-              DhanDataEngine.instance.lastAuditStatus,
-              color: QuantTheme.positive),
+          _kvRow('Used Margin', '₹${usedMargin.toStringAsFixed(0)}'),
+          _kvRow('Available Capital',
+              availCap != null ? '₹${availCap.toStringAsFixed(0)}' : 'NO DATA'),
+          _kvRow('Open Positions', '$openCount / ${riskCfg.maxConcurrentPositions}'),
+          _kvRow('IST Daily Realized Loss / Cap',
+              '₹${widget.appState.todayRealizedLossInr.toStringAsFixed(0)} / ₹${riskCfg.maxDailyLossInr.toStringAsFixed(0)}'),
+          _kvRow('Open Position Risk',
+              '₹${widget.appState.openPositionsRiskInr.toStringAsFixed(0)}'),
+          _kvRow('Data Feed Health', DhanDataEngine.instance.dataHealth.label),
         ],
       ),
     );
@@ -675,19 +406,12 @@ class _PositionsScreenState extends State<PositionsScreen> {
 
   Widget _kvRow(String k, String v, {Color color = QuantTheme.textPrimary}) {
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 3.5),
+      padding: const EdgeInsets.symmetric(vertical: 3),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
           Text(k, style: QuantTheme.label(size: 11)),
-          Flexible(
-            child: Text(
-              v,
-              textAlign: TextAlign.right,
-              style: QuantTheme.mono(
-                  size: 11, color: color, weight: FontWeight.w700),
-            ),
-          ),
+          Text(v, style: QuantTheme.mono(size: 11, color: color)),
         ],
       ),
     );

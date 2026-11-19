@@ -1,0 +1,12 @@
+build/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+*.apk
+*.aab
+*.jks
+*.keystore
+key.properties
+local.properties
+AI-Options-Pro-arm64-APK/

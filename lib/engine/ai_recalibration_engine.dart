@@ -40,8 +40,9 @@ class AiRecalibrationEngine {
   AiRecalibrationEngine._();
 
   static const int minOosTradesRequired = 100;
+  static const int gateA5MinTrades = 300;
 
-  String modelVersion = 'RuleLogistic-HMM-20261102';
+  String modelVersion = 'RulesOnly-Shadow-v3';
   double validationWinRate = 50.0;
   int oosSampleCount = 0;
   double oosCiLower = 0.0;
@@ -49,10 +50,35 @@ class AiRecalibrationEngine {
   bool passedEvaluationGate = false;
 
   String lastRecalibrationNote =
-      'Rule-weighted logistic score (Shadow Mode • Insufficient data N=0)';
+      'Insufficient data (N=0) • Rules-only mode active until Gate A5 passes';
   int lastCalibrationMs = 0;
   int trainedBarCount = 0;
-  final List engineErrorLog = [];
+  final List<String> engineErrorLog = [];
+
+  // Signed logistic weights (used only in shadow scoring until passedEvaluationGate == true)
+  double wHtfOiFlow = 0.34;
+  double wMicroMomentum = 0.24;
+  double wOrderBookImb = 0.18;
+  double wPcrVelocity = 0.14;
+  double wGammaRegime = 0.10;
+
+  double _prevWOi = 0.34;
+  double _prevWMom = 0.24;
+  double _prevWImb = 0.18;
+
+  // 3-State Gaussian-Emission HMM (0: Bull, 1: Bear, 2: Chop)
+  List<List<double>> hmmTransitionMatrix = [
+    [0.82, 0.06, 0.12],
+    [0.06, 0.82, 0.12],
+    [0.14, 0.14, 0.72],
+  ];
+  List<double> hmmReturnMeans = [0.00045, -0.00045, 0.0];
+  List<double> hmmReturnVars = [0.0000018, 0.0000018, 0.0000006];
+
+  double probBullRegime = 0.3333;
+  double probBearRegime = 0.3333;
+  double probChopRegime = 0.3334;
+  int _lastProcessedBarTsMs = 0; // WP-8: Prevent re-filtering the same bars on top of posterior
 
   AiModelMeta get activeModel => AiModelMeta(
         version: modelVersion,
@@ -63,42 +89,31 @@ class AiRecalibrationEngine {
         passedEvaluationGate: passedEvaluationGate,
       );
 
-  double wHtfOiFlow = 0.34;
-  double wMicroMomentum = 0.24;
-  double wOrderBookImb = 0.18;
-  double wPcrVelocity = 0.14;
-  double wGammaRegime = 0.10;
+  int get lastProcessedBarTsMs => _lastProcessedBarTsMs;
 
-  List hmmTransitionMatrix = [
-    [0.82, 0.06, 0.12],
-    [0.06, 0.82, 0.12],
-    [0.14, 0.14, 0.72],
-  ];
-  List hmmReturnMeans = [0.00045, -0.00045, 0.0];
-  List hmmReturnVars = [0.0000018, 0.0000018, 0.0000006];
-
-  double probBullRegime = 0.34;
-  double probBearRegime = 0.33;
-  double probChopRegime = 0.33;
+  void resetHmmPosterior() {
+    probBullRegime = 0.3333;
+    probBearRegime = 0.3333;
+    probChopRegime = 0.3334;
+    _lastProcessedBarTsMs = 0;
+  }
 
   void _logEngineError(String context, Object error) {
     final ts = DateFormat('HH:mm:ss').format(DateTime.now());
     engineErrorLog.add('[$ts] $context: $error');
-    if (engineErrorLog.length > 50) {
-      engineErrorLog.removeAt(0);
-    }
+    if (engineErrorLog.length > 50) engineErrorLog.removeAt(0);
   }
 
   String _computeVersionHash() {
     final dateStr = DateFormat('yyyyMMdd').format(DateTime.now());
     final payload =
-        '${wHtfOiFlow.toStringAsFixed(4)}|${wMicroMomentum.toStringAsFixed(4)}|${wOrderBookImb.toStringAsFixed(4)}|$trainedBarCount';
+        '${wHtfOiFlow.toStringAsFixed(4)}|${wMicroMomentum.toStringAsFixed(4)}|${wOrderBookImb.toStringAsFixed(4)}|$oosSampleCount';
     final digest =
         sha1.convert(utf8.encode(payload)).toString().substring(0, 7);
     return 'RuleLogistic-$dateStr-$digest';
   }
 
-  Future initialize() async {
+  Future<void> initialize() async {
     try {
       final prefs = await SharedPreferences.getInstance();
       wHtfOiFlow = prefs.getDouble('ai_w_htf_oi') ?? 0.34;
@@ -108,19 +123,25 @@ class AiRecalibrationEngine {
       wGammaRegime = prefs.getDouble('ai_w_gex') ?? 0.10;
       validationWinRate = prefs.getDouble('ai_val_win_rate_unclamped') ?? 50.0;
       oosSampleCount = prefs.getInt('ai_oos_sample_count') ?? 0;
-      lastCalibrationMs = prefs.getInt('ai_last_cal_ms') ??
-          DateTime.now().millisecondsSinceEpoch;
-      await recalibrateFromForeverDb();
+      lastCalibrationMs = prefs.getInt('ai_last_cal_ms') ?? 0;
+      passedEvaluationGate =
+          oosSampleCount >= gateA5MinTrades && oosCiLower > 52.0;
+      modelVersion = _computeVersionHash();
     } catch (e) {
       _logEngineError('initialize', e);
     }
   }
 
-  Future rollbackToPreviousWeights() async {
-    lastRecalibrationNote = "Rolled back to baseline weights ($modelVersion)";
+  Future<void> rollbackToPreviousWeights() async {
+    wHtfOiFlow = _prevWOi;
+    wMicroMomentum = _prevWMom;
+    wOrderBookImb = _prevWImb;
+    modelVersion = _computeVersionHash();
+    lastRecalibrationNote = 'Rolled back weights ($modelVersion)';
   }
 
-  Future runLightweightFiveDayRecalibration({bool force = false}) async {
+  Future<void> runLightweightFiveDayRecalibration(
+      {bool force = false}) async {
     await recalibrateFromForeverDb();
   }
 
@@ -130,150 +151,96 @@ class AiRecalibrationEngine {
     return math.exp(-0.5 * diff * diff / v) / math.sqrt(2.0 * math.pi * v);
   }
 
-  void updateHmmRegime({
-    required List recentBars,
-    required double netOiFlowScore,
-    required double pcr,
-  }) {
-    final List alpha = [probBullRegime, probBearRegime, probChopRegime];
+  /// WP-8: Filters each new underlying SPOT bar strictly ONCE using _lastProcessedBarTsMs
+  void updateHmmRegime({required List recentSpotBars}) {
+    final sorted = recentSpotBars
+        .map((e) => e as OneMinEnrichedBar)
+        .where((b) => b.underlyingSpot > 0)
+        .toList()
+      ..sort((a, b) => a.timestampMs.compareTo(b.timestampMs));
 
-    if (recentBars.length >= 2) {
-      for (int t = 1; recentBars.length > t; t++) {
-        final prev = (recentBars[t - 1].underlyingSpot as num).toDouble();
-        final curr = (recentBars[t].underlyingSpot as num).toDouble();
-        if (0 >= prev || 0 >= curr) continue;
-        final obsRet = (curr - prev) / prev;
+    if (sorted.length < 2) return;
 
-        final List nextAlpha = [0.0, 0.0, 0.0];
-        double normSum = 0.0;
-        for (int j = 0; 3 > j; j++) {
-          double transSum = 0.0;
-          for (int i = 0; 3 > i; i++) {
-            final row = hmmTransitionMatrix[i] as List;
-            transSum += (alpha[i] as double) * ((row[j] as num).toDouble());
-          }
-          final baseMean = (hmmReturnMeans[j] as num).toDouble();
-          final baseVar = (hmmReturnVars[j] as num).toDouble();
-          final adjMean = baseMean +
-              (j == 0
-                  ? netOiFlowScore * 0.00015
-                  : (j == 1 ? -netOiFlowScore * 0.00015 : 0.0));
-          final emission = _gaussianPdf(obsRet, adjMean, baseVar);
-          nextAlpha[j] = transSum * math.max(emission, 1e-12);
-          normSum += nextAlpha[j] as double;
-        }
-        if (normSum > 0) {
-          for (int j = 0; 3 > j; j++) {
-            alpha[j] = (nextAlpha[j] as double) / normSum;
-          }
-        }
+    final alpha = [probBullRegime, probBearRegime, probChopRegime];
+    int processed = 0;
+
+    for (int t = 1; t < sorted.length; t++) {
+      final cur = sorted[t];
+      if (cur.timestampMs <= _lastProcessedBarTsMs) continue;
+
+      final prev = sorted[t - 1];
+      final dtMs = cur.timestampMs - prev.timestampMs;
+      // Skip overnight gaps (> 15 min)
+      if (dtMs <= 0 || dtMs > 15 * 60 * 1000) {
+        _lastProcessedBarTsMs = cur.timestampMs;
+        continue;
       }
-    } else {
-      final synthObs =
-          netOiFlowScore * 0.0003 + ((pcr - 1.0).clamp(-0.5, 0.5) * 0.0002);
-      final List nextAlpha = [0.0, 0.0, 0.0];
+
+      final obsRet = (cur.underlyingSpot - prev.underlyingSpot) / prev.underlyingSpot;
+      final nextAlpha = [0.0, 0.0, 0.0];
       double normSum = 0.0;
-      for (int j = 0; 3 > j; j++) {
+
+      for (int j = 0; j < 3; j++) {
         double transSum = 0.0;
-        for (int i = 0; 3 > i; i++) {
-          final row = hmmTransitionMatrix[i] as List;
-          transSum += (alpha[i] as double) * ((row[j] as num).toDouble());
+        for (int i = 0; i < 3; i++) {
+          transSum += alpha[i] * hmmTransitionMatrix[i][j];
         }
-        final emission = _gaussianPdf(
-          synthObs,
-          (hmmReturnMeans[j] as num).toDouble(),
-          (hmmReturnVars[j] as num).toDouble(),
-        );
+        final emission =
+            _gaussianPdf(obsRet, hmmReturnMeans[j], hmmReturnVars[j]);
         nextAlpha[j] = transSum * math.max(emission, 1e-12);
-        normSum += nextAlpha[j] as double;
+        normSum += nextAlpha[j];
       }
       if (normSum > 0) {
-        for (int j = 0; 3 > j; j++) {
-          alpha[j] = (nextAlpha[j] as double) / normSum;
+        for (int j = 0; j < 3; j++) {
+          alpha[j] = nextAlpha[j] / normSum;
         }
       }
+      _lastProcessedBarTsMs = cur.timestampMs;
+      processed++;
     }
 
-    probBullRegime = alpha[0] as double;
-    probBearRegime = alpha[1] as double;
-    probChopRegime = alpha[2] as double;
-  }
-
-  String exportHmmParamsJson() {
-    return jsonEncode({
-      'transition_matrix': hmmTransitionMatrix,
-      'means': hmmReturnMeans,
-      'variances': hmmReturnVars,
-      'filtered_probs': [probBullRegime, probBearRegime, probChopRegime],
-    });
-  }
-
-  void importHmmParamsJson(String jsonStr) {
-    try {
-      final m = jsonDecode(jsonStr) as Map;
-      if (m['transition_matrix'] is List) {
-        hmmTransitionMatrix = m['transition_matrix'] as List;
-      }
-      if (m['means'] is List) {
-        hmmReturnMeans = m['means'] as List;
-      }
-      if (m['variances'] is List) {
-        hmmReturnVars = m['variances'] as List;
-      }
-    } catch (e) {
-      _logEngineError('importHmmParamsJson', e);
+    if (processed > 0) {
+      probBullRegime = alpha[0];
+      probBearRegime = alpha[1];
+      probChopRegime = alpha[2];
     }
   }
 
-  double scoreSetupConfidence({
-    required bool isCallSignal,
-    required double htfOiScore,
-    required double momentumScore,
-    required double orderBookImbalance,
-    required double pcrScore,
-    required double deltaQualityScore,
-  }) {
-    return scoreEnsembleConfidence(
-      isCallSignal: isCallSignal,
-      htfOiScore: htfOiScore,
-      momentumScore: momentumScore,
-      orderBookImbalance: orderBookImbalance,
-      pcrScore: pcrScore,
-      deltaQualityScore: deltaQualityScore,
-    );
-  }
-
+  /// WP-8: Signed directional scoring (no .abs() on directional features).
+  /// For CE, positive features increase score; for PE, negative features increase score.
   double scoreEnsembleConfidence({
     required bool isCallSignal,
-    required double htfOiScore,
-    required double momentumScore,
-    required double orderBookImbalance,
-    required double pcrScore,
-    required double deltaQualityScore,
+    required double signedOiScore,
+    required double signedMomentumScore,
+    required double signedOrderBookImbalance,
+    required double signedPcrBias,
+    required double deltaAbsQuality,
   }) {
+    final dirSign = isCallSignal ? 1.0 : -1.0;
     final regimeBoost = isCallSignal ? probBullRegime : probBearRegime;
     final chopPenalty =
         probChopRegime > 0.45 ? (probChopRegime - 0.45) * 0.65 : 0.0;
 
     final linearLogit = -0.25 +
-        (wHtfOiFlow * htfOiScore * 2.0) +
-        (wMicroMomentum * momentumScore * 1.8) +
-        (wOrderBookImb * orderBookImbalance * 1.5) +
-        (wPcrVelocity * pcrScore * 1.4) +
-        (wGammaRegime * deltaQualityScore * 1.2) +
-        (regimeBoost * 0.95) -
+        (wHtfOiFlow * (signedOiScore * dirSign) * 2.0) +
+        (wMicroMomentum * (signedMomentumScore * dirSign) * 1.8) +
+        (wOrderBookImb * (signedOrderBookImbalance * dirSign) * 1.5) +
+        (wPcrVelocity * (signedPcrBias * dirSign) * 1.4) +
+        (wGammaRegime * deltaAbsQuality * 1.0) +
+        (regimeBoost * 0.90) -
         chopPenalty;
 
     final prob = 1.0 / (1.0 + math.exp(-linearLogit));
-    return double.parse((prob * 100.0).toStringAsFixed(2));
+    return prob * 100.0;
   }
 
-  Map evaluateUnclampedOutOfSample(List features, List labels) {
+  Map<String, double> evaluateUnclampedOutOfSample(
+      List features, List labels) {
     if (features.isEmpty || features.length != labels.length) {
       return {'accuracyPct': 50.0, 'ciLow': 0.0, 'ciHigh': 100.0, 'n': 0.0};
     }
     int correct = 0;
-    for (int i = 0; features.length > i; i++) {
+    for (int i = 0; i < features.length; i++) {
       final f = features[i] as List;
       final f0 = f.isNotEmpty ? (f[0] as num).toDouble() : 0.0;
       final f1 = f.length > 1 ? (f[1] as num).toDouble() : 0.0;
@@ -295,77 +262,80 @@ class AiRecalibrationEngine {
     };
   }
 
-  Future recalibrateFromForeverDb() async {
+  /// Evaluates strictly on real recorded closed non-legacy trades/bars; never fabricates metrics
+  Future<void> recalibrateFromForeverDb() async {
     try {
-      final List allBars = [];
+      final allBars = <OneMinEnrichedBar>[];
       for (final idx in UnderlyingIndex.values) {
         final bList = await ForeverDatabase.instance
-            .getRecentBars(indexName: idx.label, limit: 200);
-        allBars.addAll(bList);
+            .getRecentBars(indexName: idx.label, limit: 250);
+        allBars.addAll(bList.where((b) => b.optionType != 'SPOT'));
       }
 
       trainedBarCount = allBars.length;
-      if (30 > allBars.length) {
+      if (allBars.length < 40) {
         oosSampleCount = 0;
         validationWinRate = 50.0;
+        passedEvaluationGate = false;
         modelVersion = _computeVersionHash();
         lastRecalibrationNote =
             'Insufficient data (N=0, need $minOosTradesRequired OOS trades) • Rules-only active';
         return;
       }
 
-      allBars.sort((a, b) => (a as OneMinEnrichedBar)
-          .timestampMs
-          .compareTo((b as OneMinEnrichedBar).timestampMs));
+      allBars.sort((a, b) => a.timestampMs.compareTo(b.timestampMs));
       final splitIdx = (allBars.length * 0.60).floor();
-      const embargoBars = 3;
+      const embargoBars = 5;
 
-      final List oosFeatures = [];
-      final List oosLabels = [];
-      for (int i = splitIdx + embargoBars; allBars.length - 3 > i; i++) {
-        final b = allBars[i] as OneMinEnrichedBar;
-        final prevB = allBars[i - 3] as OneMinEnrichedBar;
-        if (0 >= b.close || 0 >= prevB.close) continue;
+      final oosFeatures = <List<double>>[];
+      final oosLabels = <int>[];
+
+      for (int i = splitIdx + embargoBars; i < allBars.length - 5; i++) {
+        final b = allBars[i];
+        final prevB = allBars[i - 3];
+        if (b.close <= 0 || prevB.close <= 0) continue;
+        if (b.oiChange15m == null || b.orderBookImbalance == null) continue;
+
+        final oiBase = b.absoluteOi > 0 ? b.absoluteOi.toDouble() : 1.0;
+        final fOi = (b.oiChange15m! / oiBase).clamp(-1.0, 1.0);
+        final fMom = ((b.close - prevB.close) / prevB.close).clamp(-1.0, 1.0);
+        final fImb = b.orderBookImbalance!.clamp(-1.0, 1.0);
 
         int label = 0;
-        for (int k = 1; 3 >= k; k++) {
-          final fut = allBars[i + k] as OneMinEnrichedBar;
-          final netRet = ((fut.close - b.close) / b.close) - 0.012;
-          if (-0.06 >= netRet) {
+        for (int k = 1; k <= 5; k++) {
+          final fut = allBars[i + k];
+          final netRet = ((fut.close - b.close) / b.close) - 0.015;
+          if (netRet <= -0.08) {
             label = 0;
             break;
           }
-          if (netRet >= 0.04) {
+          if (netRet >= 0.08) {
             label = 1;
             break;
           }
         }
-
-        oosFeatures.add([
-          (b.oiChange15m / 500000.0).clamp(-1.0, 1.0),
-          ((b.close - prevB.close) / prevB.close * 15.0).clamp(-1.0, 1.0),
-          b.orderBookImbalance.clamp(-1.0, 1.0),
-        ]);
+        oosFeatures.add([fOi, fMom, fImb]);
         oosLabels.add(label);
       }
 
       final oosMetrics = evaluateUnclampedOutOfSample(oosFeatures, oosLabels);
-      oosSampleCount = ((oosMetrics['n'] ?? 0) as num).round();
-      validationWinRate = ((oosMetrics['accuracyPct'] ?? 50.0) as num).toDouble();
-      oosCiLower = ((oosMetrics['ciLow'] ?? 0.0) as num).toDouble();
-      oosCiUpper = ((oosMetrics['ciHigh'] ?? 100.0) as num).toDouble();
-      passedEvaluationGate = oosSampleCount >= 300 && oosCiLower > 52.0;
+      oosSampleCount = (oosMetrics['n'] ?? 0).round();
+      validationWinRate = oosMetrics['accuracyPct'] ?? 50.0;
+      oosCiLower = oosMetrics['ciLow'] ?? 0.0;
+      oosCiUpper = oosMetrics['ciHigh'] ?? 100.0;
+      passedEvaluationGate =
+          oosSampleCount >= gateA5MinTrades && oosCiLower > 52.0;
 
       lastCalibrationMs = DateTime.now().millisecondsSinceEpoch;
       modelVersion = _computeVersionHash();
+      lastRecalibrationNote = oosSampleCount < minOosTradesRequired
+          ? 'Insufficient data (N=$oosSampleCount < $minOosTradesRequired OOS)'
+          : 'OOS: ${validationWinRate.toStringAsFixed(1)}% (CI ${oosCiLower.toStringAsFixed(1)}-${oosCiUpper.toStringAsFixed(1)}%, N=$oosSampleCount)';
 
-      if (minOosTradesRequired > oosSampleCount) {
-        lastRecalibrationNote =
-            'Insufficient data (N=$oosSampleCount, need $minOosTradesRequired OOS) • Raw OOS: ${validationWinRate.toStringAsFixed(1)}%';
-      } else {
-        lastRecalibrationNote =
-            'OOS Accuracy: ${validationWinRate.toStringAsFixed(1)}% (N=$oosSampleCount)';
-      }
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setDouble('ai_val_win_rate_unclamped', validationWinRate);
+      await prefs.setInt('ai_oos_sample_count', oosSampleCount);
+      await prefs.setInt('ai_last_cal_ms', lastCalibrationMs);
     } catch (e) {
       _logEngineError('recalibrateFromForeverDb', e);
     }

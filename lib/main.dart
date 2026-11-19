@@ -1,8 +1,8 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'data/dhan_data_engine.dart';
 import 'data/forever_db.dart';
-import 'engine/ai_recalibration_engine.dart';
 import 'engine/strategy_settings.dart';
 import 'state/app_state.dart';
 import 'ui/screens/home_screen.dart';
@@ -21,16 +21,19 @@ Future<void> main() async {
     DeviceOrientation.portraitDown,
   ]);
 
+  // WP-9: Show UI shell immediately; run DB & broker initialization in background
+  runApp(const AiOptionsProApp());
+  unawaited(_bootstrapOnDevice());
+}
+
+Future<void> _bootstrapOnDevice() async {
   try {
     await ForeverDatabase.instance.database;
     await StrategySettingsEngine.instance.load();
-    await AiRecalibrationEngine.instance.initialize();
     await globalAppState.initialize();
   } catch (e) {
-    debugPrint('Startup initialization note: $e');
+    debugPrint('Background bootstrap note: $e');
   }
-
-  runApp(const AiOptionsProApp());
 }
 
 class AiOptionsProApp extends StatelessWidget {
@@ -63,25 +66,21 @@ class _MainTerminalShellState extends State<MainTerminalShell> {
   void initState() {
     super.initState();
     widget.appState.addListener(_onStateChanged);
-    DhanDataEngine.instance.onDataUpdated = _onStateChanged;
   }
 
   void _onStateChanged() {
-    if (mounted) {
-      setState(() {});
-    }
+    if (mounted) setState(() {});
   }
 
   @override
   void dispose() {
     widget.appState.removeListener(_onStateChanged);
+    DhanDataEngine.instance.disposeEngine();
     super.dispose();
   }
 
   void _switchToTab(int idx) {
-    setState(() {
-      _currentIndex = idx.clamp(0, 4);
-    });
+    setState(() => _currentIndex = idx.clamp(0, 4));
   }
 
   @override

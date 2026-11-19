@@ -5,8 +5,9 @@ import '../data/dhan_data_engine.dart';
 import '../data/forever_db.dart';
 import '../engine/ai_recalibration_engine.dart';
 import '../engine/backtest_engine.dart';
+import '../engine/execution_engine.dart';
+import '../engine/exit_manager.dart';
 import '../engine/mtf_strategy_engine.dart';
-import '../engine/risk_engine.dart';
 
 class AppState extends ChangeNotifier {
   TradingMode tradingMode = TradingMode.paper;
@@ -19,320 +20,267 @@ class AppState extends ChangeNotifier {
 
   AiSignal? currentSignal;
   BacktestReport? latestBacktest;
+  double todayNetRealizedPnlIst = 0.0;
   bool isBusy = false;
-  Timer? _uiRefreshTimer;
+  Timer? _supervisorTimer;
 
-  bool get isLiveMode => tradingMode == TradingMode.live;
+  bool get isLiveMode =>
+      tradingMode == TradingMode.live && ExecutionEngine.liveTradingUnlocked;
   AiSignal? get activeSignal => currentSignal;
   BacktestReport? get lastBacktestReport => latestBacktest;
+  DataHealthStatus get dataHealth => DhanDataEngine.instance.dataHealth;
 
-  double get todayRealizedLossInr {
-    double loss = 0.0;
+  double get todayRealizedLossInr =>
+      todayNetRealizedPnlIst < 0 ? todayNetRealizedPnlIst.abs() : 0.0;
+
+  double get openPositionsRiskInr {
+    double risk = 0.0;
     for (final p in openPositions) {
-      if (!p.isOpen && p.realizedPnl < 0) {
-        loss += p.realizedPnl.abs();
-      }
-      if (p.isOpen) {
-        final ltp = p.currentLtp > 0 ? p.currentLtp : p.avgEntryPrice;
-        final curPnl = (ltp - p.avgEntryPrice) * p.quantity;
-        if (curPnl < 0) {
-          loss += curPnl.abs();
-        }
-      }
+      if (!p.isOpen) continue;
+      risk += (p.avgEntryPrice - p.stopLossPrice).abs() * p.quantity;
     }
-    return loss;
+    return risk;
   }
 
   Future<void> initialize() async {
     await initAppState();
   }
 
+  /// WP-9: Non-blocking startup — loads local DB fast, connects broker in background
   Future<void> initAppState() async {
-    isBusy = true;
-    notifyListeners();
-
     try {
       riskConfig = await ForeverDatabase.instance.loadPersistedRiskConfig();
+      await _reloadSavedRecords();
+      await AiRecalibrationEngine.instance.initialize();
     } catch (_) {}
 
-    await AiRecalibrationEngine.instance.initialize();
-    await DhanDataEngine.instance.initializeAndStart();
-
+    DhanDataEngine.instance.activeStreamingIndex = selectedIndex;
     DhanDataEngine.instance.onDataUpdated = () {
-      _updateOpenPositionsLtp();
-      _evaluateCurrentIndexSignal();
-      notifyListeners();
+      _onMarketTick();
     };
 
-    await _reloadSavedRecords();
-    await _evaluateCurrentIndexSignal();
+    // Start broker feed in background without blocking UI shell
+    unawaited(DhanDataEngine.instance.initializeAndStart());
 
-    _uiRefreshTimer?.cancel();
-    _uiRefreshTimer = Timer.periodic(const Duration(seconds: 2), (_) {
-      _updateOpenPositionsLtp();
-      _evaluateCurrentIndexSignal();
-      notifyListeners();
+    _supervisorTimer?.cancel();
+    _supervisorTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      _onMarketTick();
     });
 
-    isBusy = false;
     notifyListeners();
   }
 
-  void refreshFromEngine() {
+  void _onMarketTick() {
     _updateOpenPositionsLtp();
-    _evaluateCurrentIndexSignal();
+    unawaited(_runExitManagerAndSignalEval());
+    notifyListeners();
+  }
+
+  Future<void> _runExitManagerAndSignalEval() async {
+    final engine = DhanDataEngine.instance;
+
+    // Build securityId -> StrikeRowSnapshot map across loaded indices for ExitManager
+    final quoteMap = <String, StrikeRowSnapshot>{};
+    for (final idx in UnderlyingIndex.values) {
+      for (final r in (engine.optionChainRows[idx] ?? const [])) {
+        if (r.ceSecurityId.isNotEmpty) quoteMap[r.ceSecurityId] = r;
+        if (r.peSecurityId.isNotEmpty) quoteMap[r.peSecurityId] = r;
+      }
+    }
+
+    final activeOpens = openPositions.where((p) => p.isOpen).toList();
+    if (activeOpens.isNotEmpty) {
+      final exits = await ExitManager.instance.evaluateAndExecuteExits(
+        openPositions: activeOpens,
+        quoteBySecurityId: quoteMap,
+      );
+      if (exits.isNotEmpty) {
+        await _reloadSavedRecords();
+      }
+    }
+
+    await _evaluateCurrentIndexSignal();
     notifyListeners();
   }
 
   Future<void> _reloadSavedRecords() async {
     try {
-      final db = await ForeverDatabase.instance.database;
-      final posRows = await db.query('positions');
-      openPositions = posRows
-          .map((e) => PositionRecord.fromMap(Map<String, dynamic>.from(e)))
-          .toList();
-      auditLogs = (await ForeverDatabase.instance.getAuditLogs())
-          .map((e) => Map<String, dynamic>.from(e as Map))
-          .toList();
+      orders = await ForeverDatabase.instance.getRecentOrders();
+      openPositions = await ForeverDatabase.instance.getAllPositions();
+      auditLogs = await ForeverDatabase.instance.getAuditLogs();
+      todayNetRealizedPnlIst =
+          await ForeverDatabase.instance.computeTodayNetRealizedPnlIst();
     } catch (_) {}
   }
 
   void setSelectedUnderlying(UnderlyingIndex index) {
     selectedIndex = index;
-    DhanDataEngine.instance.fetchOptionChainSnapshot(index);
-    _evaluateCurrentIndexSignal();
+    DhanDataEngine.instance.activeStreamingIndex = index;
+    unawaited(DhanDataEngine.instance.fetchOptionChainSnapshot(index));
+    unawaited(_evaluateCurrentIndexSignal());
     notifyListeners();
   }
 
-  void selectIndex(UnderlyingIndex index) {
-    setSelectedUnderlying(index);
-  }
-
-  void toggleTradingMode(bool enableLive) {
+  bool toggleTradingMode(bool enableLive) {
+    // WP-2 & WP-6: LIVE mode stays strictly locked until WP-1..WP-6 + 15-day paper run complete
+    if (enableLive && !ExecutionEngine.liveTradingUnlocked) {
+      tradingMode = TradingMode.paper;
+      notifyListeners();
+      return false;
+    }
     tradingMode = enableLive ? TradingMode.live : TradingMode.paper;
+    ForeverDatabase.instance.logAuditEvent(
+      category: 'MODE_CHANGE',
+      message: 'Trading mode set to ${tradingMode.label}',
+    );
     notifyListeners();
-  }
-
-  void setTradingMode(TradingMode mode) {
-    tradingMode = mode;
-    notifyListeners();
+    return true;
   }
 
   void updateRiskConfig(RiskConfig nextConfig) {
     riskConfig = nextConfig;
     ForeverDatabase.instance.savePersistedRiskConfig(nextConfig);
-    _evaluateCurrentIndexSignal();
+    unawaited(_evaluateCurrentIndexSignal());
     notifyListeners();
   }
 
-  void toggleKillSwitch(bool active) {
-    updateRiskConfig(riskConfig.copyWith(killSwitchActive: active));
+  /// WP-6: Kill switch blocks entries and optionally flattens all open positions
+  Future<void> activateKillSwitch({bool flattenAll = false}) async {
+    updateRiskConfig(riskConfig.copyWith(killSwitchActive: true));
+    await ForeverDatabase.instance.logAuditEvent(
+      category: 'KILL_SWITCH',
+      message: 'Kill switch ACTIVATED (flattenAll=$flattenAll)',
+    );
+    if (flattenAll) {
+      for (final p in openPositions.where((e) => e.isOpen).toList()) {
+        await closePosition(p.positionId, reason: 'KILL_SWITCH_FLATTEN');
+      }
+    }
   }
 
   Future<void> _evaluateCurrentIndexSignal() async {
     final engine = DhanDataEngine.instance;
-    final rows = engine.optionChainRows[selectedIndex] ?? [];
-    final exp = engine.selectedExpiry[selectedIndex] ?? '2026-11-12';
-    final bars = await ForeverDatabase.instance.getRecentBars(
+    final rows = engine.optionChainRows[selectedIndex] ?? const [];
+    final exp = engine.selectedExpiry[selectedIndex] ?? '';
+    final spot = engine.spotPrices[selectedIndex] ?? 0.0;
+    final spotBars = await ForeverDatabase.instance.getRecentBars(
       indexName: selectedIndex.label,
-      limit: 30,
+      optionType: 'SPOT',
+      limit: 60,
     );
 
-    final rawSig = MtfStrategyEngine.evaluateOneMinEntry(
+    currentSignal = MtfStrategyEngine.evaluateEntry(
       index: selectedIndex,
       expiry: exp,
+      spot: spot,
+      dataHealth: engine.dataHealth,
       chainRows: rows,
-      recent1mBars: bars,
-      availableCapital: engine.availableTradingCapital > 0
-          ? engine.availableTradingCapital
-          : 48200.0,
+      recentSpotBars: spotBars,
+      availableCapital: engine.availableTradingCapital,
       riskConfig: riskConfig,
       openPositionsCount: openPositions.where((p) => p.isOpen).length,
-      todayRealizedLossInr: todayRealizedLossInr,
+      todayNetRealizedPnlIst: todayNetRealizedPnlIst,
+      openPositionsRiskInr: openPositionsRiskInr,
     );
-
-    currentSignal = rawSig;
   }
 
   void _updateOpenPositionsLtp() {
     final engine = DhanDataEngine.instance;
-    bool changed = false;
     for (int i = 0; i < openPositions.length; i++) {
       final p = openPositions[i];
       if (!p.isOpen) continue;
-      UnderlyingIndex idx = UnderlyingIndex.nifty50;
-      for (final u in UnderlyingIndex.values) {
-        if (u.label == p.indexName) idx = u;
-      }
-      final rows = engine.optionChainRows[idx] ?? [];
-      for (final r in rows) {
-        if (r.strike == p.strike) {
-          final liveLtp =
-              p.optionType.toUpperCase() == 'CE' ? r.ceLtp : r.peLtp;
-          if (liveLtp > 0 && liveLtp != p.currentLtp) {
-            openPositions[i] = p.copyWith(currentLtp: liveLtp);
-            changed = true;
+      for (final idx in UnderlyingIndex.values) {
+        if (idx.label != p.indexName) continue;
+        for (final r in (engine.optionChainRows[idx] ?? const [])) {
+          if (r.ceSecurityId == p.securityId || r.peSecurityId == p.securityId) {
+            final liveLtp =
+                p.optionType.toUpperCase() == 'CE' ? r.ceLtp : r.peLtp;
+            if (liveLtp > 0 && liveLtp != p.currentLtp) {
+              openPositions[i] = p.copyWith(currentLtp: liveLtp);
+            }
           }
-          break;
         }
       }
     }
-    if (changed) {
-      notifyListeners();
-    }
   }
 
-  Future<void> executeActiveSignal() async {
+  Future<ExecutionResult?> executeActiveSignal() async {
     final sig = currentSignal;
-    if (sig == null ||
-        sig.action == SignalAction.noTrade ||
-        sig.strike == 0 ||
-        sig.entryPremium <= 0) {
-      return;
+    if (sig == null || !sig.riskWithinLimits || !sig.strategyPassed) {
+      return null;
     }
 
-    final validated = RiskEngine.validateAndEnforceRisk(
-      rawSignal: sig,
-      config: riskConfig,
-      openPositionsCount: openPositions.where((p) => p.isOpen).length,
-      todayRealizedLossInr: todayRealizedLossInr,
-      availableCapital: DhanDataEngine.instance.availableTradingCapital > 0
-          ? DhanDataEngine.instance.availableTradingCapital
-          : 48200.0,
-    );
-
-    if (!validated.riskWithinLimits) {
-      currentSignal = validated;
-      notifyListeners();
-      return;
-    }
-
-    final nowMs = DateTime.now().millisecondsSinceEpoch;
-    final optType = sig.action == SignalAction.buyCe ? 'CE' : 'PE';
-    final modeStr = isLiveMode ? 'LIVE' : 'PAPER';
-
-    if (isLiveMode) {
-      final ord = await DhanDataEngine.instance.placeLiveBrokerOrder(
-        securityId: '${sig.index.dhanSymbol}_${sig.strike}_$optType',
-        index: sig.index,
-        expiry: sig.expiry,
-        strike: sig.strike,
-        optionType: optType,
-        transactionType: 'BUY',
-        quantity: sig.lotSize,
-        price: sig.entryPremium,
-        reason: sig.htfOiReason,
-      );
-      orders.insert(0, ord);
-      if (ord.status != 'Filled') {
-        notifyListeners();
-        return;
+    // Lookup live bid/ask for quote-driven paper fill & marketable limit cap
+    double? bid;
+    double? ask;
+    final rows = DhanDataEngine.instance.optionChainRows[sig.index] ?? const [];
+    for (final r in rows) {
+      if (r.ceSecurityId == sig.securityId) {
+        bid = r.ceBid;
+        ask = r.ceAsk;
+        break;
+      } else if (r.peSecurityId == sig.securityId) {
+        bid = r.peBid;
+        ask = r.peAsk;
+        break;
       }
-    } else {
-      final paperOrd = TradeOrder(
-        orderId: 'PAPER_$nowMs',
-        timestampMs: nowMs,
-        indexName: sig.index.label,
-        expiry: sig.expiry,
-        strike: sig.strike,
-        optionType: optType,
-        side: 'BUY',
-        quantity: sig.lotSize,
-        price: sig.entryPremium,
-        status: 'Filled',
-        mode: modeStr,
-        reason: sig.htfOiReason,
-      );
-      orders.insert(0, paperOrd);
-      await ForeverDatabase.instance.saveOrder(paperOrd);
     }
 
-    final pos = PositionRecord.fromMap({
-      'position_id': 'POS_$nowMs',
-      'security_id': '${sig.index.dhanSymbol}_${sig.strike}_$optType',
-      'index_name': sig.index.label,
-      'expiry': sig.expiry,
-      'strike': sig.strike,
-      'option_type': optType,
-      'quantity': sig.lotSize,
-      'avg_entry_price': sig.entryPremium,
-      'current_ltp': sig.entryPremium,
-      'stop_loss': sig.stopLossPremium,
-      'target': sig.targetPremium,
-      'status': 'OPEN',
-      'is_open': 1,
-      'mode': modeStr,
-      'realized_pnl': 0.0,
-      'opened_at_ms': nowMs,
-      'open_timestamp_ms': nowMs,
-    });
-    openPositions.insert(0, pos);
+    final res = await ExecutionEngine.instance.executeEntry(
+      signal: sig,
+      mode: tradingMode,
+      bestBid: bid,
+      bestAsk: ask,
+    );
+    await _reloadSavedRecords();
     notifyListeners();
+    return res;
   }
 
-  Future<void> closePosition(String positionId) async {
+  Future<void> closePosition(String positionId,
+      {String reason = 'MANUAL_SQUARE_OFF'}) async {
     final idx = openPositions.indexWhere((p) => p.positionId == positionId);
     if (idx == -1) return;
     final p = openPositions[idx];
     if (!p.isOpen) return;
 
-    final exitLtp = p.currentLtp > 0 ? p.currentLtp : p.avgEntryPrice;
-    final costs = RiskEngine.computeRoundTripCostsAndSlippage(
-      entryPremium: p.avgEntryPrice,
-      exitPremium: exitLtp,
-      quantity: p.quantity,
-    );
-    final netPnl =
-        ((exitLtp - p.avgEntryPrice) * p.quantity) - costs.totalFrictionInr;
-    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    double? bid;
+    double? ask;
+    double liveLtp = p.currentLtp > 0 ? p.currentLtp : p.avgEntryPrice;
+    for (final u in UnderlyingIndex.values) {
+      if (u.label != p.indexName) continue;
+      for (final r in (DhanDataEngine.instance.optionChainRows[u] ?? const [])) {
+        if (r.ceSecurityId == p.securityId) {
+          liveLtp = r.ceLtp > 0 ? r.ceLtp : liveLtp;
+          bid = r.ceBid;
+          ask = r.ceAsk;
+          break;
+        } else if (r.peSecurityId == p.securityId) {
+          liveLtp = r.peLtp > 0 ? r.peLtp : liveLtp;
+          bid = r.peBid;
+          ask = r.peAsk;
+          break;
+        }
+      }
+    }
 
-    final closed = PositionRecord.fromMap({
-      'position_id': p.positionId,
-      'security_id': p.securityId,
-      'index_name': p.indexName,
-      'expiry': p.expiry,
-      'strike': p.strike,
-      'option_type': p.optionType,
-      'quantity': p.quantity,
-      'avg_entry_price': p.avgEntryPrice,
-      'current_ltp': exitLtp,
-      'stop_loss': p.stopLoss,
-      'target': p.target,
-      'status': 'CLOSED',
-      'is_open': 0,
-      'mode': p.mode,
-      'realized_pnl': double.parse(netPnl.toStringAsFixed(2)),
-      'opened_at_ms': nowMs,
-      'open_timestamp_ms': nowMs,
-      'closed_at_ms': nowMs,
-    });
-    openPositions[idx] = closed;
-
-    final closeOrder = TradeOrder(
-      orderId: 'EXIT_$nowMs',
-      timestampMs: nowMs,
-      indexName: p.indexName,
-      expiry: p.expiry,
-      strike: p.strike,
-      optionType: p.optionType,
-      side: 'SELL',
-      quantity: p.quantity,
-      price: exitLtp,
-      status: 'Filled',
-      mode: p.mode,
-      reason: 'Manual Square-Off (Net P&L ₹${netPnl.toStringAsFixed(1)})',
+    await ExecutionEngine.instance.executeExit(
+      position: p,
+      currentLtp: liveLtp,
+      bestBid: bid,
+      bestAsk: ask,
+      exitReason: reason,
     );
-    orders.insert(0, closeOrder);
-    await ForeverDatabase.instance.saveOrder(closeOrder);
+    await _reloadSavedRecords();
     notifyListeners();
   }
 
   Future<void> runBacktestForSelectedIndex() async {
-    final rep = await BacktestEngine.runBacktest(
+    latestBacktest = await BacktestEngine.runBacktest(
       index: selectedIndex,
       riskConfig: riskConfig,
+      availableCapital: DhanDataEngine.instance.availableTradingCapital,
     );
-    latestBacktest = rep as BacktestReport;
     notifyListeners();
   }
 }

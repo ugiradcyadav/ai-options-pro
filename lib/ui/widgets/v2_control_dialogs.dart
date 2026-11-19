@@ -1,23 +1,25 @@
 import 'package:flutter/material.dart';
 import '../../core/models.dart';
 import '../../data/forever_db.dart';
+import '../../data/strike_selector.dart';
 import '../../engine/ai_recalibration_engine.dart';
 import '../../engine/math_greeks.dart';
 import '../../engine/strategy_settings.dart';
+import '../theme/quant_theme.dart';
 
 class V2ControlDialogs {
-  static Future confirmSwitchToLive(BuildContext context) async {
+  static Future<bool> confirmSwitchToLive(BuildContext context) async {
     final ctrl = TextEditingController();
     final ai = AiRecalibrationEngine.instance;
     final gateNote = ai.activeModel.passedEvaluationGate
         ? 'Evaluation Gate A5: PASSED'
-        : 'Evaluation Gate A5: NOT PASSED (N=${ai.oosSampleCount} OOS trades • Rules-only fallback active)';
+        : 'Evaluation Gate A5: NOT PASSED (N=${ai.oosSampleCount} OOS trades • Rules-only active)';
 
-    final confirmed = await showDialog(
+    final confirmed = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
       builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFF101B33),
+        backgroundColor: QuantTheme.bgPanel,
         title: const Text(
           'Confirm Live Trading Mode',
           style: TextStyle(
@@ -33,7 +35,7 @@ class V2ControlDialogs {
             ),
             const SizedBox(height: 8),
             Text(gateNote,
-                style: const TextStyle(color: Color(0xFFFFAB00), fontSize: 11)),
+                style: const TextStyle(color: QuantTheme.warning, fontSize: 11)),
             const SizedBox(height: 12),
             TextField(
               controller: ctrl,
@@ -53,7 +55,7 @@ class V2ControlDialogs {
           ),
           ElevatedButton(
             style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFFD50000)),
+                backgroundColor: QuantTheme.negative),
             onPressed: () {
               if (ctrl.text.trim() == 'LIVE') {
                 Navigator.of(ctx).pop(true);
@@ -67,7 +69,7 @@ class V2ControlDialogs {
     return confirmed == true;
   }
 
-  static Future openStrategySettingsSheet(
+  static Future<void> openStrategySettingsSheet(
     BuildContext context, {
     VoidCallback? onSaved,
   }) async {
@@ -89,7 +91,7 @@ class V2ControlDialogs {
     await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: const Color(0xFF0D162B),
+      backgroundColor: QuantTheme.bgSecondary,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setSheetState) => Padding(
           padding: EdgeInsets.only(
@@ -138,9 +140,9 @@ class V2ControlDialogs {
                 const SizedBox(height: 8),
                 Row(
                   children: [
-                    Expanded(child: _numField('OI Change Threshold', oiCtrl)),
+                    Expanded(child: _numField('OI Change (Lots)', oiCtrl)),
                     const SizedBox(width: 8),
-                    Expanded(child: _numField('Min 1m Volume', volCtrl)),
+                    Expanded(child: _numField('Min Volume', volCtrl)),
                   ],
                 ),
                 const SizedBox(height: 8),
@@ -171,14 +173,15 @@ class V2ControlDialogs {
                   const SizedBox(height: 8),
                   Text(errorText!,
                       style: const TextStyle(
-                          color: Color(0xFFFF5252), fontSize: 12)),
+                          color: QuantTheme.negative, fontSize: 12)),
                 ],
                 const SizedBox(height: 12),
                 SizedBox(
                   width: double.infinity,
                   child: ElevatedButton(
                     style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF00C853)),
+                        backgroundColor: QuantTheme.positive,
+                        foregroundColor: QuantTheme.bgMain),
                     onPressed: () async {
                       final candidate = StrategySettings(
                         oiChangeThreshold: int.tryParse(oiCtrl.text.trim()) ?? -1,
@@ -210,18 +213,19 @@ class V2ControlDialogs {
     );
   }
 
-  static Future openDataAndStorageSheet(
+  static Future<void> openDataAndStorageSheet(
     BuildContext context, {
     VoidCallback? onChanged,
   }) async {
     final db = await ForeverDatabase.instance.database;
-    final rows = await db.query('one_min_bars');
-    final sizeBytes = rows.length * 256;
+    final barRows = await db.query('one_min_bars');
+    final snapRows = await db.query('chain_snapshots');
+    final sizeBytes = await ForeverDatabase.instance.getDatabaseFileSizeBytes();
     if (!context.mounted) return;
 
     await showModalBottomSheet(
       context: context,
-      backgroundColor: const Color(0xFF0D162B),
+      backgroundColor: QuantTheme.bgSecondary,
       builder: (ctx) => Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -237,7 +241,7 @@ class V2ControlDialogs {
             ),
             const SizedBox(height: 8),
             Text(
-              'Stored 1-Minute Enriched Bars: ${rows.length}',
+              'Recorded Real 1m Bars: ${barRows.length} | Raw Chain Snapshots: ${snapRows.length}',
               style: const TextStyle(color: Colors.white70, fontSize: 12),
             ),
             const SizedBox(height: 14),
@@ -251,6 +255,8 @@ class V2ControlDialogs {
                           .millisecondsSinceEpoch;
                       await db.delete('one_min_bars',
                           where: 'timestamp_ms < ?', whereArgs: [cutoff]);
+                      await db.delete('chain_snapshots',
+                          where: 'timestamp_ms < ?', whereArgs: [cutoff]);
                       onChanged?.call();
                       if (ctx.mounted) Navigator.of(ctx).pop();
                     },
@@ -261,9 +267,10 @@ class V2ControlDialogs {
                 Expanded(
                   child: ElevatedButton(
                     style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFFD50000)),
+                        backgroundColor: QuantTheme.negative),
                     onPressed: () async {
                       await db.delete('one_min_bars');
+                      await db.delete('chain_snapshots');
                       onChanged?.call();
                       if (ctx.mounted) Navigator.of(ctx).pop();
                     },
@@ -280,25 +287,43 @@ class V2ControlDialogs {
 
   static Widget buildPortfolioGreeksCard(
     List openPositions,
-    double defaultSpot,
+    double? liveSpot,
   ) {
-    double netDelta = 0.0;
-    double netGamma = 0.0;
-    double netTheta = 0.0;
-    double netVega = 0.0;
-    double netVanna = 0.0;
-    double netCharm = 0.0;
+    final opens = openPositions
+        .map((e) => e as PositionRecord)
+        .where((p) => p.isOpen)
+        .toList();
 
-    for (final raw in openPositions) {
-      final p = raw as PositionRecord;
-      if (!p.isOpen) continue;
+    if (opens.isEmpty || liveSpot == null || liveSpot <= 0) {
+      return QuantPanel(
+        margin: const EdgeInsets.only(bottom: 10),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text('Portfolio Greeks (M2)', style: QuantTheme.heading(size: 12)),
+            Text(
+              opens.isEmpty ? 'No open positions' : 'NO DATA (Awaiting live spot)',
+              style: QuantTheme.mono(size: 11, color: QuantTheme.textSecondary),
+            ),
+          ],
+        ),
+      );
+    }
+
+    double netDelta = 0.0, netGamma = 0.0, netTheta = 0.0;
+    double netVega = 0.0, netVanna = 0.0, netCharm = 0.0;
+
+    for (final p in opens) {
       final isCall = p.optionType.toUpperCase() == 'CE';
-      final spot = defaultSpot > 0 ? defaultSpot : p.strike.toDouble();
+      final tYears =
+          StrikeSelectionEngine.computeFractionalYearsToExpiryIst(p.expiry);
+      if (tYears <= 0) continue;
       final g = MathGreeksEngine.computeIvAndGreeks(
-        spot: spot,
+        spot: liveSpot,
         strike: p.strike.toDouble(),
         optionLtp: p.currentLtp > 0 ? p.currentLtp : p.avgEntryPrice,
-        daysToExpiry: 4.0,
+        daysToExpiry: tYears * 365.0,
+        timeYearsOverride: tYears,
         isCall: isCall,
       );
       netDelta += g.delta * p.quantity;
@@ -309,28 +334,18 @@ class V2ControlDialogs {
       netCharm += g.charm * p.quantity;
     }
 
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: const Color(0xFF101B33),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: const Color(0xFF1E325C)),
-      ),
+    return QuantPanel(
+      margin: const EdgeInsets.only(bottom: 10),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text(
-            'Portfolio Aggregated Greeks (M2 First & Second-Order)',
-            style: TextStyle(
-                color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),
-          ),
+          Text('Portfolio Aggregated Greeks (Black-76 Full Precision)',
+              style: QuantTheme.heading(size: 12)),
           const SizedBox(height: 6),
           Text(
-            'Net Δ: ${netDelta.toStringAsFixed(1)} | Net Γ: ${netGamma.toStringAsFixed(3)} | Net Θ: ₹${netTheta.toStringAsFixed(0)}/d | Net ν: ₹${netVega.toStringAsFixed(0)}\n'
+            'Net Δ: ${netDelta.toStringAsFixed(2)} | Net Γ: ${netGamma.toStringAsFixed(4)} | Net Θ: ₹${netTheta.toStringAsFixed(0)}/d | Net ν: ₹${netVega.toStringAsFixed(0)}\n'
             '2nd-Order: Net Vanna ${netVanna.toStringAsFixed(2)} | Net Charm ${netCharm.toStringAsFixed(2)}/d',
-            style: const TextStyle(
-                color: Colors.cyanAccent, fontSize: 11, height: 1.4),
+            style: QuantTheme.mono(size: 11, color: QuantTheme.accent),
           ),
         ],
       ),
@@ -351,7 +366,7 @@ class V2ControlDialogs {
           decoration: InputDecoration(
             isDense: true,
             filled: true,
-            fillColor: const Color(0xFF162444),
+            fillColor: QuantTheme.bgElevated,
             contentPadding:
                 const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
             border: OutlineInputBorder(

@@ -1,181 +1,161 @@
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
-import 'package:shared_preferences/shared_preferences.dart';
-
-class DhanCredentials {
-  final String clientId;
-  final String pinOrSecret;
-  final String totpSecret;
-  final String accessToken;
-  final int tokenGeneratedAtMs;
-
-  const DhanCredentials({
-    required this.clientId,
-    required this.pinOrSecret,
-    required this.totpSecret,
-    required this.accessToken,
-    required this.tokenGeneratedAtMs,
-  });
-
-  bool get isConfigured =>
-      clientId.trim().isNotEmpty &&
-      (accessToken.trim().isNotEmpty || totpSecret.trim().isNotEmpty);
-
-  bool get isTokenFresh {
-    if (accessToken.trim().isEmpty) return false;
-    final ageHours =
-        (DateTime.now().millisecondsSinceEpoch - tokenGeneratedAtMs) /
-            (1000 * 3600);
-    return ageHours < 20.0;
-  }
-}
+import 'models.dart';
 
 class TotpAuthManager {
-  static const _kClientId = 'dhan_client_id_v2';
-  static const _kPinSecret = 'dhan_pin_secret_v2';
-  static const _kTotpSecret = 'dhan_totp_secret_v2';
-  static const _kAccessToken = 'dhan_access_token_v2';
-  static const _kTokenTime = 'dhan_token_time_ms_v2';
+  static const FlutterSecureStorage _secureStorage = FlutterSecureStorage(
+    aOptions: AndroidOptions(encryptedSharedPreferences: true),
+  );
 
-  static String lastServerMessage = '';
+  static const _kClientId = 'sec_dhan_client_id';
+  static const _kAccessToken = 'sec_dhan_access_token';
+  static const _kPin = 'sec_dhan_pin';
+  static const _kTotpSecret = 'sec_dhan_totp_secret';
+  static const _kOptInTotp = 'sec_dhan_opt_in_totp';
+  static const _kTokenExpiryMs = 'sec_dhan_token_expiry_ms';
 
-  static Future<DhanCredentials> loadCredentials() async {
-    final prefs = await SharedPreferences.getInstance();
-    final clientId = prefs.getString(_kClientId) ?? '';
-    final pinOrSecret = prefs.getString(_kPinSecret) ?? '';
-    final totpSecret = prefs.getString(_kTotpSecret) ?? '';
-    final accessToken = prefs.getString(_kAccessToken) ?? '';
-    final tokenTime = prefs.getInt(_kTokenTime) ?? 0;
-
-    return DhanCredentials(
-      clientId: clientId,
-      pinOrSecret: pinOrSecret,
-      totpSecret: totpSecret,
-      accessToken: accessToken,
-      tokenGeneratedAtMs: tokenTime,
-    );
-  }
+  static String lastAuthError = '';
 
   static Future<void> saveCredentials({
     required String clientId,
-    required String pinOrSecret,
-    required String totpSecret,
     required String accessToken,
+    String pin = '',
+    String totpSecret = '',
+    bool optInStoreTotp = false,
   }) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_kClientId, clientId.trim());
-    await prefs.setString(_kPinSecret, pinOrSecret.trim());
-    await prefs.setString(
-      _kTotpSecret,
-      totpSecret.trim().toUpperCase().replaceAll(RegExp(r'[^A-Z2-7]'), ''),
+    await _secureStorage.write(key: _kClientId, value: clientId.trim());
+    await _secureStorage.write(key: _kAccessToken, value: accessToken.trim());
+    await _secureStorage.write(
+        key: _kOptInTotp, value: optInStoreTotp ? 'true' : 'false');
+
+    // WP-1: Never store PIN and TOTP seed together. Only store TOTP seed on explicit user opt-in.
+    if (optInStoreTotp && totpSecret.trim().isNotEmpty) {
+      final cleanSeed =
+          totpSecret.trim().toUpperCase().replaceAll(RegExp(r'[^A-Z2-7]'), '');
+      await _secureStorage.write(key: _kTotpSecret, value: cleanSeed);
+      await _secureStorage.delete(key: _kPin);
+    } else {
+      await _secureStorage.delete(key: _kTotpSecret);
+      if (pin.trim().isNotEmpty) {
+        await _secureStorage.write(key: _kPin, value: pin.trim());
+      } else {
+        await _secureStorage.delete(key: _kPin);
+      }
+    }
+
+    final expiryMs = DateTime.now()
+        .add(const Duration(hours: 20))
+        .millisecondsSinceEpoch;
+    await _secureStorage.write(
+        key: _kTokenExpiryMs, value: expiryMs.toString());
+  }
+
+  static Future<void> clearAllCredentials() async {
+    await _secureStorage.delete(key: _kClientId);
+    await _secureStorage.delete(key: _kAccessToken);
+    await _secureStorage.delete(key: _kPin);
+    await _secureStorage.delete(key: _kTotpSecret);
+    await _secureStorage.delete(key: _kOptInTotp);
+    await _secureStorage.delete(key: _kTokenExpiryMs);
+  }
+
+  static Future<DhanCredentials> loadCredentials() async {
+    final clientId = await _secureStorage.read(key: _kClientId) ?? '';
+    final accessToken = await _secureStorage.read(key: _kAccessToken) ?? '';
+    final pin = await _secureStorage.read(key: _kPin) ?? '';
+    final totpSecret = await _secureStorage.read(key: _kTotpSecret) ?? '';
+    final expStr = await _secureStorage.read(key: _kTokenExpiryMs) ?? '0';
+    return DhanCredentials(
+      clientId: clientId,
+      accessToken: accessToken,
+      pin: pin,
+      totpSecret: totpSecret,
+      tokenExpiryMs: int.tryParse(expStr) ?? 0,
     );
-    if (accessToken.trim().isNotEmpty) {
-      await prefs.setString(_kAccessToken, accessToken.trim());
-      await prefs.setInt(_kTokenTime, DateTime.now().millisecondsSinceEpoch);
+  }
+
+  static Future<DhanCredentials?> ensureValidSession() async {
+    final creds = await loadCredentials();
+    if (!creds.isConfigured) {
+      lastAuthError = 'Broker credentials not configured.';
+      return null;
+    }
+    return creds;
+  }
+
+  static Future<bool> verifyDhanSession(DhanCredentials creds) async {
+    if (!creds.isConfigured) {
+      lastAuthError = 'Missing client ID or access token.';
+      return false;
+    }
+    try {
+      final resp = await http
+          .get(
+            Uri.parse('https://api.dhan.co/v2/fundlimit'),
+            headers: {
+              'Accept': 'application/json',
+              'access-token': creds.accessToken,
+              'client-id': creds.clientId,
+            },
+          )
+          .timeout(const Duration(seconds: 6));
+      if (resp.statusCode == 200) {
+        lastAuthError = '';
+        return true;
+      }
+      // WP-1: Never expose resp.body in logs or UI
+      lastAuthError = 'Authentication failed (HTTP ${resp.statusCode}).';
+      return false;
+    } catch (_) {
+      lastAuthError = 'Network error while verifying broker session.';
+      return false;
     }
   }
 
-  static String generateTotpCode(String base32Secret, {DateTime? now}) {
+  /// RFC-6238 6-digit TOTP generator (HMAC-SHA1, 30-second window)
+  static String generateTotpCode(String base32Secret, {int? timestampSec}) {
     final clean =
-        base32Secret.toUpperCase().replaceAll(RegExp(r'[^A-Z2-7]'), '');
+        base32Secret.trim().toUpperCase().replaceAll(RegExp(r'[^A-Z2-7]'), '');
     if (clean.isEmpty) return '000000';
+    final key = _decodeBase32(clean);
+    final nowSec =
+        timestampSec ?? (DateTime.now().millisecondsSinceEpoch ~/ 1000);
+    final counter = nowSec ~/ 30;
 
-    final keyBytes = _base32Decode(clean);
-    if (keyBytes.isEmpty) return '000000';
-
-    final timeSec = ((now ?? DateTime.now()).millisecondsSinceEpoch ~/ 1000);
-    int counter = timeSec ~/ 30;
-
-    final counterBytes = Uint8List(8);
+    final msg = Uint8List(8);
+    int c = counter;
     for (int i = 7; i >= 0; i--) {
-      counterBytes[i] = counter & 0xff;
-      counter >>= 8;
+      msg[i] = c & 0xff;
+      c = c >> 8;
     }
 
-    final hmac = Hmac(sha1, keyBytes);
-    final hash = hmac.convert(counterBytes).bytes;
+    final hmac = Hmac(sha1, key);
+    final hash = hmac.convert(msg).bytes;
     final offset = hash[hash.length - 1] & 0x0f;
     final binary = ((hash[offset] & 0x7f) << 24) |
         ((hash[offset + 1] & 0xff) << 16) |
         ((hash[offset + 2] & 0xff) << 8) |
         (hash[offset + 3] & 0xff);
-
     final otp = binary % 1000000;
     return otp.toString().padLeft(6, '0');
   }
 
-  static Future<DhanCredentials> ensureValidSession({bool forceRefresh = false}) async {
-    final creds = await loadCredentials();
-    if (!creds.isConfigured) {
-      lastServerMessage = 'Credentials not configured.';
-      return creds;
-    }
-
-    if (!forceRefresh && creds.isTokenFresh && creds.accessToken.isNotEmpty) {
-      return creds;
-    }
-
-    if (creds.accessToken.isNotEmpty && creds.totpSecret.isEmpty) {
-      lastServerMessage = 'Using direct 24h Access Token.';
-      return creds;
-    }
-
-    if (creds.totpSecret.isNotEmpty && creds.pinOrSecret.isNotEmpty) {
-      final totp = generateTotpCode(creds.totpSecret);
-      try {
-        final uri = Uri.parse(
-          'https://auth.dhan.co/app/generateAccessToken?dhanClientId=${Uri.encodeComponent(creds.clientId)}&pin=${Uri.encodeComponent(creds.pinOrSecret)}&totp=$totp',
-        );
-        final resp = await http.post(
-          uri,
-          headers: {'Accept': 'application/json'},
-        ).timeout(const Duration(seconds: 12));
-
-        if (resp.statusCode == 200) {
-          final body = jsonDecode(resp.body);
-          if (body is Map &&
-              (body['accessToken'] != null || body['token'] != null)) {
-            final newToken =
-                (body['accessToken'] ?? body['token']).toString().trim();
-            if (newToken.isNotEmpty) {
-              await saveCredentials(
-                clientId: creds.clientId,
-                pinOrSecret: creds.pinOrSecret,
-                totpSecret: creds.totpSecret,
-                accessToken: newToken,
-              );
-              lastServerMessage = 'Auto-TOTP token generated successfully!';
-              return await loadCredentials();
-            }
-          }
-          lastServerMessage = 'Dhan Auth Response: ${resp.body}';
-        } else {
-          lastServerMessage =
-              'Dhan TOTP Auth HTTP ${resp.statusCode}: ${resp.body}';
-        }
-      } catch (e) {
-        lastServerMessage = 'Network/Auth Error: $e';
-      }
-    }
-
-    return creds;
-  }
-
-  static Uint8List _base32Decode(String input) {
+  static Uint8List _decodeBase32(String input) {
     const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-    int buffer = 0;
-    int bitsLeft = 0;
-    final List<int> out = [];
+    int bits = 0;
+    int value = 0;
+    final out = <int>[];
     for (int i = 0; i < input.length; i++) {
-      final val = alphabet.indexOf(input[i]);
-      if (val < 0) continue;
-      buffer = (buffer << 5) | val;
-      bitsLeft += 5;
-      if (bitsLeft >= 8) {
-        bitsLeft -= 8;
-        out.add((buffer >> bitsLeft) & 0xff);
+      final idx = alphabet.indexOf(input[i]);
+      if (idx < 0) continue;
+      value = (value << 5) | idx;
+      bits += 5;
+      if (bits >= 8) {
+        out.add((value >> (bits - 8)) & 0xff);
+        bits -= 8;
       }
     }
     return Uint8List.fromList(out);

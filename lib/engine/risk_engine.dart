@@ -2,6 +2,18 @@ import 'dart:math' as math;
 import '../core/models.dart';
 import 'strategy_settings.dart';
 
+/// WP-6: Dated Indian NFO Options Statutory Cost Schedule (Verify against broker contract note)
+class IndianOptionCostConfig {
+  static const String effectiveDate = '2026-04-01';
+  static const double brokeragePerOrderInr = 20.0;
+  static const double sttSellOptionRate = 0.0015; // 0.15% on sell option premium (effective 1 Apr 2026)
+  static const double nseExchangeTxnRate = 0.0003503; // 0.03503% on buy + sell premium turnover
+  static const double sebiTurnoverRate = 0.000001; // Rs 10 per crore
+  static const double stampDutyBuyRate = 0.00003; // 0.003% on buy turnover
+  static const double gstRate = 0.18; // 18% on (brokerage + exchange txn + SEBI)
+  static const double maxPermittedSpreadPct = 0.80; // Block illiquid spreads > 0.80%
+}
+
 class OrderCostBreakdown {
   final double brokerageInr;
   final double sttInr;
@@ -32,22 +44,13 @@ class OrderCostBreakdown {
 }
 
 class RiskEngine {
-  /// M7.1 & M7.2: Realistic Indian Equity Index Options Round-Trip Cost & Slippage Model
-  /// Rates (verify against latest NSE/SEBI/broker schedule):
-  /// - Brokerage: Rs 20 buy + Rs 20 sell = Rs 40 per round trip
-  /// - STT: 0.10% on sell-side option premium turnover
-  /// - NSE Exchange Transaction Charge: 0.03503% on buy + sell premium turnover
-  /// - SEBI Turnover Fee: 0.0001% (Rs 10/crore) on buy + sell turnover
-  /// - Stamp Duty: 0.003% on buy-side premium turnover
-  /// - GST: 18% on (Brokerage + Exchange Txn + SEBI Fee)
-  /// - Slippage: >= 0.5 * bid-ask spread + volume impact term per leg
   static OrderCostBreakdown computeRoundTripCostsAndSlippage({
     required double entryPremium,
     required double exitPremium,
     required int quantity,
     double spreadPct = 0.25,
     int barVolume = 1500,
-    double flatBrokeragePerOrder = 20.0,
+    double flatBrokeragePerOrder = IndianOptionCostConfig.brokeragePerOrderInr,
   }) {
     if (quantity <= 0 || entryPremium <= 0) {
       return const OrderCostBreakdown(
@@ -67,13 +70,12 @@ class RiskEngine {
     final totalTurnover = buyTurnover + sellTurnover;
 
     final brokerage = flatBrokeragePerOrder * 2.0;
-    final stt = sellTurnover * 0.001; // 0.10% on sell option premium
-    final exchTxn = totalTurnover * 0.0003503; // 0.03503% NSE NFO
-    final sebiFee = totalTurnover * 0.000001; // Rs 10 per crore
-    final stampDuty = buyTurnover * 0.00003; // 0.003% on buy side
-    final gst = 0.18 * (brokerage + exchTxn + sebiFee);
+    final stt = sellTurnover * IndianOptionCostConfig.sttSellOptionRate;
+    final exchTxn = totalTurnover * IndianOptionCostConfig.nseExchangeTxnRate;
+    final sebiFee = totalTurnover * IndianOptionCostConfig.sebiTurnoverRate;
+    final stampDuty = buyTurnover * IndianOptionCostConfig.stampDutyBuyRate;
+    final gst = IndianOptionCostConfig.gstRate * (brokerage + exchTxn + sebiFee);
 
-    // M7.2: Half-spread + square-root market impact slippage
     final halfSpreadFrac = math.max(0.001, (spreadPct / 100.0) * 0.5);
     final liqRatio = quantity / math.max(100.0, barVolume.toDouble());
     final impactFrac = 0.0012 * math.sqrt(liqRatio.clamp(0.01, 4.0));
@@ -83,32 +85,33 @@ class RiskEngine {
         math.max(1.0, exitPremium) * (halfSpreadFrac + impactFrac);
 
     return OrderCostBreakdown(
-      brokerageInr: double.parse(brokerage.toStringAsFixed(2)),
-      sttInr: double.parse(stt.toStringAsFixed(2)),
-      exchangeTxnInr: double.parse(exchTxn.toStringAsFixed(2)),
-      sebiFeesInr: double.parse(sebiFee.toStringAsFixed(2)),
-      stampDutyInr: double.parse(stampDuty.toStringAsFixed(2)),
-      gstInr: double.parse(gst.toStringAsFixed(2)),
-      entrySlippageInr:
-          double.parse((entrySlipPerUnit * quantity).toStringAsFixed(2)),
-      exitSlippageInr:
-          double.parse((exitSlipPerUnit * quantity).toStringAsFixed(2)),
+      brokerageInr: brokerage,
+      sttInr: stt,
+      exchangeTxnInr: exchTxn,
+      sebiFeesInr: sebiFee,
+      stampDutyInr: stampDuty,
+      gstInr: gst,
+      entrySlippageInr: entrySlipPerUnit * quantity,
+      exitSlippageInr: exitSlipPerUnit * quantity,
     );
   }
 
-  /// M8: Capped Fractional Kelly Position Sizing (at most 25% of Kelly, goes to 0 at zero/negative edge)
+  /// WP-6 & WP-8: Strict sizing. When [useModelProbability] is false (rules-only mode before Gate A5),
+  /// uses fixed small 1-lot sizing within risk caps. When true, uses capped 25% Kelly (returns 0 on zero/negative edge).
   static int computeOptimalBuyerQuantity({
-    required double winProbability, // 0.0 .. 1.0 (use lower CI bound when available)
+    required double winProbability,
     required double entryPremium,
     required double stopLossPremium,
     required double targetPremium,
     required int lotSize,
-    required double availableCapital,
+    required double? availableCapital,
     required RiskConfig config,
+    bool useModelProbability = true,
   }) {
-    if (entryPremium <= 0 ||
-        lotSize <= 0 ||
+    if (availableCapital == null ||
         availableCapital <= 0 ||
+        entryPremium <= 0 ||
+        lotSize <= 0 ||
         targetPremium <= entryPremium ||
         stopLossPremium >= entryPremium) {
       return 0;
@@ -124,50 +127,49 @@ class RiskEngine {
         ((targetPremium - entryPremium) * lotSize) - costs1Lot.totalFrictionInr;
     final netRiskPerLot =
         ((entryPremium - stopLossPremium) * lotSize) + costs1Lot.totalFrictionInr;
+    final totalOutlay1Lot =
+        (entryPremium * lotSize) + costs1Lot.totalFrictionInr;
 
     if (netRewardPerLot <= 0 || netRiskPerLot <= 0) return 0;
+    if (totalOutlay1Lot > availableCapital) return 0;
 
-    final p = winProbability.clamp(0.0, 1.0);
-    final q = 1.0 - p;
-    final b = netRewardPerLot / netRiskPerLot; // Net payoff odds
+    final hardRiskBudget =
+        availableCapital * (config.maxRiskPerTradePct / 100.0);
+    final hardOutlayBudget =
+        availableCapital * (config.maxCapitalOutlayPct / 100.0);
 
-    // Full Kelly fraction f* = (p*b - q) / b
-    final fullKelly = (p * b - q) / b;
-    if (fullKelly <= 0.0) {
-      // M8 Acceptance: At zero or negative edge, size goes to zero!
+    // WP-8: Before calibrated model passes Gate A5, rules-only mode uses fixed 1-lot cap if within risk limits
+    if (!useModelProbability) {
+      if (netRiskPerLot <= hardRiskBudget &&
+          totalOutlay1Lot <= hardOutlayBudget) {
+        return lotSize;
+      }
       return 0;
     }
 
-    // Cap at 25% of Kelly and never exceed RiskConfig maxRiskPerTradePct
-    final quarterKelly = (fullKelly * 0.25).clamp(0.0, config.maxRiskPerTradePct / 100.0);
-    final maxRiskBudgetInr = availableCapital * quarterKelly;
-    final maxCapitalOutlayInr =
-        availableCapital * (config.maxCapitalOutlayPct / 100.0);
+    final p = winProbability.clamp(0.0, 1.0);
+    final q = 1.0 - p;
+    final b = netRewardPerLot / netRiskPerLot;
 
-    final lotsByRisk = (maxRiskBudgetInr / netRiskPerLot).floor();
-    final lotsByOutlay =
-        (maxCapitalOutlayInr / (entryPremium * lotSize)).floor();
-
-    // Buyer-only max loss = entryPremium * quantity must be <= availableCapital
-    final maxAffordableLots =
-        (availableCapital / (entryPremium * lotSize + costs1Lot.totalFrictionInr))
-            .floor();
-
-    int chosenLots = math.min(lotsByRisk, math.min(lotsByOutlay, maxAffordableLots));
-    if (chosenLots < 1 && maxAffordableLots >= 1 && fullKelly > 0.02) {
-      // Allow 1 minimum lot if positive edge & within hard RiskConfig per-trade cap
-      final hardRiskBudget =
-          availableCapital * (config.maxRiskPerTradePct / 100.0);
-      if (netRiskPerLot <= hardRiskBudget * 1.25 &&
-          (entryPremium * lotSize) <= availableCapital) {
-        chosenLots = 1;
-      }
+    // Full Kelly f* = (p*b - q) / b; zero or negative edge strictly returns 0 (WP-6: no 1-lot bypass)
+    final fullKelly = (p * b - q) / b;
+    if (fullKelly <= 0.0) {
+      return 0;
     }
 
-    return math.max(0, chosenLots * lotSize);
+    final quarterKelly =
+        (fullKelly * 0.25).clamp(0.0, config.maxRiskPerTradePct / 100.0);
+    final riskBudgetInr = availableCapital * quarterKelly;
+
+    final lotsByRisk = (riskBudgetInr / netRiskPerLot).floor();
+    final lotsByOutlay = (hardOutlayBudget / totalOutlay1Lot).floor();
+    final lotsByCap = (availableCapital / totalOutlay1Lot).floor();
+
+    final chosenLots = math.min(lotsByRisk, math.min(lotsByOutlay, lotsByCap));
+    if (chosenLots <= 0) return 0;
+    return chosenLots * lotSize;
   }
 
-  /// M8: Modeled Net Expected Value (EV in INR) after all statutory charges & slippage
   static double computeNetExpectedValueInr({
     required double winProbability,
     required double entryPremium,
@@ -185,37 +187,65 @@ class RiskEngine {
       spreadPct: spreadPct,
       barVolume: barVolume,
     );
-
     final grossWin = math.max(0.0, targetPremium - entryPremium) * quantity;
     final grossLoss = math.max(0.0, entryPremium - stopLossPremium) * quantity;
     final p = winProbability.clamp(0.0, 1.0);
-    final netEv =
-        (p * grossWin) - ((1.0 - p) * grossLoss) - costs.totalFrictionInr;
-    return double.parse(netEv.toStringAsFixed(2));
+    return (p * grossWin) - ((1.0 - p) * grossLoss) - costs.totalFrictionInr;
   }
 
-  /// Enforces Phase-1 & V2 M8 Risk Guardrails (Kill Switch, Net Daily Loss Limit, Max Positions, Buyer Max Loss, Net EV Gate)
+  /// WP-6: Fail-Closed Risk Gate (no capital bypass, no Kelly-0 bypass, spread gate, IST daily loss + open risk)
   static AiSignal validateAndEnforceRisk({
     required AiSignal rawSignal,
     required RiskConfig config,
     required int openPositionsCount,
-    required double todayRealizedLossInr,
-    required double availableCapital,
+    required double todayNetRealizedPnlIst,
+    required double openPositionsRiskInr,
+    required double? availableCapital,
+    double? bidPrice,
+    double? askPrice,
+    int? topAskQty,
+    bool enforceEvGate = false,
   }) {
-    if (rawSignal.action == SignalAction.noTrade) {
-      return rawSignal;
+    if (rawSignal.action == SignalAction.noTrade || !rawSignal.strategyPassed) {
+      return _blockSignal(
+        rawSignal,
+        availableCapital ?? 0.0,
+        rawSignal.riskNote.isNotEmpty
+            ? rawSignal.riskNote
+            : 'BLOCKED: Strategy gate not passed',
+      );
     }
 
     if (config.killSwitchActive) {
       return _blockSignal(
-          rawSignal, availableCapital, 'BLOCKED: Kill Switch is ACTIVE');
+          rawSignal, availableCapital ?? 0.0, 'BLOCKED: Kill Switch is ACTIVE');
     }
 
-    if (todayRealizedLossInr >= config.maxDailyLossInr) {
+    // WP-6: Unknown or zero capital ALWAYS blocks (no bypass)
+    if (availableCapital == null || availableCapital <= 0) {
+      return _blockSignal(
+          rawSignal, 0.0, 'BLOCKED: Broker capital unavailable or zero');
+    }
+
+    if (rawSignal.securityId.isEmpty || rawSignal.lotSize <= 0) {
+      return _blockSignal(rawSignal, availableCapital,
+          'BLOCKED: Unresolved contract securityId or lot size');
+    }
+
+    final qty = rawSignal.quantity;
+    if (qty <= 0) {
+      return _blockSignal(rawSignal, availableCapital,
+          'BLOCKED: Position size is 0 (Kelly/Risk cap exceeded)');
+    }
+
+    // WP-6: Daily loss check using IST net realized P&L + open risk
+    final realizedLossToday =
+        todayNetRealizedPnlIst < 0 ? todayNetRealizedPnlIst.abs() : 0.0;
+    if (realizedLossToday >= config.maxDailyLossInr) {
       return _blockSignal(
         rawSignal,
         availableCapital,
-        'BLOCKED: Net Daily Loss (₹${todayRealizedLossInr.toStringAsFixed(0)}) >= Limit (₹${config.maxDailyLossInr.toStringAsFixed(0)})',
+        'BLOCKED: Today IST Net Loss (₹${realizedLossToday.toStringAsFixed(0)}) >= Limit (₹${config.maxDailyLossInr.toStringAsFixed(0)})',
       );
     }
 
@@ -227,77 +257,104 @@ class RiskEngine {
       );
     }
 
-    final qty = rawSignal.lotSize;
+    // Bid-ask spread & liquidity gate
+    double spreadPct = 0.25;
+    if (bidPrice != null &&
+        askPrice != null &&
+        bidPrice > 0 &&
+        askPrice >= bidPrice) {
+      final mid = 0.5 * (bidPrice + askPrice);
+      spreadPct = mid > 0 ? ((askPrice - bidPrice) / mid) * 100.0 : 99.0;
+      if (spreadPct > IndianOptionCostConfig.maxPermittedSpreadPct) {
+        return _blockSignal(
+          rawSignal,
+          availableCapital,
+          'BLOCKED: Wide bid-ask spread (${spreadPct.toStringAsFixed(2)}% > ${IndianOptionCostConfig.maxPermittedSpreadPct}%)',
+        );
+      }
+    }
+    if (topAskQty != null && topAskQty > 0 && topAskQty < qty) {
+      return _blockSignal(
+        rawSignal,
+        availableCapital,
+        'BLOCKED: Top-of-book liquidity ($topAskQty) < order qty ($qty)',
+      );
+    }
+
     final costs = computeRoundTripCostsAndSlippage(
       entryPremium: rawSignal.entryPremium,
       exitPremium: rawSignal.targetPremium,
       quantity: qty,
+      spreadPct: spreadPct,
     );
 
-    // M8: Buyer-only max possible loss is full premium outlay + statutory charges
-    final maxPossibleLoss =
-        (rawSignal.entryPremium * qty) + costs.totalStatutoryChargesInr;
     final requiredCap =
         (rawSignal.entryPremium * qty) + costs.totalFrictionInr;
-
-    if (availableCapital < requiredCap || availableCapital < maxPossibleLoss) {
+    if (availableCapital < requiredCap) {
       return _blockSignal(
         rawSignal,
         availableCapital,
-        'BLOCKED: Required ₹${requiredCap.toStringAsFixed(0)} (incl. ₹${costs.totalFrictionInr.toStringAsFixed(0)} costs) > Available ₹${availableCapital.toStringAsFixed(0)}',
+        'BLOCKED: Required ₹${requiredCap.toStringAsFixed(0)} > Available ₹${availableCapital.toStringAsFixed(0)}',
       );
     }
 
     final stopLossRiskInr =
         ((rawSignal.entryPremium - rawSignal.stopLossPremium).abs() * qty) +
             costs.totalFrictionInr;
-    if (todayRealizedLossInr + stopLossRiskInr > config.maxDailyLossInr * 1.15) {
+    if (realizedLossToday + openPositionsRiskInr + stopLossRiskInr >
+        config.maxDailyLossInr) {
       return _blockSignal(
         rawSignal,
         availableCapital,
-        'BLOCKED: Trade stop-loss risk (₹${stopLossRiskInr.toStringAsFixed(0)}) would breach daily loss cap',
+        'BLOCKED: Combined daily + open + trade risk (₹${(realizedLossToday + openPositionsRiskInr + stopLossRiskInr).toStringAsFixed(0)}) exceeds limit ₹${config.maxDailyLossInr.toStringAsFixed(0)}',
       );
     }
 
-    // M8: Net Expected Value Gate after costs & slippage
-    final winProb = (rawSignal.confidencePct / 100.0).clamp(0.01, 0.99);
-    final netEv = computeNetExpectedValueInr(
-      winProbability: winProb,
-      entryPremium: rawSignal.entryPremium,
-      stopLossPremium: rawSignal.stopLossPremium,
-      targetPremium: rawSignal.targetPremium,
-      quantity: qty,
-    );
-    final minEv = StrategySettingsEngine.instance.current.minNetEvInr;
-    if (netEv < minEv) {
-      return _blockSignal(
-        rawSignal,
-        availableCapital,
-        'BLOCKED by EV Gate: Net EV ₹${netEv.toStringAsFixed(1)} < ₹${minEv.toStringAsFixed(1)} after ₹${costs.totalFrictionInr.toStringAsFixed(0)} friction',
+    if (enforceEvGate) {
+      final winProb = (rawSignal.confidencePct / 100.0).clamp(0.01, 0.99);
+      final netEv = computeNetExpectedValueInr(
+        winProbability: winProb,
+        entryPremium: rawSignal.entryPremium,
+        stopLossPremium: rawSignal.stopLossPremium,
+        targetPremium: rawSignal.targetPremium,
+        quantity: qty,
+        spreadPct: spreadPct,
       );
+      final minEv = StrategySettingsEngine.instance.current.minNetEvInr;
+      if (netEv < minEv) {
+        return _blockSignal(
+          rawSignal,
+          availableCapital,
+          'BLOCKED by EV Gate: Net EV ₹${netEv.toStringAsFixed(1)} < ₹${minEv.toStringAsFixed(1)}',
+        );
+      }
     }
 
     return AiSignal(
       timestampMs: rawSignal.timestampMs,
       index: rawSignal.index,
       expiry: rawSignal.expiry,
+      securityId: rawSignal.securityId,
+      tradingSymbol: rawSignal.tradingSymbol,
       strike: rawSignal.strike,
       action: rawSignal.action,
       confidencePct: rawSignal.confidencePct,
       htfOiReason: rawSignal.htfOiReason,
       reasons: [
         ...rawSignal.reasons,
-        'Net EV: +₹${netEv.toStringAsFixed(0)} (Costs+Slip: ₹${costs.totalFrictionInr.toStringAsFixed(0)})',
+        'Risk Approved • Qty $qty | Est. Friction ₹${costs.totalFrictionInr.toStringAsFixed(1)} (STT 0.15%)',
       ],
       entryPremium: rawSignal.entryPremium,
       stopLossPremium: rawSignal.stopLossPremium,
       targetPremium: rawSignal.targetPremium,
-      lotSize: qty,
-      requiredCapital: double.parse(requiredCap.toStringAsFixed(2)),
+      lotSize: rawSignal.lotSize,
+      quantity: qty,
+      requiredCapital: requiredCap,
       availableCapital: availableCapital,
+      strategyPassed: true,
       riskWithinLimits: true,
       riskNote:
-          'Approved • Net EV +₹${netEv.toStringAsFixed(0)} | MaxLoss ₹${stopLossRiskInr.toStringAsFixed(0)}',
+          'Approved • MaxLoss ₹${stopLossRiskInr.toStringAsFixed(0)} | Friction ₹${costs.totalFrictionInr.toStringAsFixed(0)}',
       modelVersion: rawSignal.modelVersion,
     );
   }
@@ -308,6 +365,8 @@ class RiskEngine {
       timestampMs: sig.timestampMs,
       index: sig.index,
       expiry: sig.expiry,
+      securityId: sig.securityId,
+      tradingSymbol: sig.tradingSymbol,
       strike: sig.strike,
       action: SignalAction.noTrade,
       confidencePct: sig.confidencePct,
@@ -317,8 +376,10 @@ class RiskEngine {
       stopLossPremium: sig.stopLossPremium,
       targetPremium: sig.targetPremium,
       lotSize: sig.lotSize,
+      quantity: 0,
       requiredCapital: sig.requiredCapital,
       availableCapital: availCap,
+      strategyPassed: sig.strategyPassed,
       riskWithinLimits: false,
       riskNote: blockReason,
       modelVersion: sig.modelVersion,
