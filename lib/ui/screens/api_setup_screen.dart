@@ -53,6 +53,9 @@ class _ApiSetupScreenState extends State<ApiSetupScreen> {
       _selectedBroker = broker;
       _angelApiKeyCtrl.text = AngelSmartApiEngine.instance.apiKey;
       _angelClientCodeCtrl.text = AngelSmartApiEngine.instance.clientCode;
+      _angelPinCtrl.text = AngelSmartApiEngine.instance.savedPin;
+      _angelTotpSeedCtrl.text = AngelSmartApiEngine.instance.savedTotpKey;
+      _angelOptInTotp = AngelSmartApiEngine.instance.optInTotpSaved;
       _dhanClientIdCtrl.text = dhanCreds.clientId;
     });
   }

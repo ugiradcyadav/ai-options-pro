@@ -5,6 +5,7 @@ import 'package:intl/intl.dart' hide TextDirection;
 import 'package:path/path.dart';
 import 'package:path_provider/path_provider.dart';
 import '../core/models.dart';
+import 'constituent_flow_engine.dart';
 
 class ResolvedContract {
   final String securityId;
@@ -39,6 +40,7 @@ class ScripMasterEngine {
       'https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json';
 
   final Map<String, ResolvedContract> _contractsByKey = {};
+  final Map<String, String> _nseEquityTokens = {};
   final Map<UnderlyingIndex, List<String>> _expiriesByIndex = {
     for (final u in UnderlyingIndex.values) u: <String>[],
   };
@@ -93,13 +95,19 @@ class ScripMasterEngine {
     return null;
   }
 
+  String? getNseEquityToken(String symbol) =>
+      _nseEquityTokens[symbol.trim().toUpperCase()];
+
+  int get loadedEquityCount => _nseEquityTokens.length;
+
   Future<bool> loadOrRefreshMaster({bool forceDownload = false}) async {
     try {
       final dir = await getApplicationDocumentsDirectory();
       final todayStr = DateFormat('yyyyMMdd').format(
           DateTime.now().toUtc().add(const Duration(hours: 5, minutes: 30)));
       final cacheFile =
-          File(join(dir.path, 'angel_nfo_bfo_master_v2_$todayStr.json'));
+          File(join(dir.path, 'angel_sadhu_master_v3_$todayStr.json'));
+      final trackedEq = ConstituentFlowEngine.allTrackedEquitySymbols;
 
       String jsonBody = '';
       if (!forceDownload && await cacheFile.exists()) {
@@ -107,7 +115,7 @@ class ScripMasterEngine {
       } else {
         final resp = await http
             .get(Uri.parse(angelMasterUrl))
-            .timeout(const Duration(seconds: 30));
+            .timeout(const Duration(seconds: 35));
         if (resp.statusCode == 200 && resp.body.isNotEmpty) {
           final decoded = jsonDecode(resp.body);
           if (decoded is List) {
@@ -118,9 +126,17 @@ class ScripMasterEngine {
                 final inst =
                     (item['instrumenttype'] ?? '').toString().toUpperCase();
                 final name = (item['name'] ?? '').toString().toUpperCase();
-                if ((exch == 'NFO' || exch == 'BFO') &&
+                final sym = (item['symbol'] ?? '').toString().toUpperCase();
+
+                final isTargetOpt = (exch == 'NFO' || exch == 'BFO') &&
                     inst == 'OPTIDX' &&
-                    _allowedSymbols.contains(name)) {
+                    _allowedSymbols.contains(name);
+                final isTargetEq = exch == 'NSE' &&
+                    sym.endsWith('-EQ') &&
+                    (trackedEq.contains(name) ||
+                        trackedEq.contains(sym.substring(0, sym.length - 3)));
+
+                if (isTargetOpt || isTargetEq) {
                   filtered.add(Map<String, dynamic>.from(item));
                 }
               }
@@ -140,7 +156,8 @@ class ScripMasterEngine {
       }
 
       final count = loadFromAngelJsonList(jsonDecode(jsonBody) as List);
-      masterVersion = 'ANGEL-NFO/BFO-$todayStr ($count contracts)';
+      masterVersion =
+          'ANGEL-v3-$todayStr ($count opt, ${_nseEquityTokens.length} eq)';
       isLoaded = count > 0;
       lastLoadError =
           isLoaded ? '' : 'No index option contracts found in master';
@@ -153,6 +170,7 @@ class ScripMasterEngine {
 
   int loadFromAngelJsonList(List records, {DateTime? referenceNowUtc}) {
     _contractsByKey.clear();
+    _nseEquityTokens.clear();
     for (final idx in UnderlyingIndex.values) {
       _expiriesByIndex[idx] = [];
     }
@@ -161,6 +179,7 @@ class ScripMasterEngine {
     final nowIst = (referenceNowUtc ?? DateTime.now().toUtc())
         .add(const Duration(hours: 5, minutes: 30));
     final todayIso = DateFormat('yyyy-MM-dd').format(nowIst);
+    final trackedEq = ConstituentFlowEngine.allTrackedEquitySymbols;
 
     final expirySets = <UnderlyingIndex, Set<String>>{
       for (final u in UnderlyingIndex.values) u: <String>{},
@@ -171,15 +190,28 @@ class ScripMasterEngine {
       if (raw is! Map) continue;
       final exch = (raw['exch_seg'] ?? '').toString().toUpperCase();
       final inst = (raw['instrumenttype'] ?? '').toString().toUpperCase();
+      final token = (raw['token'] ?? '').toString().trim();
+      final symbol = (raw['symbol'] ?? '').toString().trim().toUpperCase();
+      final name = (raw['name'] ?? '').toString().trim().toUpperCase();
+
+      if (exch == 'NSE' && symbol.endsWith('-EQ') && token.isNotEmpty) {
+        final baseSym = symbol.substring(0, symbol.length - 3);
+        if (trackedEq.contains(baseSym)) {
+          _nseEquityTokens[baseSym] = token;
+        }
+        if (trackedEq.contains(name)) {
+          _nseEquityTokens[name] = token;
+        }
+        continue;
+      }
+
       if ((exch != 'NFO' && exch != 'BFO') || inst != 'OPTIDX') continue;
 
-      final idx = matchExactIndex((raw['name'] ?? '').toString());
+      final idx = matchExactIndex(name);
       if (idx == null) continue;
       if (idx == UnderlyingIndex.sensex && exch != 'BFO') continue;
       if (idx != UnderlyingIndex.sensex && exch != 'NFO') continue;
 
-      final token = (raw['token'] ?? '').toString().trim();
-      final symbol = (raw['symbol'] ?? '').toString().trim().toUpperCase();
       final expIso = parseAngelExpiryToIso((raw['expiry'] ?? '').toString());
       final lotSize = int.tryParse((raw['lotsize'] ?? '0').toString()) ?? 0;
       final strikeRaw =

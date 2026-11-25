@@ -21,13 +21,23 @@ class ExecutionEngine {
   static final ExecutionEngine instance = ExecutionEngine._();
   ExecutionEngine._();
 
-  // LIVE mode stays locked until 15 real-data paper trading days & static-IP rules are verified
+  // Strictly Paper-only until Phase 2 real broker order adapter + Phase 5 unlock gates pass
   static const bool liveTradingUnlocked = false;
 
   /// Default per-order liquidity cap: max 15% of observed top-of-book depth
   static const double defaultOrderVolumeRatio = 0.15;
 
   final Set<String> _inFlightCorrelationIds = {};
+  final Set<String> _completedCorrelationIds = {};
+  final Set<String> _closingPositionIds = {};
+  final Set<String> _closedPositionIds = {};
+
+  void clearSessionLocks() {
+    _inFlightCorrelationIds.clear();
+    _completedCorrelationIds.clear();
+    _closingPositionIds.clear();
+    _closedPositionIds.clear();
+  }
 
   /// Computes marketable limit price with protection cap (never raw MARKET orders)
   static double computeMarketableLimitPrice({
@@ -62,7 +72,7 @@ class ExecutionEngine {
     return math.min(requestedQty, maxAllowedLots);
   }
 
-  /// Executes an entry order through: NEW -> SENT -> ACKED -> PARTIAL/FILLED / REJECTED / CANCELLED
+  /// Executes an entry order with deterministic idempotency (C5) & Paper-only lock (C6)
   Future<ExecutionResult> executeEntry({
     required AiSignal signal,
     required TradingMode mode,
@@ -74,10 +84,12 @@ class ExecutionEngine {
   }) async {
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     final optType = signal.action == SignalAction.buyCe ? 'CE' : 'PE';
+    final minuteBucket = nowMs ~/ 60000;
     final corrId = correlationIdOverride ??
-        'ENT_${signal.securityId}_${signal.strike}_$nowMs';
+        'ENT_${signal.securityId}_${signal.strike}_${optType}_$minuteBucket';
 
-    if (_inFlightCorrelationIds.contains(corrId)) {
+    if (_inFlightCorrelationIds.contains(corrId) ||
+        _completedCorrelationIds.contains(corrId)) {
       final dup = TradeOrder(
         orderId: 'DUP_$nowMs',
         clientCorrelationId: corrId,
@@ -95,35 +107,39 @@ class ExecutionEngine {
         limitPrice: signal.entryPremium,
         status: OrderLifecycleState.rejected.label,
         mode: mode.label,
-        reason: 'Idempotency guard blocked duplicate correlation ID',
+        reason: 'Idempotency guard blocked duplicate entry ($corrId)',
       );
       return ExecutionResult(order: dup, success: false, message: dup.reason);
     }
 
-    if (mode == TradingMode.live && !liveTradingUnlocked) {
-      final blocked = TradeOrder(
-        orderId: 'BLK_$nowMs',
-        clientCorrelationId: corrId,
-        timestampMs: nowMs,
-        securityId: signal.securityId,
-        tradingSymbol: signal.tradingSymbol,
-        indexName: signal.index.label,
-        expiry: signal.expiry,
-        strike: signal.strike,
-        optionType: optType,
-        side: 'BUY',
-        quantity: signal.quantity,
-        filledQty: 0,
-        price: signal.entryPremium,
-        limitPrice: signal.entryPremium,
-        status: OrderLifecycleState.rejected.label,
-        mode: mode.label,
-        reason:
-            'LIVE mode locked until 15 real-data paper trading days & static-IP rules are verified.',
-      );
-      await ForeverDatabase.instance.saveOrder(blocked);
-      return ExecutionResult(
-          order: blocked, success: false, message: blocked.reason);
+    if (mode == TradingMode.live) {
+      if (!liveTradingUnlocked) {
+        final blocked = TradeOrder(
+          orderId: 'BLK_$nowMs',
+          clientCorrelationId: corrId,
+          timestampMs: nowMs,
+          securityId: signal.securityId,
+          tradingSymbol: signal.tradingSymbol,
+          indexName: signal.index.label,
+          expiry: signal.expiry,
+          strike: signal.strike,
+          optionType: optType,
+          side: 'BUY',
+          quantity: signal.quantity,
+          filledQty: 0,
+          price: signal.entryPremium,
+          limitPrice: signal.entryPremium,
+          status: OrderLifecycleState.rejected.label,
+          mode: mode.label,
+          reason:
+              'Sadhu AI is Paper-only until Phase 2 real broker adapter & unlock gates pass.',
+        );
+        await ForeverDatabase.instance.saveOrder(blocked);
+        return ExecutionResult(
+            order: blocked, success: false, message: blocked.reason);
+      }
+      throw UnsupportedError(
+          'Sadhu AI Phase 1 has no live broker order adapter. Live execution is prohibited.');
     }
 
     if (!signal.riskWithinLimits ||
@@ -183,7 +199,6 @@ class ExecutionEngine {
       );
       await ForeverDatabase.instance.saveOrder(order);
 
-      // Apply order_volume_ratio depth cap for realistic paper partial fills
       final filledQty = computeVolumeCappedFillQty(
         requestedQty: signal.quantity,
         lotSize: signal.lotSize,
@@ -196,7 +211,7 @@ class ExecutionEngine {
           status: OrderLifecycleState.cancelled.label,
           filledQty: 0,
           reason:
-              'CANCELLED: Top-of-book depth ($topBookAskQty) below ${(orderVolumeRatio * 100).toStringAsFixed(0)}% volume cap for 1 lot (${signal.lotSize})',
+              'CANCELLED: Top-of-book depth ($topBookAskQty) below ${(orderVolumeRatio * 100).toStringAsFixed(0)}% cap for 1 lot (${signal.lotSize})',
         );
         await ForeverDatabase.instance.saveOrder(order);
         return ExecutionResult(
@@ -215,13 +230,13 @@ class ExecutionEngine {
         filledQty: filledQty,
         price: fillPrice,
         reason: isPartial
-            ? 'PARTIAL FILL ($filledQty/${signal.quantity} qty capped by ${(orderVolumeRatio * 100).toStringAsFixed(0)}% depth ratio; remainder cancelled)'
+            ? 'PARTIAL FILL ($filledQty/${signal.quantity}) capped by ${(orderVolumeRatio * 100).toStringAsFixed(0)}% depth'
             : signal.htfOiReason,
       );
       await ForeverDatabase.instance.saveOrder(order);
 
       final pos = PositionRecord(
-        positionId: 'POS_$nowMs',
+        positionId: 'POS_${nowMs}_${signal.securityId}',
         securityId: signal.securityId,
         tradingSymbol: signal.tradingSymbol,
         indexName: signal.index.label,
@@ -239,6 +254,8 @@ class ExecutionEngine {
         realizedPnl: 0.0,
       );
       await ForeverDatabase.instance.upsertPosition(pos);
+      _completedCorrelationIds.add(corrId);
+
       await ForeverDatabase.instance.logAuditEvent(
         category: isPartial ? 'ORDER_PARTIAL' : 'ORDER_FILLED',
         message:
@@ -258,7 +275,7 @@ class ExecutionEngine {
     }
   }
 
-  /// Closes an open position with marketable limit SELL, preserving openedAtMs & persisting net P&L
+  /// Idempotent position exit (C4 fix) + no bid/ask slippage double-count (H2 fix)
   Future<ExecutionResult> executeExit({
     required PositionRecord position,
     required double currentLtp,
@@ -267,66 +284,151 @@ class ExecutionEngine {
     required String exitReason,
   }) async {
     final nowMs = DateTime.now().millisecondsSinceEpoch;
-    final corrId = 'EXT_${position.positionId}_$nowMs';
-    final limitPrice = computeMarketableLimitPrice(
-      isBuy: false,
-      ltp: currentLtp,
-      bestBid: bestBid,
-      bestAsk: bestAsk,
-    );
+    final corrId = 'EXT_${position.positionId}';
 
-    final fillPrice = (bestBid != null && bestBid > 0)
-        ? math.max(limitPrice, bestBid)
-        : currentLtp;
+    if (!position.isOpen ||
+        _closingPositionIds.contains(position.positionId) ||
+        _closedPositionIds.contains(position.positionId)) {
+      final dup = TradeOrder(
+        orderId: 'DUP_EXIT_$nowMs',
+        clientCorrelationId: corrId,
+        timestampMs: nowMs,
+        securityId: position.securityId,
+        tradingSymbol: position.tradingSymbol,
+        indexName: position.indexName,
+        expiry: position.expiry,
+        strike: position.strike,
+        optionType: position.optionType,
+        side: 'SELL',
+        quantity: position.quantity,
+        filledQty: 0,
+        price: currentLtp,
+        limitPrice: currentLtp,
+        status: OrderLifecycleState.rejected.label,
+        mode: position.mode,
+        reason: 'Idempotent exit guard: position ${position.positionId} already closing/closed',
+      );
+      return ExecutionResult(
+        order: dup,
+        position: position,
+        success: false,
+        message: dup.reason,
+      );
+    }
 
-    final costs = RiskEngine.computeRoundTripCostsAndSlippage(
-      entryPremium: position.avgEntryPrice,
-      exitPremium: fillPrice,
-      quantity: position.quantity,
-    );
-    final netPnl =
-        ((fillPrice - position.avgEntryPrice) * position.quantity) -
-            costs.totalFrictionInr;
+    if (position.mode.toUpperCase() == 'LIVE' && !liveTradingUnlocked) {
+      throw UnsupportedError(
+          'Sadhu AI Phase 1 prohibits simulated exits for LIVE positions.');
+    }
 
-    final closeOrder = TradeOrder(
-      orderId: 'EXIT_$nowMs',
-      clientCorrelationId: corrId,
-      timestampMs: nowMs,
-      securityId: position.securityId,
-      tradingSymbol: position.tradingSymbol,
-      indexName: position.indexName,
-      expiry: position.expiry,
-      strike: position.strike,
-      optionType: position.optionType,
-      side: 'SELL',
-      quantity: position.quantity,
-      filledQty: position.quantity,
-      price: fillPrice,
-      limitPrice: limitPrice,
-      status: OrderLifecycleState.filled.label,
-      mode: position.mode,
-      reason: '$exitReason (Net ₹${netPnl.toStringAsFixed(2)})',
-    );
-    await ForeverDatabase.instance.saveOrder(closeOrder);
+    _closingPositionIds.add(position.positionId);
+    try {
+      // Double-check DB status so stale memory objects can never close twice
+      try {
+        final dbPositions = await ForeverDatabase.instance.getAllPositions();
+        final match = dbPositions
+            .where((p) => p.positionId == position.positionId)
+            .toList();
+        if (match.isNotEmpty && !match.first.isOpen) {
+          _closedPositionIds.add(position.positionId);
+          final already = TradeOrder(
+            orderId: 'DUP_DB_EXIT_$nowMs',
+            clientCorrelationId: corrId,
+            timestampMs: nowMs,
+            securityId: position.securityId,
+            tradingSymbol: position.tradingSymbol,
+            indexName: position.indexName,
+            expiry: position.expiry,
+            strike: position.strike,
+            optionType: position.optionType,
+            side: 'SELL',
+            quantity: position.quantity,
+            filledQty: 0,
+            price: currentLtp,
+            limitPrice: currentLtp,
+            status: OrderLifecycleState.rejected.label,
+            mode: position.mode,
+            reason: 'DB guard: position ${position.positionId} already CLOSED',
+          );
+          return ExecutionResult(
+            order: already,
+            position: match.first,
+            success: false,
+            message: already.reason,
+          );
+        }
+      } catch (_) {}
 
-    final closedPos = position.copyWith(
-      status: 'CLOSED',
-      currentLtp: fillPrice,
-      closedAtMs: nowMs,
-      realizedPnl: netPnl,
-    );
-    await ForeverDatabase.instance.upsertPosition(closedPos);
-    await ForeverDatabase.instance.logAuditEvent(
-      category: 'POSITION_CLOSED',
-      message:
-          'SELL ${position.tradingSymbol} qty=${position.quantity} @ ₹${fillPrice.toStringAsFixed(2)} | Reason: $exitReason | Net ₹${netPnl.toStringAsFixed(2)}',
-    );
+      final limitPrice = computeMarketableLimitPrice(
+        isBuy: false,
+        ltp: currentLtp,
+        bestBid: bestBid,
+        bestAsk: bestAsk,
+      );
 
-    return ExecutionResult(
-      order: closeOrder,
-      position: closedPos,
-      success: true,
-      message: '$exitReason • Net ₹${netPnl.toStringAsFixed(2)}',
-    );
+      final usedRealBid = bestBid != null && bestBid > 0;
+      final fillPrice =
+          usedRealBid ? math.max(limitPrice, bestBid) : currentLtp;
+
+      final costs = RiskEngine.computeRoundTripCostsAndSlippage(
+        entryPremium: position.avgEntryPrice,
+        exitPremium: fillPrice,
+        quantity: position.quantity,
+      );
+
+      // H2 Fix: When crossing real displayed Bid/Ask, do not subtract modelled slippage twice
+      final appliedCosts = usedRealBid
+          ? costs.totalStatutoryChargesInr
+          : costs.totalFrictionInr;
+
+      final netPnl =
+          ((fillPrice - position.avgEntryPrice) * position.quantity) -
+              appliedCosts;
+
+      final closeOrder = TradeOrder(
+        orderId: 'EXIT_${nowMs}_${position.securityId}',
+        clientCorrelationId: corrId,
+        timestampMs: nowMs,
+        securityId: position.securityId,
+        tradingSymbol: position.tradingSymbol,
+        indexName: position.indexName,
+        expiry: position.expiry,
+        strike: position.strike,
+        optionType: position.optionType,
+        side: 'SELL',
+        quantity: position.quantity,
+        filledQty: position.quantity,
+        price: fillPrice,
+        limitPrice: limitPrice,
+        status: OrderLifecycleState.filled.label,
+        mode: position.mode,
+        reason: '$exitReason (Net ₹${netPnl.toStringAsFixed(2)})',
+      );
+      await ForeverDatabase.instance.saveOrder(closeOrder);
+
+      final closedPos = position.copyWith(
+        status: 'CLOSED',
+        currentLtp: fillPrice,
+        closedAtMs: nowMs,
+        realizedPnl: netPnl,
+      );
+      await ForeverDatabase.instance.upsertPosition(closedPos);
+      _closedPositionIds.add(position.positionId);
+
+      await ForeverDatabase.instance.logAuditEvent(
+        category: 'POSITION_CLOSED',
+        message:
+            'SELL ${position.tradingSymbol} qty=${position.quantity} @ ₹${fillPrice.toStringAsFixed(2)} | Reason: $exitReason | Net ₹${netPnl.toStringAsFixed(2)}',
+      );
+
+      return ExecutionResult(
+        order: closeOrder,
+        position: closedPos,
+        success: true,
+        message: '$exitReason • Net ₹${netPnl.toStringAsFixed(2)}',
+      );
+    } finally {
+      _closingPositionIds.remove(position.positionId);
+    }
   }
 }

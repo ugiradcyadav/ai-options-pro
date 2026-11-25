@@ -74,22 +74,21 @@ class BacktestEngine {
 
     for (int i = 0; i < bars.length; i++) {
       final b = bars[i] as OneMinEnrichedBar;
-      if (b.close <= 0 ||
-          b.open <= 0 ||
-          b.low <= 0 ||
-          b.low > b.high) {
+      if (b.close <= 0 || b.open <= 0 || b.low <= 0 || b.low > b.high) {
         badTicks++;
       }
       if (b.intervalVolume <= 0) zeroVol++;
       if (i > 0) {
         final prev = bars[i - 1] as OneMinEnrichedBar;
-        final dtMs = (b.timestampMs - prev.timestampMs).abs();
-        if (dtMs > 300000 && dtMs < 43200000) gaps++;
-        if (b.close == prev.close &&
-            b.open == prev.open &&
-            b.high == prev.high &&
-            b.low == prev.low) {
-          stale++;
+        if (prev.contractId == b.contractId) {
+          final dtMs = (b.timestampMs - prev.timestampMs).abs();
+          if (dtMs > 300000 && dtMs < 43200000) gaps++;
+          if (b.close == prev.close &&
+              b.open == prev.open &&
+              b.high == prev.high &&
+              b.low == prev.low) {
+            stale++;
+          }
         }
       }
     }
@@ -118,7 +117,7 @@ class BacktestEngine {
   }) async {
     final optBars = await ForeverDatabase.instance.getRecentBars(
       indexName: index.label,
-      limit: 600,
+      limit: 800,
     );
     final lotSize = ScripMasterEngine.instance.getLotSizeForIndex(index) ?? 0;
     return runRealisticBacktest(
@@ -132,7 +131,7 @@ class BacktestEngine {
     );
   }
 
-  /// 3-Way Chronological Split: 50% Train | embargo | 25% Frozen OOS | embargo | 25% Final Holdout
+  /// 3-Way Chronological Split on unique timestamps: 50% Train | embargo | 25% Frozen OOS | embargo | 25% Holdout
   static ThreeWayBacktestReport runThreeWayHoldout({
     required UnderlyingIndex index,
     required List bars,
@@ -141,13 +140,15 @@ class BacktestEngine {
     required int lotSize,
     StrategySettings? settingsOverride,
   }) {
-    final allBars = bars.map((e) => e as OneMinEnrichedBar).toList()
-      ..sort((a, b) => a.timestampMs.compareTo(b.timestampMs));
-    final contractCount =
-        allBars.where((b) => b.optionType.toUpperCase() != 'SPOT').length;
+    final allBars = bars.map((e) => e as OneMinEnrichedBar).toList();
+    final uniqueTs = allBars
+        .where((b) => b.optionType.toUpperCase() != 'SPOT')
+        .map((b) => b.timestampMs)
+        .toSet()
+        .toList()
+      ..sort();
 
-    const int embargo = 5;
-    if (contractCount < 40 || startingCapital <= 0 || lotSize <= 0) {
+    if (uniqueTs.length < 30 || startingCapital <= 0 || lotSize <= 0) {
       final empty = runRealisticBacktest(
         index: index,
         bars: const [],
@@ -162,14 +163,15 @@ class BacktestEngine {
         finalHoldoutReport: empty,
         hasSufficientBars: false,
         summaryNote:
-            'Insufficient recorded bars ($contractCount found; need >= 40 for 3-way split).',
+            'Need >= 30 recorded chain timestamps for 3-way holdout (have ${uniqueTs.length}).',
       );
     }
 
-    final trainEnd = (contractCount * 0.50).floor();
-    final oosStart = trainEnd + embargo;
-    final oosEnd = (contractCount * 0.75).floor();
-    final holdoutStart = oosEnd + embargo;
+    const embargo = 3;
+    final tEnd = (uniqueTs.length * 0.50).floor();
+    final oosStart = math.min(uniqueTs.length - 5, tEnd + embargo);
+    final oosEnd = math.min(uniqueTs.length - 3, (uniqueTs.length * 0.75).floor());
+    final holdStart = math.min(uniqueTs.length - 2, oosEnd + embargo);
 
     final trainRep = runRealisticBacktest(
       index: index,
@@ -180,9 +182,8 @@ class BacktestEngine {
       settingsOverride: settingsOverride,
       outOfSampleOnly: false,
       startIdxOverride: 4,
-      endIdxOverride: trainEnd,
+      endIdxOverride: tEnd,
     );
-
     final oosRep = runRealisticBacktest(
       index: index,
       bars: allBars,
@@ -194,8 +195,7 @@ class BacktestEngine {
       startIdxOverride: oosStart,
       endIdxOverride: oosEnd,
     );
-
-    final holdoutRep = runRealisticBacktest(
+    final holdRep = runRealisticBacktest(
       index: index,
       bars: allBars,
       riskConfig: riskConfig,
@@ -203,21 +203,20 @@ class BacktestEngine {
       lotSize: lotSize,
       settingsOverride: settingsOverride,
       outOfSampleOnly: false,
-      startIdxOverride: holdoutStart,
-      endIdxOverride: contractCount - 2,
+      startIdxOverride: holdStart,
+      endIdxOverride: uniqueTs.length - 2,
     );
 
     return ThreeWayBacktestReport(
       trainReport: trainRep,
       frozenOosReport: oosRep,
-      finalHoldoutReport: holdoutRep,
+      finalHoldoutReport: holdRep,
       hasSufficientBars: true,
       summaryNote:
-          '3-Way Split (50% Train / 25% Frozen OOS / 25% Holdout, $embargo-bar embargo)',
+          '3-Way Per-Contract Split (${uniqueTs.length} timestamps): Train ${trainRep.totalTrades}t | OOS ${oosRep.totalTrades}t | Holdout ${holdRep.totalTrades}t',
     );
   }
 
-  /// Reruns the exact same recorded bars under 1.0x, 1.5x, and 2.0x friction/slippage stress
   static List<FrictionStressRow> runFrictionStressTest({
     required UnderlyingIndex index,
     required List bars,
@@ -227,16 +226,13 @@ class BacktestEngine {
     StrategySettings? settingsOverride,
     bool outOfSampleOnly = true,
   }) {
-    const scenarios = [
-      {'mult': 1.0, 'label': '1.0x Base (0.15% STT)'},
-      {'mult': 1.5, 'label': '1.5x Slippage Stress'},
-      {'mult': 2.0, 'label': '2.0x Severe Stress'},
+    final specs = [
+      (1.0, '1.0x Baseline'),
+      (1.5, '1.5x Stressed'),
+      (2.0, '2.0x Extreme'),
     ];
-
-    final results = <FrictionStressRow>[];
-    for (final sc in scenarios) {
-      final mult = sc['mult'] as double;
-      final rep = runRealisticBacktest(
+    return specs.map((sp) {
+      final r = runRealisticBacktest(
         index: index,
         bars: bars,
         riskConfig: riskConfig,
@@ -244,23 +240,25 @@ class BacktestEngine {
         lotSize: lotSize,
         settingsOverride: settingsOverride,
         outOfSampleOnly: outOfSampleOnly,
-        frictionMultiplier: mult,
+        frictionMultiplier: sp.$1,
       );
-      results.add(FrictionStressRow(
-        multiplier: mult,
-        label: sc['label'] as String,
-        totalTrades: rep.totalTrades,
-        winRatePct: rep.winRatePct,
-        totalChargesInr: rep.totalCharges,
-        netPnlInr: rep.netPnl,
-        profitFactor: rep.profitFactor,
-        maxDrawdownInr: rep.maxDrawdown,
-      ));
-    }
-    return results;
+      return FrictionStressRow(
+        multiplier: sp.$1,
+        label: sp.$2,
+        totalTrades: r.totalTrades,
+        winRatePct: r.winRatePct,
+        totalChargesInr: r.totalCharges,
+        netPnlInr: r.netPnl,
+        profitFactor: r.profitFactor,
+        maxDrawdownInr: r.maxDrawdown,
+      );
+    }).toList();
   }
 
-  /// Calls MtfStrategyEngine.evaluateEntry() chronologically with IST day-reset loss, real-minute hold, and gap-aware stop fills
+  /// C1 + C2 + C3 Fixed Backtester:
+  /// - Replays REAL timestamp-grouped multi-strike chains (zero fabricated opposite OI)
+  /// - Enters and exits strictly on the SAME contractId's own timeline
+  /// - Completely stateless & reproducible across runs
   static BacktestReport runRealisticBacktest({
     required UnderlyingIndex index,
     required List bars,
@@ -280,14 +278,33 @@ class BacktestEngine {
     final spotBars = allBars
         .where((b) => b.optionType.toUpperCase() == 'SPOT')
         .toList();
-    final contractBars = allBars
+    final optionBars = allBars
         .where((b) => b.optionType.toUpperCase() != 'SPOT')
         .toList();
 
-    final dq = auditBarQuality(contractBars);
-    if (contractBars.length < 10 || startingCapital <= 0 || lotSize <= 0) {
+    final dq = auditBarQuality(optionBars);
+
+    // 1. Group option bars by contractId (C1: isolated per-contract timelines)
+    final Map<String, List<OneMinEnrichedBar>> contractTimelines = {};
+    // 2. Group option bars by timestampMs -> strike -> CE/PE (C2: real chain replay)
+    final Map<int, Map<int, Map<String, OneMinEnrichedBar>>> chainByTs = {};
+
+    for (final b in optionBars) {
+      contractTimelines.putIfAbsent(b.contractId, () => []).add(b);
+      final byStrike = chainByTs.putIfAbsent(b.timestampMs, () => {});
+      final sideMap = byStrike.putIfAbsent(b.strike, () => {});
+      sideMap[b.optionType.toUpperCase()] = b;
+    }
+
+    for (final list in contractTimelines.values) {
+      list.sort((a, b) => a.timestampMs.compareTo(b.timestampMs));
+    }
+
+    final timestamps = chainByTs.keys.toList()..sort();
+
+    if (timestamps.length < 6 || startingCapital <= 0 || lotSize <= 0) {
       return BacktestReport(
-        strategyName: 'Walk-Forward OOS (NO DATA or unresolved lot/capital)',
+        strategyName: 'Sadhu Per-Contract OOS (NO DATA or unresolved lot/capital)',
         indexName: index.label,
         htfConfirmation: dq.summary,
         totalTrades: 0,
@@ -304,13 +321,13 @@ class BacktestEngine {
       );
     }
 
-    const int embargoBars = 5;
-    final int defaultStart = outOfSampleOnly && contractBars.length >= 25
-        ? ((contractBars.length * 0.40).floor() + embargoBars)
+    const int embargoSteps = 3;
+    final int defaultStart = outOfSampleOnly && timestamps.length >= 20
+        ? ((timestamps.length * 0.40).floor() + embargoSteps)
         : 4;
-    final int startIdx = math.max(4, startIdxOverride ?? defaultStart);
+    final int startIdx = math.max(0, startIdxOverride ?? defaultStart);
     final int endIdx =
-        math.min(contractBars.length - 2, endIdxOverride ?? (contractBars.length - 2));
+        math.min(timestamps.length - 2, endIdxOverride ?? (timestamps.length - 2));
 
     int totalTrades = 0;
     int wins = 0;
@@ -328,62 +345,79 @@ class BacktestEngine {
     double todayNetRealizedPnlIst = 0.0;
     final List tradeLogs = [];
 
-    // Strictly chronological loop: next trade cannot start until prior trade settles
-    int i = startIdx;
-    while (i < endIdx) {
-      final bar = contractBars[i];
-      final barDay = _istDayKey(bar.timestampMs);
+    int tIdx = startIdx;
+    while (tIdx <= endIdx) {
+      final ts = timestamps[tIdx];
+      final barDay = _istDayKey(ts);
       if (barDay != currentIstDay) {
         currentIstDay = barDay;
         todayNetRealizedPnlIst = 0.0;
       }
 
-      final causalSpots = spotBars
-          .where((s) => s.timestampMs <= bar.timestampMs)
-          .toList();
+      // Build REAL chain snapshot at timestamp `ts` (zero invented opposite-side OI)
+      final byStrike = chainByTs[ts]!;
+      final chainRows = <StrikeRowSnapshot>[];
+      double spotAtTs = 0.0;
+      String expiryAtTs = '';
 
-      final isCallBar = bar.optionType.toUpperCase() == 'CE';
-      final snap = StrikeRowSnapshot(
-        strike: bar.strike,
-        offset: bar.strikeOffset,
-        ceSecurityId: isCallBar ? bar.contractId : '',
-        peSecurityId: isCallBar ? '' : bar.contractId,
-        lotSize: lotSize,
-        ceLtp: isCallBar ? bar.close : 0.0,
-        peLtp: isCallBar ? 0.0 : bar.close,
-        ceOi: isCallBar ? bar.absoluteOi : (bar.absoluteOi * 0.90).round(),
-        peOi: isCallBar ? (bar.absoluteOi * 1.12).round() : bar.absoluteOi,
-        ceOiChange5m: isCallBar ? bar.oiChange5m : 0,
-        peOiChange5m: isCallBar ? 0 : bar.oiChange5m,
-        ceOiChange15m: isCallBar ? bar.oiChange15m : 0,
-        peOiChange15m: isCallBar ? 0 : bar.oiChange15m,
-        ceOiChange60m: isCallBar ? bar.oiChange60m : 0,
-        peOiChange60m: isCallBar ? 0 : bar.oiChange60m,
-        ceVolume: isCallBar ? bar.intervalVolume : 0,
-        peVolume: isCallBar ? 0 : bar.intervalVolume,
-        ceIv: isCallBar ? bar.iv : null,
-        peIv: isCallBar ? null : bar.iv,
-        ceDelta: isCallBar ? bar.delta : 0.0,
-        peDelta: isCallBar ? 0.0 : bar.delta,
-        ceGamma: isCallBar ? bar.gamma : 0.0,
-        peGamma: isCallBar ? 0.0 : bar.gamma,
-        ceTheta: isCallBar ? bar.theta : 0.0,
-        peTheta: isCallBar ? 0.0 : bar.theta,
-        ceVega: isCallBar ? bar.vega : 0.0,
-        peVega: isCallBar ? 0.0 : bar.vega,
-        ceImbalance: isCallBar ? bar.orderBookImbalance : null,
-        peImbalance: isCallBar ? null : bar.orderBookImbalance,
-        source: 'BACKTEST_RECORDED',
-        exchangeTimestampMs: bar.timestampMs,
-        receivedAtMs: bar.timestampMs,
-      );
+      for (final entry in byStrike.entries) {
+        final ce = entry.value['CE'];
+        final pe = entry.value['PE'];
+        final ref = ce ?? pe;
+        if (ref == null) continue;
+        if (spotAtTs <= 0 && ref.underlyingSpot > 0) {
+          spotAtTs = ref.underlyingSpot;
+        }
+        if (expiryAtTs.isEmpty && ref.expiry.isNotEmpty) {
+          expiryAtTs = ref.expiry;
+        }
+        chainRows.add(StrikeRowSnapshot(
+          strike: entry.key,
+          offset: ref.strikeOffset,
+          ceSecurityId: ce?.contractId ?? '',
+          peSecurityId: pe?.contractId ?? '',
+          ceTradingSymbol: ce != null ? '${index.dhanSymbol}_${entry.key}_CE' : '',
+          peTradingSymbol: pe != null ? '${index.dhanSymbol}_${entry.key}_PE' : '',
+          lotSize: lotSize,
+          ceLtp: ce?.close ?? 0.0,
+          peLtp: pe?.close ?? 0.0,
+          ceOi: ce?.absoluteOi ?? 0,
+          peOi: pe?.absoluteOi ?? 0,
+          ceOiChange5m: ce?.oiChange5m,
+          peOiChange5m: pe?.oiChange5m,
+          ceOiChange15m: ce?.oiChange15m,
+          peOiChange15m: pe?.oiChange15m,
+          ceOiChange60m: ce?.oiChange60m,
+          peOiChange60m: pe?.oiChange60m,
+          ceVolume: ce?.intervalVolume ?? 0,
+          peVolume: pe?.intervalVolume ?? 0,
+          ceIv: ce?.iv,
+          peIv: pe?.iv,
+          ceDelta: ce?.delta ?? 0.0,
+          peDelta: pe?.delta ?? 0.0,
+          ceGamma: ce?.gamma ?? 0.0,
+          peGamma: pe?.gamma ?? 0.0,
+          ceTheta: ce?.theta ?? 0.0,
+          peTheta: pe?.theta ?? 0.0,
+          ceVega: ce?.vega ?? 0.0,
+          peVega: pe?.vega ?? 0.0,
+          ceImbalance: ce?.orderBookImbalance,
+          peImbalance: pe?.orderBookImbalance,
+          source: 'BACKTEST_REAL_CHAIN',
+          exchangeTimestampMs: ts,
+          receivedAtMs: ts,
+        ));
+      }
+
+      final causalSpots =
+          spotBars.where((s) => s.timestampMs <= ts).toList();
 
       final sig = MtfStrategyEngine.evaluateEntry(
         index: index,
-        expiry: bar.expiry,
-        spot: bar.underlyingSpot,
+        expiry: expiryAtTs,
+        spot: spotAtTs,
         dataHealth: DataHealthStatus.live,
-        chainRows: [snap],
+        chainRows: chainRows,
         recentSpotBars: causalSpots,
         availableCapital: currentEquity,
         riskConfig: riskConfig,
@@ -391,18 +425,31 @@ class BacktestEngine {
         todayNetRealizedPnlIst: todayNetRealizedPnlIst,
         openPositionsRiskInr: 0.0,
         settingsOverride: settings,
-        timestampMsOverride: bar.timestampMs,
+        timestampMsOverride: ts,
       );
 
       if (sig.action == SignalAction.noTrade || !sig.riskWithinLimits) {
-        if (sig.strategyPassed && !sig.riskWithinLimits) rejectedByRisk++;
-        i++;
+        if (sig.strategyPassed && !sig.riskWithinLimits) {
+          rejectedByRisk++;
+        }
+        tIdx++;
         continue;
       }
 
-      final fillBar = contractBars[i + 1];
+      // C1 Fix: Walk STRICTLY on the chosen contract's own timeline
+      final ownTimeline = contractTimelines[sig.securityId];
+      if (ownTimeline == null || ownTimeline.isEmpty) {
+        tIdx++;
+        continue;
+      }
+      final fillIdx = ownTimeline.indexWhere((b) => b.timestampMs > ts);
+      if (fillIdx == -1) {
+        tIdx++;
+        continue;
+      }
+      final fillBar = ownTimeline[fillIdx];
       if (_istDayKey(fillBar.timestampMs) != barDay || fillBar.open <= 0) {
-        i++;
+        tIdx++;
         continue;
       }
 
@@ -415,12 +462,12 @@ class BacktestEngine {
 
       double rawExit = fillBar.close;
       String exitReason = 'TIME_EXIT';
-      int exitBarIdx = i + 1;
+      int exitTsMs = fillBar.timestampMs;
 
-      for (int h = i + 1; h <= endIdx; h++) {
-        final hBar = contractBars[h];
+      for (int h = fillIdx; h < ownTimeline.length; h++) {
+        final hBar = ownTimeline[h];
         if (_istDayKey(hBar.timestampMs) != barDay) break;
-        exitBarIdx = h;
+        exitTsMs = hBar.timestampMs;
 
         if (hBar.open <= stopPrice) {
           rawExit = hBar.open;
@@ -476,43 +523,44 @@ class BacktestEngine {
       if (dd > maxDrawdownInr) maxDrawdownInr = dd;
 
       tradeLogs.add({
+        'contractId': sig.securityId,
+        'strike': sig.strike,
+        'action': sig.action.label,
         'entryTimeMs': fillBar.timestampMs,
-        'exitTimeMs': contractBars[exitBarIdx].timestampMs,
-        'strike': bar.strike,
-        'optionType': bar.optionType,
+        'exitTimeMs': exitTsMs,
+        'entry': rawEntry,
+        'exit': rawExit,
         'qty': qty,
-        'entryPrice': rawEntry,
-        'exitPrice': rawExit,
         'grossPnl': grossPnl,
-        'charges': friction,
+        'friction': friction,
         'netPnl': netPnl,
         'reason': exitReason,
       });
 
-      i = exitBarIdx + 1;
+      // Advance chronological clock past exitTsMs so trades never overlap
+      while (tIdx <= endIdx && timestamps[tIdx] <= exitTsMs) {
+        tIdx++;
+      }
     }
 
-    final winRate =
-        totalTrades > 0 ? (wins / totalTrades.toDouble()) * 100.0 : 0.0;
-    final expectancy =
-        totalTrades > 0 ? (netPnlSum / totalTrades.toDouble()) : 0.0;
-    final profitFactor = grossLossAbs > 0
+    final winRate = totalTrades > 0 ? (wins / totalTrades) * 100.0 : 0.0;
+    final pf = grossLossAbs > 0
         ? (grossProfitWins / grossLossAbs)
         : (grossProfitWins > 0 ? 9.99 : 0.0);
+    final expPerTrade = totalTrades > 0 ? (netPnlSum / totalTrades) : 0.0;
 
     return BacktestReport(
-      strategyName:
-          'Unified Walk-Forward ${outOfSampleOnly ? "OOS" : "Window"} (${frictionMultiplier.toStringAsFixed(1)}x Friction)',
+      strategyName: 'Sadhu Per-Contract OOS (${frictionMultiplier}x Cost)',
       indexName: index.label,
-      htfConfirmation: 'Same evaluateEntry() • Gap-Aware Stops • 0.15% STT',
+      htfConfirmation: dq.summary,
       totalTrades: totalTrades,
       winRatePct: winRate,
       grossPnl: grossPnlSum,
       totalCharges: totalFrictionSum,
       netPnl: netPnlSum,
-      profitFactor: profitFactor,
+      profitFactor: pf,
       maxDrawdown: maxDrawdownInr,
-      expectancyPerTrade: expectancy,
+      expectancyPerTrade: expPerTrade,
       rejectedByRiskCount: rejectedByRisk,
       tradeLogs: tradeLogs,
       runTimestampMs: DateTime.now().millisecondsSinceEpoch,

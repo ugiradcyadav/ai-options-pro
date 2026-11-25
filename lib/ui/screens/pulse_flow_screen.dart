@@ -1,8 +1,11 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart' hide TextDirection;
 import '../../core/models.dart';
+import '../../core/ui_haptics.dart';
 import '../../data/angel_ws_streamer.dart';
+import '../../data/constituent_flow_engine.dart';
 import '../../data/dhan_data_engine.dart';
 import '../../data/flow_data_engine.dart';
 import '../../data/forever_db.dart';
@@ -26,12 +29,13 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
   String _subTab = 'Overview';
   String _scannerMode = 'GAINERS';
   bool _scannerLoading = false;
+  bool _showAllConstituents = false;
   List<TvScannerStock> _scannerStocks = [];
   bool _motionPaused = false;
-  SectorFlowSnapshot? _selectedSector;
+  ConstituentFlowItem? _selectedStock;
   List<OneMinEnrichedBar> _recentBars = [];
   late AnimationController _animCtrl;
-  Timer? _sectorTimer;
+  Timer? _refreshTimer;
 
   @override
   void initState() {
@@ -41,16 +45,31 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
       duration: const Duration(seconds: 4),
     )..repeat();
 
-    _refreshAllFlowData();
-    _sectorTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+    _refreshAllFlowData(forceConstituents: true);
+    _refreshTimer = Timer.periodic(const Duration(seconds: 8), (_) {
       _refreshAllFlowData();
     });
   }
 
-  Future<void> _refreshAllFlowData() async {
-    await FlowDataEngine.instance.refreshSectoralFlow();
+  @override
+  void didUpdateWidget(covariant PulseFlowScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.appState.selectedIndex != widget.appState.selectedIndex) {
+      _selectedStock = null;
+      _showAllConstituents = false;
+    }
+    _refreshAllFlowData();
+  }
+
+  Future<void> _refreshAllFlowData({bool forceConstituents = false}) async {
+    final idx = widget.appState.selectedIndex;
+    await Future.wait([
+      FlowDataEngine.instance.refreshSectoralFlow(),
+      ConstituentFlowEngine.instance
+          .refreshForIndex(idx, force: forceConstituents),
+    ]);
     final bars = await ForeverDatabase.instance.getRecentBars(
-      indexName: widget.appState.selectedIndex.label,
+      indexName: idx.label,
       optionType: 'CE',
       limit: 60,
     );
@@ -76,6 +95,7 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
   }
 
   void _toggleMotion() {
+    UiHaptics.tap();
     setState(() {
       _motionPaused = !_motionPaused;
       if (_motionPaused) {
@@ -88,7 +108,7 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
 
   @override
   void dispose() {
-    _sectorTimer?.cancel();
+    _refreshTimer?.cancel();
     _animCtrl.dispose();
     super.dispose();
   }
@@ -99,6 +119,7 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
     final engine = DhanDataEngine.instance;
     final flow = FlowDataEngine.instance;
     final ws = AngelWsStreamer.instance;
+    final constSnap = ConstituentFlowEngine.instance.getSnapshot(idx);
     final health = engine.dataHealth;
     final spot = engine.spotPrices[idx] ?? 0.0;
     final chgPct = engine.spotChangePct[idx] ?? 0.0;
@@ -106,24 +127,22 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
         engine.optionChainRows[idx] ?? const <StrikeRowSnapshot>[];
     final hasLive = health == DataHealthStatus.live && spot > 0;
 
-    final mood = flow.marketMoodScore;
-    final moodLabel = mood == null
-        ? 'NO DATA'
-        : (mood >= 60 ? 'Risk-on' : (mood <= 40 ? 'Risk-off' : 'Neutral'));
-    final moodColor = mood == null
+    // Real breadth from the active index's own constituents
+    final items = constSnap?.items ?? const <ConstituentFlowItem>[];
+    final advCount = items.where((e) => e.isInflow).length;
+    final decCount = items.length - advCount;
+    final breadthPct =
+        items.isNotEmpty ? ((advCount / items.length) * 100.0).round() : null;
+    final breadthColor = breadthPct == null
         ? QuantTheme.negative
-        : (mood >= 60
+        : (breadthPct >= 55
             ? QuantTheme.positive
-            : (mood <= 40 ? QuantTheme.negative : QuantTheme.warning));
+            : (breadthPct <= 45 ? QuantTheme.negative : QuantTheme.warning));
 
     final vix = flow.indiaVix;
     final vixLabel = vix == null
         ? 'NO DATA'
         : (vix >= 16.0 ? 'Elevated' : (vix <= 12.5 ? 'Calm' : 'Normal'));
-
-    final inflows = flow.sectors.where((s) => s.isInflow).toList();
-    final outflows = flow.sectors.where((s) => !s.isInflow).toList()
-      ..sort((a, b) => a.changePct.compareTo(b.changePct));
 
     final injections = flow.computeOptionCapitalInjection(idx);
     final rawRadar = flow.computeRadarAxes(
@@ -142,45 +161,49 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
       srRoomScore: srTrend.srRoomScore ?? rawRadar.srRoomScore,
     );
 
-    final lastUpdStr = flow.lastSectorFetchMs > 0
+    final lastTs = constSnap?.fetchedAtMs ?? flow.lastSectorFetchMs;
+    final lastUpdStr = lastTs > 0
         ? DateFormat('HH:mm:ss')
-            .format(DateTime.fromMillisecondsSinceEpoch(flow.lastSectorFetchMs))
+            .format(DateTime.fromMillisecondsSinceEpoch(lastTs))
         : '--:--:--';
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        // 1. Top 3-Card Real Pulse Strip: Index Breadth | Active Spot | India VIX
         Row(
           children: [
             Expanded(
               child: QuantPanel(
-                padding: const EdgeInsets.all(10),
+                padding: const EdgeInsets.all(12),
                 backgroundColor: QuantTheme.bgSecondary,
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('Mood', style: QuantTheme.label(size: 10)),
+                    Text('Breadth', style: QuantTheme.label(size: 10)),
                     const SizedBox(height: 3),
                     Text(
-                      mood != null ? '$mood/100' : 'NO DATA',
+                      items.isNotEmpty ? '$advCount / ${items.length}' : 'NO DATA',
                       style: QuantTheme.mono(
-                        size: 15,
-                        color: mood != null
+                        size: 14,
+                        color: items.isNotEmpty
                             ? QuantTheme.textPrimary
                             : QuantTheme.negative,
                         weight: FontWeight.w800,
                       ),
                     ),
-                    Text(moodLabel,
-                        style: QuantTheme.label(size: 10, color: moodColor)),
+                    Text(
+                      breadthPct != null ? '$breadthPct% Up ($decCount Dn)' : '--',
+                      style: QuantTheme.label(size: 9.5, color: breadthColor),
+                    ),
                   ],
                 ),
               ),
             ),
-            const SizedBox(width: 6),
+            const SizedBox(width: 8),
             Expanded(
               child: QuantPanel(
-                padding: const EdgeInsets.all(10),
+                padding: const EdgeInsets.all(12),
                 backgroundColor: QuantTheme.bgSecondary,
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -190,7 +213,7 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
                     Text(
                       hasLive ? spot.toStringAsFixed(0) : 'NO DATA',
                       style: QuantTheme.mono(
-                        size: 15,
+                        size: 14,
                         color: hasLive
                             ? QuantTheme.textPrimary
                             : QuantTheme.negative,
@@ -202,7 +225,7 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
                           ? '${chgPct >= 0 ? "+" : ""}${chgPct.toStringAsFixed(2)}%'
                           : '--',
                       style: QuantTheme.mono(
-                        size: 10,
+                        size: 9.5,
                         color: chgPct >= 0
                             ? QuantTheme.positive
                             : QuantTheme.negative,
@@ -212,10 +235,10 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
                 ),
               ),
             ),
-            const SizedBox(width: 6),
+            const SizedBox(width: 8),
             Expanded(
               child: QuantPanel(
-                padding: const EdgeInsets.all(10),
+                padding: const EdgeInsets.all(12),
                 backgroundColor: QuantTheme.bgSecondary,
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -225,7 +248,7 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
                     Text(
                       vix != null ? vix.toStringAsFixed(2) : 'NO DATA',
                       style: QuantTheme.mono(
-                        size: 15,
+                        size: 14,
                         color: vix != null
                             ? QuantTheme.textPrimary
                             : QuantTheme.negative,
@@ -235,7 +258,7 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
                     Text(
                       vixLabel,
                       style: QuantTheme.label(
-                        size: 10,
+                        size: 9.5,
                         color: (vix ?? 0) >= 16.0
                             ? QuantTheme.warning
                             : QuantTheme.accent,
@@ -247,7 +270,9 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
             ),
           ],
         ),
-        const SizedBox(height: 10),
+        const SizedBox(height: 12),
+
+        // 2. Sub-Tabs
         SingleChildScrollView(
           scrollDirection: Axis.horizontal,
           child: Row(
@@ -261,15 +286,18 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
               final active = _subTab == t;
               return GestureDetector(
                 onTap: () {
+                  UiHaptics.tap();
                   setState(() => _subTab = t);
-                  if (t == 'Scanner' && _scannerStocks.isEmpty && !_scannerLoading) {
+                  if (t == 'Scanner' &&
+                      _scannerStocks.isEmpty &&
+                      !_scannerLoading) {
                     _loadTvScanner();
                   }
                 },
                 child: Container(
-                  margin: const EdgeInsets.only(right: 5),
+                  margin: const EdgeInsets.only(right: 6),
                   padding:
-                      const EdgeInsets.symmetric(horizontal: 11, vertical: 7),
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                   alignment: Alignment.center,
                   decoration: BoxDecoration(
                     color: active ? QuantTheme.bgElevated : QuantTheme.bgPanel,
@@ -293,6 +321,8 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
           ),
         ),
         const SizedBox(height: 10),
+
+        // 3. Live Status Strip
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
@@ -311,14 +341,14 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
               onTap: _toggleMotion,
               child: Container(
                 padding:
-                    const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
                 decoration: BoxDecoration(
                   color: QuantTheme.bgPanel,
                   borderRadius: BorderRadius.circular(6),
                   border: Border.all(color: QuantTheme.border),
                 ),
                 child: Text(
-                  _motionPaused ? '▶ Resume motion' : '⏸ Pause motion',
+                  _motionPaused ? '▶ Resume' : '⏸ Pause',
                   style: QuantTheme.mono(
                       size: 10, color: QuantTheme.textSecondary),
                 ),
@@ -326,24 +356,25 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
             ),
           ],
         ),
-        const SizedBox(height: 10),
+        const SizedBox(height: 12),
+
         if (_subTab == 'Overview') ...[
-          _buildMoneyRotationCard(inflows, outflows, flow.hasSectorData),
-          const SizedBox(height: 10),
+          _buildConstituentRotationCard(idx, constSnap),
+          const SizedBox(height: 12),
           _buildOptionCapitalInjectionCard(idx, injections),
         ] else if (_subTab == 'Money flow') ...[
-          _buildMoneyRotationCard(inflows, outflows, flow.hasSectorData),
-          const SizedBox(height: 10),
-          _buildSectorBreakdownList(flow.sectors),
-          const SizedBox(height: 10),
+          _buildConstituentRotationCard(idx, constSnap),
+          const SizedBox(height: 12),
+          _buildConstituentGridCard(idx, constSnap),
+          const SizedBox(height: 12),
           _buildOptionCapitalInjectionCard(idx, injections),
         ] else if (_subTab == 'Order flow') ...[
           _buildFollowTheMoneyHubCard(flow),
-          const SizedBox(height: 10),
+          const SizedBox(height: 12),
           _buildOrderBookWallCard(idx, rows, spot),
         ] else if (_subTab == 'Radar') ...[
           _buildSignalRadarCard(idx, radarAxes, srTrend.breakoutState),
-          const SizedBox(height: 10),
+          const SizedBox(height: 12),
           _buildOptionCapitalInjectionCard(idx, injections),
         ] else ...[
           _buildTvScannerCard(),
@@ -352,8 +383,252 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
     );
   }
 
+  /// Real Per-Index Constituent Money Rotation (Nifty 50 / BankNifty 12 / FinNifty 20 / Sensex 30)
+  Widget _buildConstituentRotationCard(
+    UnderlyingIndex idx,
+    IndexConstituentFlowSnapshot? snap,
+  ) {
+    final totalTarget =
+        ConstituentFlowEngine.constituentsByIndex[idx]?.length ?? 0;
+    final items = snap?.items ?? const <ConstituentFlowItem>[];
+    final inflows = snap?.inflows ?? const <ConstituentFlowItem>[];
+    final outflows = snap?.outflows ?? const <ConstituentFlowItem>[];
+    final inCr = snap?.inflowTurnoverCr ?? 0.0;
+    final outCr = snap?.outflowTurnoverCr ?? 0.0;
+    final topIn = inflows.take(3).map((e) => e.symbol).join(', ');
+    final topOut = outflows.take(3).map((e) => e.symbol).join(', ');
+
+    return QuantPanel(
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Where money moved (${idx.label})',
+                        style: QuantTheme.heading(size: 13)),
+                    Text(
+                      'Real ${items.length}/$totalTarget Index Constituents • Live Angel Quotes',
+                      style: QuantTheme.label(size: 9.5),
+                    ),
+                  ],
+                ),
+              ),
+              QuantBadge(
+                text: '${inflows.length} IN / ${outflows.length} OUT',
+                color: inflows.length >= outflows.length
+                    ? QuantTheme.positive
+                    : QuantTheme.negative,
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          if (items.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 16),
+              child: Center(
+                child: Text(
+                  snap != null && snap.errorNote.isNotEmpty
+                      ? snap.errorNote
+                      : 'NO DATA — Connect Angel One API to stream real ${idx.label} constituent money flow.',
+                  textAlign: TextAlign.center,
+                  style: QuantTheme.mono(size: 10.5, color: QuantTheme.negative),
+                ),
+              ),
+            )
+          else ...[
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                QuantMetricCell(
+                  label: 'INFLOW TURNOVER',
+                  value: '₹${inCr.toStringAsFixed(0)} Cr',
+                  valueColor: QuantTheme.positive,
+                ),
+                QuantMetricCell(
+                  label: 'OUTFLOW TURNOVER',
+                  value: '₹${outCr.toStringAsFixed(0)} Cr',
+                  valueColor: QuantTheme.negative,
+                ),
+                QuantMetricCell(
+                  label: 'NET STOCK FLOW',
+                  value:
+                      '${inCr >= outCr ? "+" : "-"}₹${(inCr - outCr).abs().toStringAsFixed(0)} Cr',
+                  valueColor:
+                      inCr >= outCr ? QuantTheme.positive : QuantTheme.negative,
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            SizedBox(
+              height: 165,
+              width: double.infinity,
+              child: AnimatedBuilder(
+                animation: _animCtrl,
+                builder: (ctx, _) => CustomPaint(
+                  painter: _ConstituentRotationPainter(
+                    outflows: outflows.take(5).toList(),
+                    inflows: inflows.take(5).toList(),
+                    animValue: _animCtrl.value,
+                  ),
+                ),
+              ),
+            ),
+            const Divider(color: QuantTheme.border, height: 14),
+            Text(
+              'Leading Inflow: ${topIn.isNotEmpty ? topIn : "None"} | Leading Outflow: ${topOut.isNotEmpty ? topOut : "None"}',
+              style: QuantTheme.label(size: 10.5, color: QuantTheme.textPrimary),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// Interactive Full Constituent List (All 50 Nifty / 12 BankNifty / 20 FinNifty / 30 Sensex)
+  Widget _buildConstituentGridCard(
+    UnderlyingIndex idx,
+    IndexConstituentFlowSnapshot? snap,
+  ) {
+    final items = snap?.items ?? const <ConstituentFlowItem>[];
+    if (items.isEmpty) return const SizedBox.shrink();
+
+    final visible = _showAllConstituents ? items : items.take(16).toList();
+
+    return QuantPanel(
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text('${idx.label} Constituents (${items.length})',
+                  style: QuantTheme.heading(size: 12)),
+              if (items.length > 16)
+                GestureDetector(
+                  onTap: () {
+                    UiHaptics.tap();
+                    setState(() => _showAllConstituents = !_showAllConstituents);
+                  },
+                  child: QuantBadge(
+                    text: _showAllConstituents
+                        ? 'Show Top 16'
+                        : 'Show All ${items.length}',
+                    color: QuantTheme.accent,
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: visible.map((st) {
+              final selected = _selectedStock?.symbol == st.symbol;
+              final col = st.isInflow ? QuantTheme.positive : QuantTheme.negative;
+              return GestureDetector(
+                onTap: () {
+                  UiHaptics.tap();
+                  setState(() => _selectedStock = st);
+                },
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: selected
+                        ? col.withOpacity(0.18)
+                        : QuantTheme.bgSecondary,
+                    borderRadius: BorderRadius.circular(7),
+                    border: Border.all(
+                      color: selected ? col : QuantTheme.border,
+                    ),
+                  ),
+                  child: Text(
+                    '${st.symbol} ${st.changePct >= 0 ? "+" : ""}${st.changePct.toStringAsFixed(2)}%',
+                    style: QuantTheme.mono(size: 9.5, color: col),
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+          if (_selectedStock != null) ...[
+            const Divider(color: QuantTheme.border, height: 16),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: QuantTheme.bgSecondary,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: _selectedStock!.isInflow
+                      ? QuantTheme.positive
+                      : QuantTheme.negative,
+                ),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(
+                        '${_selectedStock!.symbol} • ${_selectedStock!.isInflow ? "INFLOW" : "OUTFLOW"}',
+                        style: QuantTheme.heading(
+                          size: 12,
+                          color: _selectedStock!.isInflow
+                              ? QuantTheme.positive
+                              : QuantTheme.negative,
+                        ),
+                      ),
+                      Text(
+                        '₹${_selectedStock!.ltp.toStringAsFixed(2)} (${_selectedStock!.changePct >= 0 ? "+" : ""}${_selectedStock!.changePct.toStringAsFixed(2)}%)',
+                        style: QuantTheme.mono(
+                          size: 11,
+                          color: _selectedStock!.isInflow
+                              ? QuantTheme.positive
+                              : QuantTheme.negative,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      QuantMetricCell(
+                        label: 'TURNOVER',
+                        value: '₹${_selectedStock!.turnoverCr.toStringAsFixed(1)} Cr',
+                        valueColor: QuantTheme.accent,
+                      ),
+                      QuantMetricCell(
+                        label: 'HIGH / LOW',
+                        value:
+                            '${_selectedStock!.high.toStringAsFixed(1)} / ${_selectedStock!.low.toStringAsFixed(1)}',
+                      ),
+                      QuantMetricCell(
+                        label: 'RANGE POS',
+                        value:
+                            '${(_selectedStock!.rangePressure * 100).toStringAsFixed(0)}%',
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
   Widget _buildTvScannerCard() {
     return QuantPanel(
+      padding: const EdgeInsets.all(14),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -365,8 +640,7 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
                 children: [
                   Text('NSE Live Momentum Scanner',
                       style: QuantTheme.heading(size: 13)),
-                  Text('Powered by TradingView India Screener',
-                      style: QuantTheme.label(size: 9.5)),
+                  Text('Live Liquid Movers', style: QuantTheme.label(size: 9.5)),
                 ],
               ),
               GestureDetector(
@@ -384,10 +658,13 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
               final active = _scannerMode == m;
               return Expanded(
                 child: GestureDetector(
-                  onTap: () => _loadTvScanner(mode: m),
+                  onTap: () {
+                    UiHaptics.tap();
+                    _loadTvScanner(mode: m);
+                  },
                   child: Container(
                     margin: const EdgeInsets.symmetric(horizontal: 2),
-                    padding: const EdgeInsets.symmetric(vertical: 6),
+                    padding: const EdgeInsets.symmetric(vertical: 7),
                     alignment: Alignment.center,
                     decoration: BoxDecoration(
                       color:
@@ -426,7 +703,7 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
               final isUp = st.changePct >= 0;
               final col = isUp ? QuantTheme.positive : QuantTheme.negative;
               return Container(
-                padding: const EdgeInsets.symmetric(vertical: 6),
+                padding: const EdgeInsets.symmetric(vertical: 7),
                 decoration: const BoxDecoration(
                   border: Border(
                       bottom: BorderSide(color: QuantTheme.border, width: 0.5)),
@@ -439,8 +716,7 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(st.symbol,
-                              style: QuantTheme.heading(size: 11)),
+                          Text(st.symbol, style: QuantTheme.heading(size: 11)),
                           Text(
                             '${st.sector} • RelVol ${st.relVolume.toStringAsFixed(1)}x • RSI ${st.rsi14?.toStringAsFixed(0) ?? "-"}',
                             overflow: TextOverflow.ellipsis,
@@ -470,182 +746,6 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
     );
   }
 
-  Widget _buildMoneyRotationCard(
-    List<SectorFlowSnapshot> inflows,
-    List<SectorFlowSnapshot> outflows,
-    bool hasSectorData,
-  ) {
-    final topIn = inflows.take(2).map((s) => s.name).join(' & ');
-    final topOut = outflows.take(2).map((s) => s.name).join(' & ');
-
-    return QuantPanel(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('Where money moved today',
-                      style: QuantTheme.heading(size: 13)),
-                  Text('Real NSE Sectoral Rotation (Angel SmartAPI)',
-                      style: QuantTheme.label(size: 10)),
-                ],
-              ),
-              QuantBadge(
-                text: '${inflows.length} IN / ${outflows.length} OUT',
-                color: inflows.length >= outflows.length
-                    ? QuantTheme.positive
-                    : QuantTheme.negative,
-              ),
-            ],
-          ),
-          const SizedBox(height: 10),
-          if (!hasSectorData)
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 20),
-              child: Center(
-                child: Text(
-                  'NO DATA — Connect Angel One API to stream real sectoral money rotation.',
-                  textAlign: TextAlign.center,
-                  style: QuantTheme.mono(size: 11, color: QuantTheme.negative),
-                ),
-              ),
-            )
-          else ...[
-            SizedBox(
-              height: 155,
-              width: double.infinity,
-              child: AnimatedBuilder(
-                animation: _animCtrl,
-                builder: (ctx, _) => CustomPaint(
-                  painter: MoneyRotationPainter(
-                    outflows: outflows,
-                    inflows: inflows,
-                    animValue: _animCtrl.value,
-                  ),
-                ),
-              ),
-            ),
-            const Divider(color: QuantTheme.border, height: 14),
-            Text(
-              'Money rotating ${topIn.isNotEmpty ? "into $topIn" : "selectively"}${topOut.isNotEmpty ? ", out of $topOut" : ""}. Tap any sector below to inspect.',
-              style: QuantTheme.label(size: 11, color: QuantTheme.textPrimary),
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-
-  Widget _buildSectorBreakdownList(List<SectorFlowSnapshot> sectors) {
-    if (sectors.isEmpty) return const SizedBox.shrink();
-    return QuantPanel(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text('Sector Inflow / Outflow Details',
-              style: QuantTheme.heading(size: 12)),
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 6,
-            runSpacing: 6,
-            children: sectors.map((s) {
-              final selected = _selectedSector?.name == s.name;
-              final col = s.isInflow ? QuantTheme.positive : QuantTheme.negative;
-              return GestureDetector(
-                onTap: () => setState(() => _selectedSector = s),
-                child: Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
-                  decoration: BoxDecoration(
-                    color: selected
-                        ? col.withOpacity(0.18)
-                        : QuantTheme.bgSecondary,
-                    borderRadius: BorderRadius.circular(7),
-                    border: Border.all(
-                      color: selected ? col : QuantTheme.border,
-                    ),
-                  ),
-                  child: Text(
-                    '${s.name} ${s.changePct >= 0 ? "+" : ""}${s.changePct.toStringAsFixed(2)}%',
-                    style: QuantTheme.mono(size: 10, color: col),
-                  ),
-                ),
-              );
-            }).toList(),
-          ),
-          if (_selectedSector != null) ...[
-            const Divider(color: QuantTheme.border, height: 16),
-            Container(
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                color: QuantTheme.bgSecondary,
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(
-                  color: _selectedSector!.isInflow
-                      ? QuantTheme.positive
-                      : QuantTheme.negative,
-                ),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text(
-                        '${_selectedSector!.name} • ${_selectedSector!.isInflow ? "money entering" : "money leaving"}',
-                        style: QuantTheme.heading(
-                          size: 12,
-                          color: _selectedSector!.isInflow
-                              ? QuantTheme.positive
-                              : QuantTheme.negative,
-                        ),
-                      ),
-                      Text(
-                        '${_selectedSector!.changePct >= 0 ? "+" : ""}${_selectedSector!.changePct.toStringAsFixed(2)}%',
-                        style: QuantTheme.mono(
-                          size: 12,
-                          color: _selectedSector!.isInflow
-                              ? QuantTheme.positive
-                              : QuantTheme.negative,
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 6),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      QuantMetricCell(
-                        label: 'LTP',
-                        value: _selectedSector!.ltp.toStringAsFixed(1),
-                      ),
-                      QuantMetricCell(
-                        label: 'DAY HIGH / LOW',
-                        value:
-                            '${_selectedSector!.high.toStringAsFixed(0)} / ${_selectedSector!.low.toStringAsFixed(0)}',
-                      ),
-                      QuantMetricCell(
-                        label: 'BUY PRESSURE',
-                        value:
-                            '${(_selectedSector!.rangePressure * 100).toStringAsFixed(0)}%',
-                        valueColor: QuantTheme.accent,
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-
   Widget _buildOptionCapitalInjectionCard(
     UnderlyingIndex idx,
     List<StrikeMoneyInjection> injections,
@@ -660,13 +760,14 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
     }
 
     return QuantPanel(
+      padding: const EdgeInsets.all(14),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text('Where Option Money Is Injected (${idx.label})',
+              Text('Option Money Injected (${idx.label})',
                   style: QuantTheme.heading(size: 12)),
               QuantBadge(
                 text: injections.isEmpty
@@ -683,25 +784,25 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
           const SizedBox(height: 8),
           if (injections.isEmpty)
             Text(
-              'NO DATA — Live option chain required to calculate real strike capital injection.',
-              style: QuantTheme.mono(size: 11, color: QuantTheme.negative),
+              'NO DATA — Live option chain required for real strike capital injection.',
+              style: QuantTheme.mono(size: 10.5, color: QuantTheme.negative),
             )
           else ...[
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 QuantMetricCell(
-                  label: 'CE TURNOVER (ATM±4)',
+                  label: 'CE TURNOVER',
                   value: '₹${ceTurnCr.toStringAsFixed(1)} Cr',
                   valueColor: QuantTheme.positive,
                 ),
                 QuantMetricCell(
-                  label: 'PE TURNOVER (ATM±4)',
+                  label: 'PE TURNOVER',
                   value: '₹${peTurnCr.toStringAsFixed(1)} Cr',
                   valueColor: QuantTheme.negative,
                 ),
                 QuantMetricCell(
-                  label: 'NET FLOW BIAS',
+                  label: 'NET BIAS',
                   value:
                       '${(ceTurnCr - peTurnCr) >= 0 ? "CE +" : "PE +"}₹${(ceTurnCr - peTurnCr).abs().toStringAsFixed(1)} Cr',
                   valueColor: QuantTheme.accent,
@@ -752,6 +853,7 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
 
   Widget _buildFollowTheMoneyHubCard(FlowDataEngine flow) {
     return QuantPanel(
+      padding: const EdgeInsets.all(14),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -763,12 +865,10 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
           Row(
             children: [
               Text('▲ ${flow.buyPressureCount} BUY PRESSURE',
-                  style:
-                      QuantTheme.mono(size: 10, color: QuantTheme.positive)),
+                  style: QuantTheme.mono(size: 10, color: QuantTheme.positive)),
               const SizedBox(width: 12),
               Text('▼ ${flow.sellPressureCount} SELL PRESSURE',
-                  style:
-                      QuantTheme.mono(size: 10, color: QuantTheme.negative)),
+                  style: QuantTheme.mono(size: 10, color: QuantTheme.negative)),
             ],
           ),
           const SizedBox(height: 10),
@@ -777,7 +877,7 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
               padding: const EdgeInsets.symmetric(vertical: 18),
               child: Center(
                 child: Text(
-                  'NO DATA — Connect Angel One API to visualize live sectoral order flow.',
+                  'NO DATA — Connect Angel One API to stream live order flow.',
                   textAlign: TextAlign.center,
                   style: QuantTheme.mono(size: 11, color: QuantTheme.negative),
                 ),
@@ -827,6 +927,7 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
     }
 
     return QuantPanel(
+      padding: const EdgeInsets.all(14),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -870,6 +971,7 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
         : (bias == 'bearish' ? QuantTheme.negative : QuantTheme.warning);
 
     return QuantPanel(
+      padding: const EdgeInsets.all(14),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -900,4 +1002,113 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
       ),
     );
   }
+}
+
+class _ConstituentRotationPainter extends CustomPainter {
+  final List<ConstituentFlowItem> outflows;
+  final List<ConstituentFlowItem> inflows;
+  final double animValue;
+
+  _ConstituentRotationPainter({
+    required this.outflows,
+    required this.inflows,
+    required this.animValue,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final leftX = 88.0;
+    final rightX = size.width - 88.0;
+    final midX = size.width * 0.5;
+    final midY = size.height * 0.5;
+
+    final maxTurn = math.max(
+      1.0,
+      [...outflows, ...inflows].fold<double>(
+          1.0, (m, e) => math.max(m, e.turnoverCr)),
+    );
+
+    void drawList(List<ConstituentFlowItem> list, bool isLeft) {
+      final n = list.length;
+      if (n == 0) return;
+      for (int i = 0; i < n; i++) {
+        final item = list[i];
+        final y = (size.height / (n + 1)) * (i + 1);
+        final col = isLeft ? QuantTheme.negative : QuantTheme.positive;
+        final strokeW =
+            (1.2 + 2.4 * (item.turnoverCr / maxTurn)).clamp(1.2, 3.6).toDouble();
+
+        final path = Path();
+        if (isLeft) {
+          path.moveTo(leftX, y);
+          path.cubicTo(leftX + 35, y, midX - 25, midY, midX, midY);
+        } else {
+          path.moveTo(midX, midY);
+          path.cubicTo(midX + 25, midY, rightX - 35, y, rightX, y);
+        }
+        canvas.drawPath(
+          path,
+          Paint()
+            ..color = col.withOpacity(0.45)
+            ..strokeWidth = strokeW
+            ..style = PaintingStyle.stroke,
+        );
+
+        // Animated flow dot along Bezier curve
+        final t = (animValue + i * 0.19) % 1.0;
+        final sx = isLeft ? leftX : midX;
+        final sy = isLeft ? y : midY;
+        final ex = isLeft ? midX : rightX;
+        final ey = isLeft ? midY : y;
+        final px = sx + (ex - sx) * t;
+        final py = sy + (ey - sy) * t;
+        canvas.drawCircle(Offset(px, py), 2.5, Paint()..color = col);
+
+        final lbl =
+            '${item.symbol} ${item.changePct >= 0 ? "+" : ""}${item.changePct.toStringAsFixed(1)}%';
+        final tp = TextPainter(
+          text: TextSpan(
+            text: lbl,
+            style: QuantTheme.mono(size: 8.5, color: col, weight: FontWeight.w700),
+          ),
+          textDirection: TextDirection.ltr,
+        )..layout(maxWidth: 84);
+        tp.paint(
+          canvas,
+          Offset(isLeft ? 2 : rightX + 4, y - tp.height / 2),
+        );
+      }
+    }
+
+    drawList(outflows, true);
+    drawList(inflows, false);
+
+    // Center hub
+    canvas.drawCircle(
+      Offset(midX, midY),
+      15,
+      Paint()..color = QuantTheme.bgElevated,
+    );
+    canvas.drawCircle(
+      Offset(midX, midY),
+      15,
+      Paint()
+        ..color = QuantTheme.accent
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.4,
+    );
+    final hubTp = TextPainter(
+      text: TextSpan(
+        text: 'FLOW',
+        style: QuantTheme.mono(
+            size: 7.5, color: QuantTheme.accent, weight: FontWeight.w800),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    hubTp.paint(canvas, Offset(midX - hubTp.width / 2, midY - hubTp.height / 2));
+  }
+
+  @override
+  bool shouldRepaint(covariant _ConstituentRotationPainter oldDelegate) =>
+      true;
 }

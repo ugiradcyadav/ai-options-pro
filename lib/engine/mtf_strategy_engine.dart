@@ -1,9 +1,10 @@
 import 'dart:math' as math;
 import '../core/models.dart';
 import '../data/strike_selector.dart';
-import 'ai_recalibration_engine.dart';
 import 'math_greeks.dart';
+import 'regime_engine.dart';
 import 'risk_engine.dart';
+import 'sadhu_ml_engine.dart';
 import 'strategy_settings.dart';
 
 class MarketSenseResult {
@@ -14,16 +15,22 @@ class MarketSenseResult {
 }
 
 class MtfStrategyEngine {
-  // Documented symmetric directional thresholds (WP-8)
   static const double bullishPcrThreshold = 1.05;
   static const double bearishPcrThreshold = 0.95;
   static const double maxChopRegimeProb = 0.62;
+
+  static bool isPastEntryCutoffIst(int timestampMs) {
+    final ist = DateTime.fromMillisecondsSinceEpoch(timestampMs, isUtc: true)
+        .add(const Duration(hours: 5, minutes: 30));
+    return (ist.hour * 60 + ist.minute) >= (15 * 60 + 10);
+  }
 
   static MarketSenseResult evaluateMarketSense({
     required List<StrikeRowSnapshot> chainRows,
     required double spot,
     required String expiryIso,
     required DataHealthStatus dataHealth,
+    MeasuredRegimeSnapshot? regime,
   }) {
     if (dataHealth != DataHealthStatus.live || chainRows.isEmpty || spot <= 0) {
       return const MarketSenseResult(
@@ -67,45 +74,48 @@ class MtfStrategyEngine {
       spot,
       timeYears: tYears,
     );
-    final surf = MathGreeksEngine.evaluateIvSurface(chainRows, spot);
-    final ai = AiRecalibrationEngine.instance;
 
-    String badge = 'Neutral';
-    String dirText = 'No directional edge (PCR & OI flow neutral)';
-    if (validOiDiffs > 0 &&
-        pcr >= bullishPcrThreshold &&
-        netOiFlowLots > 0) {
-      badge = 'Bullish';
-      dirText = 'Symmetric Bullish Bias (Put OI build > Call OI build)';
-    } else if (validOiDiffs > 0 &&
-        pcr > 0 &&
-        pcr <= bearishPcrThreshold &&
-        netOiFlowLots < 0) {
-      badge = 'Bearish';
-      dirText = 'Symmetric Bearish Bias (Call OI build > Put OI build)';
-    }
-
+    final atmIvStr = atmRow?.ceIv != null
+        ? '${atmRow!.ceIv!.toStringAsFixed(2)}%'
+        : 'N/A';
     final oiFlowStr = validOiDiffs > 0
         ? '${netOiFlowLots >= 0 ? "+" : ""}$netOiFlowLots lots'
-        : 'Collecting ${settings.lookbackMinutes}m history';
-    final atmIvStr =
-        surf.atmIv != null ? '${surf.atmIv!.toStringAsFixed(2)}%' : 'N/A';
-    final flipStr = gex.gammaFlipSpot != null
-        ? gex.gammaFlipSpot!.toStringAsFixed(1)
-        : 'N/A';
+        : 'Collecting';
+    final flipStr =
+        gex.gammaFlipSpot != null ? gex.gammaFlipSpot!.toStringAsFixed(0) : 'N/A';
+    final ml = SadhuMlEngine.instance;
+
+    String badge = 'Neutral';
+    if (regime != null && regime.hasSufficientData) {
+      if (regime.regimeLabel == 'TRENDING BULL' && pcr >= bullishPcrThreshold) {
+        badge = 'Bullish';
+      } else if (regime.regimeLabel == 'TRENDING BEAR' &&
+          pcr <= bearishPcrThreshold) {
+        badge = 'Bearish';
+      } else if (regime.chopProb > maxChopRegimeProb) {
+        badge = 'Chop';
+      }
+    } else if (pcr >= bullishPcrThreshold && netOiFlowLots > 0) {
+      badge = 'Bullish';
+    } else if (pcr <= bearishPcrThreshold && netOiFlowLots < 0) {
+      badge = 'Bearish';
+    }
+
+    final regimeLine = regime != null
+        ? '${regime.regimeLabel} | ${regime.summaryNote}'
+        : 'Collecting 1m spot bars for measured regime';
 
     return MarketSenseResult(
       badge: badge,
-      headline: '$dirText\n'
-          '• Model: ${ai.activeModel.version} | Gate A5: ${ai.activeModel.passedEvaluationGate ? "PASSED" : "Rules-Only"}\n'
-          '• HMM: Bull ${(ai.probBullRegime * 100).toStringAsFixed(0)}% | Bear ${(ai.probBearRegime * 100).toStringAsFixed(0)}% | Chop ${(ai.probChopRegime * 100).toStringAsFixed(0)}%\n'
+      headline:
+          '• Sadhu ML: ${ml.isTrained ? ml.lastReport.note : "Untrained (Rules Fallback)"}\n'
+          '• Regime: $regimeLine\n'
           '• PCR: ${pcr.toStringAsFixed(2)} | ${settings.lookbackMinutes}m Net OI: $oiFlowStr | ATM IV: $atmIvStr\n'
-          '• GEX: ${gex.netGexCr >= 0 ? "+" : ""}${gex.netGexCr.toStringAsFixed(2)} Cr | Flip: $flipStr | Walls: ${gex.putWallStrike}/${gex.callWallStrike} | MaxPain: ${gex.maxPainStrike}\n'
-          '• Note: ${gex.assumptionNote}',
+          '• GEX: ${gex.netGexCr >= 0 ? "+" : ""}${gex.netGexCr.toStringAsFixed(2)} Cr | Flip: $flipStr | Walls: ${gex.putWallStrike}/${gex.callWallStrike} | MaxPain: ${gex.maxPainStrike}',
     );
   }
 
-  /// WP-8: SINGLE SOURCE OF TRUTH strategy function called by BOTH live engine and backtester
+  /// Stateless SINGLE SOURCE OF TRUTH called by both live AppState and per-contract BacktestEngine
   static AiSignal evaluateEntry({
     required UnderlyingIndex index,
     required String expiry,
@@ -123,9 +133,8 @@ class MtfStrategyEngine {
   }) {
     final nowMs = timestampMsOverride ?? DateTime.now().millisecondsSinceEpoch;
     final settings = settingsOverride ?? StrategySettingsEngine.instance.current;
-    final ai = AiRecalibrationEngine.instance;
 
-    // 1. Fail-closed data health & contract presence checks
+    // 1. Fail-closed data health, contract presence & H4 15:10 IST cut-off
     if (dataHealth != DataHealthStatus.live) {
       return _noTrade(index, expiry, nowMs,
           'NO DATA: Feed status is ${dataHealth.label} (LIVE required)');
@@ -134,20 +143,27 @@ class MtfStrategyEngine {
       return _noTrade(
           index, expiry, nowMs, 'NO DATA: Missing live spot, expiry, or chain');
     }
+    if (isPastEntryCutoffIst(nowMs)) {
+      return _noTrade(index, expiry, nowMs,
+          'BLOCKED: Past 15:10 IST entry cut-off (15:15 forced exit)');
+    }
 
-    // Update HMM strictly on new SPOT bars
-    ai.updateHmmRegime(recentSpotBars: recentSpotBars);
-
-    if (ai.probChopRegime > maxChopRegimeProb) {
+    // 2. Pure stateless Measured Market Regime (fixes C3 global state corruption)
+    final regime = RegimeEngine.evaluate(
+      indexLabel: index.label,
+      spotBars: recentSpotBars,
+      liveSpot: spot,
+    );
+    if (regime.hasSufficientData && regime.chopProb > maxChopRegimeProb) {
       return _noTrade(
         index,
         expiry,
         nowMs,
-        'Abstained: HMM Chop regime probability ${(ai.probChopRegime * 100).toStringAsFixed(0)}% > ${(maxChopRegimeProb * 100).toStringAsFixed(0)}%',
+        'Abstained: Measured Chop ${(regime.chopProb * 100).toStringAsFixed(0)}% > ${(maxChopRegimeProb * 100).toStringAsFixed(0)}% (${regime.summaryNote})',
       );
     }
 
-    // 2. Resolve ATM strike row from real chain
+    // 3. Resolve ATM row & aggregate real OI across full chain
     StrikeRowSnapshot? atmRow;
     int minDiff = 999999;
     int totalCeOi = 0;
@@ -180,7 +196,6 @@ class MtfStrategyEngine {
       return _noTrade(
           index, expiry, nowMs, 'BLOCKED: ATM strike or master lotSize missing');
     }
-
     if (validOiDiffRows == 0) {
       return _noTrade(
         index,
@@ -189,19 +204,18 @@ class MtfStrategyEngine {
         'WAITING: Collecting real ${settings.lookbackMinutes}m OI snapshot history',
       );
     }
-
     if (totalCeOi <= 0 || totalPeOi <= 0) {
-      return _noTrade(index, expiry, nowMs, 'NO DATA: Zero total option OI');
+      return _noTrade(index, expiry, nowMs, 'NO DATA: Zero total CE or PE OI');
     }
 
-    // 3. Compute real signed spot momentum from recent SPOT bars (no placeholder constants)
+    // 4. Real signed spot momentum from recent SPOT bars
     final spotSorted = recentSpotBars
         .where((b) => b.optionType.toUpperCase() == 'SPOT' && b.close > 0)
         .toList()
       ..sort((a, b) => a.timestampMs.compareTo(b.timestampMs));
     if (spotSorted.length < 4) {
       return _noTrade(index, expiry, nowMs,
-          'WAITING: Need >= 4 real 1m SPOT bars for momentum (${spotSorted.length} stored)');
+          'WAITING: Need >= 4 real 1m SPOT bars (${spotSorted.length} stored)');
     }
     final latestSpotClose = spotSorted.last.close;
     final prevSpotClose = spotSorted[spotSorted.length - 4].close;
@@ -209,38 +223,41 @@ class MtfStrategyEngine {
 
     final pcr = totalPeOi / totalCeOi.toDouble();
     final netOiFlowLots = totalPeOiChg - totalCeOiChg;
-    final totalOiLots = (totalCeOi + totalPeOi).toDouble();
-    final signedOiRatio = (netOiFlowLots / totalOiLots).clamp(-1.0, 1.0);
     final reqOiLots = settings.oiThresholdForIndex(index);
 
-    // 4. WP-8 Symmetric Bullish / Bearish / No-Trade Rules
+    final bullRegimeOk =
+        !regime.hasSufficientData || regime.bullProb >= regime.bearProb;
+    final bearRegimeOk =
+        !regime.hasSufficientData || regime.bearProb >= regime.bullProb;
+
     SignalAction direction = SignalAction.noTrade;
     if (pcr >= bullishPcrThreshold &&
         netOiFlowLots >= reqOiLots &&
         signedSpotMom > 0.0003 &&
-        ai.probBullRegime > ai.probBearRegime) {
+        bullRegimeOk) {
       direction = SignalAction.buyCe;
     } else if (pcr <= bearishPcrThreshold &&
         netOiFlowLots <= -reqOiLots &&
         signedSpotMom < -0.0003 &&
-        ai.probBearRegime > ai.probBullRegime) {
+        bearRegimeOk) {
       direction = SignalAction.buyPe;
     } else {
       return _noTrade(
         index,
         expiry,
         nowMs,
-        'NO TRADE: Symmetric criteria not met (PCR ${pcr.toStringAsFixed(2)}, ΔOI $netOiFlowLots lots, Mom ${(signedSpotMom * 100).toStringAsFixed(3)}%)',
+        'NO TRADE: Criteria unmet (PCR ${pcr.toStringAsFixed(2)}, ΔOI $netOiFlowLots, Mom ${(signedSpotMom * 100).toStringAsFixed(3)}%)',
       );
     }
 
     final isCall = direction == SignalAction.buyCe;
     final secId = isCall ? atmRow.ceSecurityId : atmRow.peSecurityId;
-    final tradingSym =
-        isCall ? atmRow.ceTradingSymbol : atmRow.peTradingSymbol;
+    final tradingSym = isCall ? atmRow.ceTradingSymbol : atmRow.peTradingSymbol;
     final entryPrem = isCall ? atmRow.ceLtp : atmRow.peLtp;
     final optIv = isCall ? atmRow.ceIv : atmRow.peIv;
     final optVol = isCall ? atmRow.ceVolume : atmRow.peVolume;
+    final optOi = isCall ? atmRow.ceOi : atmRow.peOi;
+    final optOiChg15 = isCall ? atmRow.ceOiChange15m : atmRow.peOiChange15m;
     final optDelta = isCall ? atmRow.ceDelta : atmRow.peDelta;
     final optTheta = isCall ? atmRow.ceTheta : atmRow.peTheta;
     final optBid = isCall ? atmRow.ceBid : atmRow.peBid;
@@ -249,15 +266,13 @@ class MtfStrategyEngine {
     final optImb = isCall ? atmRow.ceImbalance : atmRow.peImbalance;
 
     if (secId.isEmpty || entryPrem < 2.0) {
-      return _noTrade(index, expiry, nowMs,
-          'BLOCKED: Contract unresolved or premium < ₹2');
+      return _noTrade(
+          index, expiry, nowMs, 'BLOCKED: Contract unresolved or premium < ₹2');
     }
-
     if (optVol < settings.minVolumeFilter) {
       return _noTrade(index, expiry, nowMs,
           'FILTERED: Volume ($optVol) < min filter (${settings.minVolumeFilter})');
     }
-
     if (optIv == null ||
         optIv < settings.minIvPct ||
         optIv > settings.maxIvPct) {
@@ -265,41 +280,39 @@ class MtfStrategyEngine {
         index,
         expiry,
         nowMs,
-        'FILTERED: IV (${optIv?.toStringAsFixed(2) ?? "N/A"}%) outside [${settings.minIvPct}–${settings.maxIvPct}%]',
+        'FILTERED: IV (${optIv?.toStringAsFixed(2) ?? "N/A"}%) outside [${settings.minIvPct}-${settings.maxIvPct}%]',
       );
     }
 
-    // 5. WP-8: Wire in volForecast — reject trade if holding-window theta decay exceeds expected favorable move
-    final volForecast = MathGreeksEngine.computeVolForecast(
-      recentSpotBars: spotSorted,
-      currentAtmIvPct: optIv,
-      spot: spot,
-      holdingMinutes: settings.timeExitMinutes.toDouble(),
-    );
-    if (volForecast.expectedMovePoints != null && optTheta < 0) {
-      final expectedOptMove =
-          optDelta.abs() * volForecast.expectedMovePoints!;
-      final holdingThetaLoss =
-          optTheta.abs() * (settings.timeExitMinutes / (24.0 * 60.0));
-      if (holdingThetaLoss > expectedOptMove) {
-        return _noTrade(
-          index,
-          expiry,
-          nowMs,
-          'FILTERED: Theta decay (₹${holdingThetaLoss.toStringAsFixed(2)}) > expected favorable move (₹${expectedOptMove.toStringAsFixed(2)})',
-        );
-      }
+    double spreadPct = 0.25;
+    if (optBid != null && optAsk != null && optBid > 0 && optAsk >= optBid) {
+      final mid = 0.5 * (optBid + optAsk);
+      if (mid > 0) spreadPct = ((optAsk - optBid) / mid) * 100.0;
     }
 
-    // 6. Signed shadow score & Gate-A5-aware position sizing
-    final confidence = ai.scoreEnsembleConfidence(
-      isCallSignal: isCall,
-      signedOiScore: signedOiRatio,
-      signedMomentumScore: (signedSpotMom * 100.0).clamp(-1.0, 1.0),
-      signedOrderBookImbalance: optImb ?? 0.0,
-      signedPcrBias: (pcr - 1.0).clamp(-1.0, 1.0),
-      deltaAbsQuality: optDelta.abs(),
-    );
+    // 5. Sadhu AI ML Calibrated Probability (H1 fix: no fake hardcoded weights)
+    final mlFeatures = <double>[
+      signedSpotMom * (isCall ? 1.0 : -1.0) * 5.0,
+      signedSpotMom,
+      optImb ?? 0.0,
+      (optOiChg15 ?? 0) / math.max(1, optOi).toDouble(),
+      optIv / 100.0,
+      optDelta.abs(),
+      spreadPct / 100.0,
+    ];
+    final mlPred = SadhuMlEngine.instance.predict(mlFeatures);
+    if (mlPred.isTrained && mlPred.calibratedProb < 0.52) {
+      return _noTrade(
+        index,
+        expiry,
+        nowMs,
+        'Sadhu ML Filtered: Calibrated P(Win) ${(mlPred.calibratedProb * 100).toStringAsFixed(1)}% < 52%',
+      );
+    }
+
+    final confidence = mlPred.isTrained
+        ? (mlPred.calibratedProb * 100.0).clamp(1.0, 99.0).toDouble()
+        : 50.0;
 
     final targetPct = settings.targetPctForIndex(index) / 100.0;
     final stopPct = settings.stopLossPctForIndex(index) / 100.0;
@@ -314,7 +327,7 @@ class MtfStrategyEngine {
       lotSize: atmRow.lotSize,
       availableCapital: availableCapital,
       config: riskConfig,
-      useModelProbability: ai.activeModel.passedEvaluationGate,
+      useModelProbability: mlPred.isTrained,
     );
 
     final rawSig = AiSignal(
@@ -327,10 +340,10 @@ class MtfStrategyEngine {
       action: direction,
       confidencePct: confidence,
       htfOiReason:
-          'Symmetric ${isCall ? "Bullish" : "Bearish"} • PCR ${pcr.toStringAsFixed(2)} | ${settings.lookbackMinutes}m ΔOI $netOiFlowLots lots',
+          '${isCall ? "Bullish" : "Bearish"} • PCR ${pcr.toStringAsFixed(2)} | ${settings.lookbackMinutes}m ΔOI $netOiFlowLots lots',
       reasons: [
-        'Mode: ${ai.activeModel.passedEvaluationGate ? "Verified Model" : "Rules-Only (Gate A5 pending)"}',
-        'Forward-HMM: Bull ${(ai.probBullRegime * 100).toStringAsFixed(0)}% | Bear ${(ai.probBearRegime * 100).toStringAsFixed(0)}% | Chop ${(ai.probChopRegime * 100).toStringAsFixed(0)}%',
+        mlPred.statusNote,
+        'Regime: ${regime.regimeLabel} (${regime.summaryNote})',
         'Black-76 IV: ${optIv.toStringAsFixed(2)}% | Δ ${optDelta.toStringAsFixed(3)} | Θ ${optTheta.toStringAsFixed(2)}/d',
       ],
       entryPremium: entryPrem,
@@ -343,7 +356,9 @@ class MtfStrategyEngine {
       strategyPassed: true,
       riskWithinLimits: false,
       riskNote: 'Pending Risk Gate',
-      modelVersion: ai.activeModel.version,
+      modelVersion: mlPred.isTrained
+          ? 'Sadhu-ML-Boosted-v1'
+          : 'Sadhu-ML-Untrained (Rules)',
     );
 
     return RiskEngine.validateAndEnforceRisk(
@@ -356,7 +371,7 @@ class MtfStrategyEngine {
       bidPrice: optBid,
       askPrice: optAsk,
       topAskQty: optAskQty,
-      enforceEvGate: ai.activeModel.passedEvaluationGate,
+      enforceEvGate: mlPred.isTrained,
     );
   }
 
@@ -381,7 +396,9 @@ class MtfStrategyEngine {
       strategyPassed: false,
       riskWithinLimits: false,
       riskNote: reason,
-      modelVersion: AiRecalibrationEngine.instance.activeModel.version,
+      modelVersion: SadhuMlEngine.instance.isTrained
+          ? 'Sadhu-ML-Boosted-v1'
+          : 'Sadhu-ML-Untrained',
     );
   }
 }

@@ -20,6 +20,10 @@ class AngelSmartApiEngine {
   );
 
   static const _kBrokerChoice = 'selected_broker_v1';
+  static const _kSpApiKey = 'sp_angel_api_key_v1';
+  static const _kSpClientCode = 'sp_angel_client_code_v1';
+  static const _kSpOptInTotp = 'sp_angel_optin_totp_v1';
+
   static const _kAngelApiKey = 'sec_angel_api_key';
   static const _kAngelClientCode = 'sec_angel_client_code';
   static const _kAngelPin = 'sec_angel_pin';
@@ -31,6 +35,7 @@ class AngelSmartApiEngine {
   String clientCode = '';
   String _pin = '';
   String _totpKey = '';
+  bool optInTotpSaved = false;
   String jwtToken = '';
   String feedToken = '';
   String lastError = '';
@@ -39,17 +44,74 @@ class AngelSmartApiEngine {
   String _resolvedPublicIp = '';
   static const String _androidOsMac = '02:00:00:00:00:00';
 
-  // Throttle SQLite snapshot writes to once every 30s per index to prevent UI/feed choke
   final Map<String, int> _lastDbPersistMsByIndex = {};
   final Map<String, Map<String, int?>> _cachedOiDeltas = {};
 
+  String get savedPin => _pin;
+  String get savedTotpKey => _totpKey;
+
+  Future<String> _safeSecureRead(String key) async {
+    try {
+      return (await _secure.read(key: key)) ?? '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  Future<void> _safeSecureWrite(String key, String value) async {
+    try {
+      if (value.isEmpty) {
+        await _secure.delete(key: key);
+      } else {
+        await _secure.write(key: key, value: value);
+      }
+    } catch (_) {}
+  }
+
+  /// Decodes JWT payload `exp` claim to check real session validity (60s safety buffer)
+  static DateTime? parseJwtExpiryUtc(String token) {
+    final clean = token.trim();
+    if (clean.isEmpty) return null;
+    try {
+      final parts = clean.split('.');
+      if (parts.length != 3) return null;
+      final normalized = base64Url.normalize(parts[1]);
+      final jsonStr = utf8.decode(base64Url.decode(normalized));
+      final map = jsonDecode(jsonStr);
+      if (map is Map && map['exp'] is num) {
+        final expSec = (map['exp'] as num).toInt();
+        return DateTime.fromMillisecondsSinceEpoch(expSec * 1000, isUtc: true);
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  static bool isJwtValid(String token, {DateTime? nowUtc}) {
+    final clean = token.trim();
+    if (clean.isEmpty) return false;
+    final exp = parseJwtExpiryUtc(clean);
+    if (exp == null) return true; // Non-JWT opaque token fallback
+    final now = nowUtc ?? DateTime.now().toUtc();
+    return now.isBefore(exp.subtract(const Duration(seconds: 60)));
+  }
+
+  bool get hasValidJwt => isJwtValid(jwtToken);
+
   Future<void> loadSavedConfig() async {
-    apiKey = await _secure.read(key: _kAngelApiKey) ?? '';
-    clientCode = await _secure.read(key: _kAngelClientCode) ?? '';
-    _pin = await _secure.read(key: _kAngelPin) ?? '';
-    _totpKey = await _secure.read(key: _kAngelTotpKey) ?? '';
-    jwtToken = await _secure.read(key: _kAngelJwtToken) ?? '';
-    feedToken = await _secure.read(key: _kAngelFeedToken) ?? '';
+    final prefs = await SharedPreferences.getInstance();
+    final secApi = await _safeSecureRead(_kAngelApiKey);
+    final secClient = await _safeSecureRead(_kAngelClientCode);
+
+    apiKey = secApi.isNotEmpty ? secApi : (prefs.getString(_kSpApiKey) ?? '');
+    clientCode = secClient.isNotEmpty
+        ? secClient
+        : (prefs.getString(_kSpClientCode) ?? '');
+    _pin = await _safeSecureRead(_kAngelPin);
+    _totpKey = await _safeSecureRead(_kAngelTotpKey);
+    optInTotpSaved =
+        _totpKey.isNotEmpty || (prefs.getBool(_kSpOptInTotp) ?? false);
+    jwtToken = await _safeSecureRead(_kAngelJwtToken);
+    feedToken = await _safeSecureRead(_kAngelFeedToken);
   }
 
   static Future<String> getSelectedBroker() async {
@@ -65,7 +127,7 @@ class AngelSmartApiEngine {
   bool get isConfigured =>
       apiKey.trim().isNotEmpty &&
       clientCode.trim().isNotEmpty &&
-      (jwtToken.isNotEmpty || _pin.isNotEmpty || _totpKey.isNotEmpty);
+      (hasValidJwt || (_pin.isNotEmpty && _totpKey.isNotEmpty) || _pin.isNotEmpty);
 
   Future<void> _ensureRealNetworkInfo() async {
     if (_resolvedLocalIp.isEmpty || _resolvedLocalIp == '127.0.0.1') {
@@ -112,12 +174,14 @@ class AngelSmartApiEngine {
   }
 
   Map<String, String> _buildHeaders({bool includeAuth = true}) {
-    final localIp = _resolvedLocalIp.isNotEmpty ? _resolvedLocalIp : '192.168.1.1';
-    final publicIp = _resolvedPublicIp.isNotEmpty ? _resolvedPublicIp : localIp;
+    final localIp =
+        _resolvedLocalIp.isNotEmpty ? _resolvedLocalIp : '192.168.1.1';
+    final publicIp =
+        _resolvedPublicIp.isNotEmpty ? _resolvedPublicIp : localIp;
     final h = <String, String>{
       'Content-Type': 'application/json',
       'Accept': 'application/json',
-      'User-Agent': 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36',
+      'User-Agent': 'SadhuAI-Android/5.0',
       'X-UserType': 'USER',
       'X-SourceID': 'WEB',
       'X-ClientLocalIP': localIp,
@@ -145,11 +209,11 @@ class AngelSmartApiEngine {
             .toString()
             .trim();
         if (code.isNotEmpty || msg.isNotEmpty) {
-          return '[v3.5] Angel rejected (${code.isNotEmpty ? code : "HTTP ${resp.statusCode}"}): $msg';
+          return '[Sadhu AI] Angel rejected (${code.isNotEmpty ? code : "HTTP ${resp.statusCode}"}): $msg';
         }
       }
     } catch (_) {}
-    return '[v3.5] Angel login failed (HTTP ${resp.statusCode}, IP: $_resolvedPublicIp).';
+    return '[Sadhu AI] Angel login failed (HTTP ${resp.statusCode}).';
   }
 
   Future<bool> loginAndSave({
@@ -159,27 +223,38 @@ class AngelSmartApiEngine {
     String newTotpSecret = '',
     String oneTimeOtp = '',
     bool optInStoreTotp = false,
+    bool rememberPin = true,
   }) async {
     apiKey = newApiKey.trim();
     clientCode = newClientCode.trim().toUpperCase();
+    final trimmedPin = newPin.trim();
     final cleanTotpKey =
         newTotpSecret.trim().toUpperCase().replaceAll(RegExp(r'[^A-Z2-7]'), '');
 
-    await _secure.write(key: _kAngelApiKey, value: apiKey);
-    await _secure.write(key: _kAngelClientCode, value: clientCode);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kSpApiKey, apiKey);
+    await prefs.setString(_kSpClientCode, clientCode);
+    await prefs.setBool(_kSpOptInTotp, optInStoreTotp && cleanTotpKey.isNotEmpty);
+
+    await _safeSecureWrite(_kAngelApiKey, apiKey);
+    await _safeSecureWrite(_kAngelClientCode, clientCode);
+
+    if (rememberPin && trimmedPin.isNotEmpty) {
+      _pin = trimmedPin;
+      await _safeSecureWrite(_kAngelPin, _pin);
+    } else if (!rememberPin) {
+      _pin = '';
+      await _safeSecureWrite(_kAngelPin, '');
+    }
 
     if (optInStoreTotp && cleanTotpKey.isNotEmpty) {
       _totpKey = cleanTotpKey;
-      _pin = '';
-      await _secure.write(key: _kAngelTotpKey, value: cleanTotpKey);
-      await _secure.delete(key: _kAngelPin);
+      optInTotpSaved = true;
+      await _safeSecureWrite(_kAngelTotpKey, _totpKey);
     } else {
       _totpKey = '';
-      _pin = newPin.trim();
-      await _secure.delete(key: _kAngelTotpKey);
-      if (_pin.isNotEmpty) {
-        await _secure.write(key: _kAngelPin, value: _pin);
-      }
+      optInTotpSaved = false;
+      await _safeSecureWrite(_kAngelTotpKey, '');
     }
 
     await setSelectedBroker('ANGEL');
@@ -190,7 +265,7 @@ class AngelSmartApiEngine {
             : '');
     return ensureSession(
       forceLogin: true,
-      ephemeralPin: newPin.trim(),
+      ephemeralPin: trimmedPin,
       ephemeralOtp: otpToUse,
     );
   }
@@ -202,7 +277,9 @@ class AngelSmartApiEngine {
   }) async {
     await loadSavedConfig();
     await _ensureRealNetworkInfo();
-    if (!forceLogin && jwtToken.isNotEmpty) {
+
+    // Reuse saved JWT only if it is actually unexpired
+    if (!forceLogin && jwtToken.isNotEmpty && isJwtValid(jwtToken)) {
       return true;
     }
 
@@ -213,8 +290,12 @@ class AngelSmartApiEngine {
             ? TotpAuthManager.generateTotpCode(_totpKey)
             : '');
 
-    if (apiKey.isEmpty || clientCode.isEmpty || usePin.isEmpty || useOtp.isEmpty) {
-      lastError = '[v3.5] Missing API Key, Client Code, MPIN, or 6-digit OTP.';
+    if (apiKey.isEmpty ||
+        clientCode.isEmpty ||
+        usePin.isEmpty ||
+        useOtp.isEmpty) {
+      lastError =
+          '[Sadhu AI] Session expired — enter 6-digit OTP (or enable Auto-TOTP secret).';
       return false;
     }
 
@@ -237,8 +318,8 @@ class AngelSmartApiEngine {
         if (body is Map && body['status'] == true && body['data'] != null) {
           jwtToken = (body['data']['jwtToken'] ?? '').toString();
           feedToken = (body['data']['feedToken'] ?? '').toString();
-          await _secure.write(key: _kAngelJwtToken, value: jwtToken);
-          await _secure.write(key: _kAngelFeedToken, value: feedToken);
+          await _safeSecureWrite(_kAngelJwtToken, jwtToken);
+          await _safeSecureWrite(_kAngelFeedToken, feedToken);
           lastError = '';
           return true;
         }
@@ -248,13 +329,54 @@ class AngelSmartApiEngine {
       lastError = _extractSafeBrokerError(resp);
       return false;
     } catch (_) {
-      lastError = '[v3.5] Network timeout connecting to Angel One.';
+      lastError = '[Sadhu AI] Network timeout connecting to Angel One.';
       return false;
     }
   }
 
+  /// Batch market quote fetcher (up to 50 tokens per chunk) for constituents & sectors
+  Future<List<Map<String, dynamic>>> fetchBatchMarketQuotes({
+    required String exchange,
+    required List<String> tokens,
+  }) async {
+    if (tokens.isEmpty) return const [];
+    await _ensureRealNetworkInfo();
+    if (!hasValidJwt) {
+      final ok = await ensureSession();
+      if (!ok) return const [];
+    }
+
+    final results = <Map<String, dynamic>>[];
+    for (int start = 0; start < tokens.length; start += 50) {
+      final end = (start + 50 > tokens.length) ? tokens.length : start + 50;
+      final chunk = tokens.sublist(start, end);
+      try {
+        final resp = await SafeBrokerHttp.post(
+          Uri.parse(
+              'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/'),
+          headers: _buildHeaders(),
+          body: jsonEncode({
+            'mode': 'FULL',
+            'exchangeTokens': {exchange: chunk},
+          }),
+          timeout: const Duration(seconds: 6),
+        );
+        if (resp.statusCode == 200) {
+          final body = jsonDecode(resp.body);
+          final fetched = body['data']?['fetched'] as List? ?? [];
+          for (final item in fetched) {
+            if (item is Map) {
+              results.add(Map<String, dynamic>.from(item));
+            }
+          }
+        }
+      } catch (_) {}
+    }
+    return results;
+  }
+
   Future<double?> fetchRmsCapital() async {
-    if (jwtToken.isEmpty) return null;
+    if (!hasValidJwt) return null;
     await _ensureRealNetworkInfo();
     try {
       final resp = await SafeBrokerHttp.get(
@@ -298,7 +420,7 @@ class AngelSmartApiEngine {
     required String expiryIso,
   }) async {
     await _ensureRealNetworkInfo();
-    if (jwtToken.isEmpty) {
+    if (!hasValidJwt) {
       final ok = await ensureSession();
       if (!ok) return null;
     }
@@ -313,40 +435,20 @@ class AngelSmartApiEngine {
     }
 
     final idxToken = spotTokenForIndex(index);
-    final spotExch = index.spotExchange; // 'NSE' or 'BSE'
-    final foExch = index.foExchange; // 'NFO' or 'BFO'
+    final spotExch = index.spotExchange;
+    final foExch = index.foExchange;
     double spot = 0.0;
     double changePct = 0.0;
     final exchangeTsMs = DateTime.now().millisecondsSinceEpoch;
 
-    try {
-      final spotResp = await SafeBrokerHttp.post(
-        Uri.parse(
-            'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/'),
-        headers: _buildHeaders(),
-        body: jsonEncode({
-          'mode': 'FULL',
-          'exchangeTokens': {
-            spotExch: [idxToken]
-          }
-        }),
-        timeout: const Duration(seconds: 5),
-      );
-
-      if (spotResp.statusCode == 200) {
-        final body = jsonDecode(spotResp.body);
-        final fetched = body['data']?['fetched'] as List? ?? [];
-        if (fetched.isNotEmpty) {
-          final item = fetched.first as Map;
-          spot = ((item['ltp'] ?? 0) as num).toDouble();
-          changePct = ((item['percentChange'] ?? 0) as num).toDouble();
-        }
-      } else {
-        lastError = 'Spot quote failed (HTTP ${spotResp.statusCode}).';
-        return null;
-      }
-    } catch (_) {
-      lastError = 'Spot quote network timeout.';
+    final spotFetched =
+        await fetchBatchMarketQuotes(exchange: spotExch, tokens: [idxToken]);
+    if (spotFetched.isNotEmpty) {
+      final item = spotFetched.first;
+      spot = ((item['ltp'] ?? 0) as num).toDouble();
+      changePct = ((item['percentChange'] ?? 0) as num).toDouble();
+    } else {
+      lastError = 'Spot quote unavailable for ${index.label}.';
       return null;
     }
 
@@ -392,37 +494,13 @@ class AngelSmartApiEngine {
       return null;
     }
 
+    final foFetched =
+        await fetchBatchMarketQuotes(exchange: foExch, tokens: foTokens);
     final Map<String, Map> quoteByToken = {};
-    for (int start = 0; start < foTokens.length; start += 50) {
-      final end = (start + 50 > foTokens.length)
-          ? foTokens.length
-          : start + 50;
-      final chunk = foTokens.sublist(start, end);
-      try {
-        final qResp = await SafeBrokerHttp.post(
-          Uri.parse(
-              'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/'),
-          headers: _buildHeaders(),
-          body: jsonEncode({
-            'mode': 'FULL',
-            'exchangeTokens': {foExch: chunk}
-          }),
-          timeout: const Duration(seconds: 5),
-        );
-
-        if (qResp.statusCode == 200) {
-          final qBody = jsonDecode(qResp.body);
-          final fetched = qBody['data']?['fetched'] as List? ?? [];
-          for (final f in fetched) {
-            if (f is Map) {
-              final tok = (f['symbolToken'] ?? '').toString();
-              if (tok.isNotEmpty) quoteByToken[tok] = f;
-            }
-          }
-        }
-      } catch (_) {}
+    for (final f in foFetched) {
+      final tok = (f['symbolToken'] ?? '').toString();
+      if (tok.isNotEmpty) quoteByToken[tok] = f;
     }
-
     if (quoteByToken.isEmpty) return null;
 
     final receivedAtMs = DateTime.now().millisecondsSinceEpoch;

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'core/ui_haptics.dart';
 import 'data/dhan_data_engine.dart';
 import 'data/forever_db.dart';
 import 'engine/strategy_settings.dart';
@@ -42,7 +43,7 @@ class AiOptionsProApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'AI Options Pro — Quant Terminal',
+      title: 'Sadhu AI — Quant Options Terminal',
       debugShowCheckedModeBanner: false,
       theme: QuantTheme.buildTheme(),
       home: MainTerminalShell(appState: globalAppState),
@@ -80,6 +81,7 @@ class _MainTerminalShellState extends State<MainTerminalShell> {
   }
 
   void _switchToTab(int idx) {
+    UiHaptics.tap();
     setState(() => _currentIndex = idx.clamp(0, 4));
   }
 
