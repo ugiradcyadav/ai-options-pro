@@ -177,7 +177,7 @@ class HomeScreen extends StatelessWidget {
               return Expanded(
                 child: QuantPanel(
                   margin: EdgeInsets.only(
-                      right: u != UnderlyingIndex.finNifty ? 6 : 0),
+                      right: u != UnderlyingIndex.values.last ? 6 : 0),
                   padding: const EdgeInsets.all(9),
                   backgroundColor:
                       active ? QuantTheme.bgElevated : QuantTheme.bgPanel,

@@ -116,7 +116,7 @@ class AppState extends ChangeNotifier {
   void setSelectedUnderlying(UnderlyingIndex index) {
     selectedIndex = index;
     DhanDataEngine.instance.activeStreamingIndex = index;
-    unawaited(DhanDataEngine.instance.fetchOptionChainSnapshot(index));
+    DhanDataEngine.instance.switchActiveIndex(index);
     unawaited(_evaluateCurrentIndexSignal());
     notifyListeners();
   }

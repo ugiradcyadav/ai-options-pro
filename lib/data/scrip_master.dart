@@ -14,6 +14,7 @@ class ScripMasterEngine {
     UnderlyingIndex.nifty50: [],
     UnderlyingIndex.bankNifty: [],
     UnderlyingIndex.finNifty: [],
+    UnderlyingIndex.sensex: [],
   };
   String _lastSyncDateKey = '';
 
@@ -34,6 +35,7 @@ class ScripMasterEngine {
       UnderlyingIndex.nifty50: <String>{},
       UnderlyingIndex.bankNifty: <String>{},
       UnderlyingIndex.finNifty: <String>{},
+      UnderlyingIndex.sensex: <String>{},
     };
 
     for (int i = 1; i < lines.length; i++) {

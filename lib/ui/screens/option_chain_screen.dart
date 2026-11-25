@@ -1,14 +1,15 @@
-import 'dart:math' as math;
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart' hide TextDirection;
 import '../../core/models.dart';
+import '../../data/angel_ws_streamer.dart';
 import '../../data/dhan_data_engine.dart';
 import '../../data/forever_db.dart';
 import '../../engine/iv_grid_engine.dart';
 import '../../engine/math_greeks.dart';
+import '../../engine/microstructure_engine.dart';
 import '../../engine/options_payoff_engine.dart';
 import '../../state/app_state.dart';
 import '../theme/quant_theme.dart';
+import '../widgets/pro_kline_chart.dart';
 import 'oi_analysis_screen.dart';
 import 'pulse_flow_screen.dart';
 
@@ -28,7 +29,7 @@ class OptionChainScreen extends StatefulWidget {
 
 class _OptionChainScreenState extends State<OptionChainScreen> {
   late String _workspaceTab;
-  String _chartTf = '5m';
+  String _chartTf = '1m';
   bool _compareSpotVsOption = true;
   bool _payoffIsCall = true;
   int _selectedOffset = 0;
@@ -54,18 +55,73 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
     final optBars = await ForeverDatabase.instance.getRecentBars(
       indexName: idxLabel,
       optionType: 'CE',
-      limit: 80,
+      limit: 120,
     );
     final spotBars = await ForeverDatabase.instance.getRecentBars(
       indexName: idxLabel,
       optionType: 'SPOT',
-      limit: 80,
+      limit: 120,
     );
     if (!mounted) return;
     setState(() {
       _intradayBars = optBars.reversed.toList();
       _spotBars = spotBars.reversed.toList();
     });
+  }
+
+  List<OneMinEnrichedBar> _aggregateBars(
+      List<OneMinEnrichedBar> raw, int bucketMins) {
+    if (bucketMins <= 1 || raw.length < 2) return raw;
+    final out = <OneMinEnrichedBar>[];
+    final bucketMs = bucketMins * 60000;
+    for (final b in raw) {
+      final key = (b.timestampMs ~/ bucketMs) * bucketMs;
+      if (out.isEmpty || out.last.timestampMs != key) {
+        out.add(OneMinEnrichedBar(
+          timestampMs: key,
+          contractId: b.contractId,
+          indexName: b.indexName,
+          expiry: b.expiry,
+          strike: b.strike,
+          optionType: b.optionType,
+          strikeOffset: b.strikeOffset,
+          underlyingSpot: b.underlyingSpot,
+          open: b.open,
+          high: b.high,
+          low: b.low,
+          close: b.close,
+          intervalVolume: b.intervalVolume,
+          absoluteOi: b.absoluteOi,
+          delta: b.delta,
+          gamma: b.gamma,
+          theta: b.theta,
+          vega: b.vega,
+        ));
+      } else {
+        final prev = out.last;
+        out[out.length - 1] = OneMinEnrichedBar(
+          timestampMs: key,
+          contractId: prev.contractId,
+          indexName: prev.indexName,
+          expiry: prev.expiry,
+          strike: prev.strike,
+          optionType: prev.optionType,
+          strikeOffset: prev.strikeOffset,
+          underlyingSpot: b.underlyingSpot,
+          open: prev.open,
+          high: b.high > prev.high ? b.high : prev.high,
+          low: b.low < prev.low ? b.low : prev.low,
+          close: b.close,
+          intervalVolume: prev.intervalVolume + b.intervalVolume,
+          absoluteOi: b.absoluteOi,
+          delta: b.delta,
+          gamma: b.gamma,
+          theta: b.theta,
+          vega: b.vega,
+        );
+      }
+    }
+    return out;
   }
 
   @override
@@ -77,7 +133,8 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
             expiries.contains(engine.selectedExpiry[idx]))
         ? engine.selectedExpiry[idx]!
         : (expiries.isNotEmpty ? expiries.first : '');
-    final rows = engine.optionChainRows[idx] ?? const <StrikeRowSnapshot>[];
+    final rows =
+        engine.optionChainRows[idx] ?? const <StrikeRowSnapshot>[];
     final spot = engine.spotPrices[idx] ?? 0.0;
     final chgPct = engine.spotChangePct[idx] ?? 0.0;
     final health = engine.dataHealth;
@@ -122,7 +179,8 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
                       tab,
                       style: QuantTheme.heading(
                         size: 11,
-                        color: active ? QuantTheme.bgMain : QuantTheme.textPrimary,
+                        color:
+                            active ? QuantTheme.bgMain : QuantTheme.textPrimary,
                       ),
                     ),
                   ),
@@ -131,7 +189,6 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
             ),
           ),
           const SizedBox(height: 10),
-
           QuantPanel(
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
             backgroundColor: QuantTheme.bgSecondary,
@@ -162,9 +219,11 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
                             ),
                           ),
                           child: Text(
-                            u.label,
+                            u.label.replaceAll(' 50', ''),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
                             style: QuantTheme.heading(
-                              size: 10,
+                              size: 9.5,
                               color: active
                                   ? QuantTheme.accent
                                   : QuantTheme.textSecondary,
@@ -246,11 +305,10 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
             ),
           ),
           const SizedBox(height: 10),
-
           if (_workspaceTab == 'Pulse & Flow')
             PulseFlowScreen(appState: widget.appState)
           else if (_workspaceTab == 'Charts')
-            _buildChartsWorkspace(idx, spot)
+            _buildChartsWorkspace(idx, rows, spot)
           else if (_workspaceTab == 'OI Analysis')
             OiAnalysisScreen(appState: widget.appState, embeddedMode: true)
           else if (_workspaceTab == 'IV & Greeks')
@@ -264,53 +322,18 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
     );
   }
 
-  Widget _buildChartsWorkspace(UnderlyingIndex idx, double spot) {
-    if (_intradayBars.isEmpty) {
-      return QuantPanel(
-        child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 20),
-          child: Center(
-            child: Text(
-              'NO DATA — Real 1-minute option bars will populate once broker feed is LIVE.',
-              textAlign: TextAlign.center,
-              style: QuantTheme.mono(size: 11, color: QuantTheme.negative),
-            ),
-          ),
-        ),
-      );
-    }
+  Widget _buildChartsWorkspace(
+      UnderlyingIndex idx, List<StrikeRowSnapshot> rows, double spot) {
+    final tfMins = _chartTf == '15m' ? 15 : (_chartTf == '5m' ? 5 : 1);
+    final barsToPlot = _aggregateBars(_intradayBars, tfMins);
 
-    double? rsi14;
-    double macdVal = 0.0, macdSignal = 0.0, vwapVal = spot;
-    if (_intradayBars.length >= 5) {
-      double gainSum = 0.0, lossSum = 0.0, pvSum = 0.0, vSum = 0.0;
-      double ema12 = _intradayBars.first.close, ema26 = ema12;
-      for (int i = 1; i < _intradayBars.length; i++) {
-        final diff = _intradayBars[i].close - _intradayBars[i - 1].close;
-        if (diff > 0) {
-          gainSum += diff;
-        } else {
-          lossSum += diff.abs();
-        }
-        final cur = _intradayBars[i];
-        pvSum += ((cur.high + cur.low + cur.close) / 3.0) * cur.intervalVolume;
-        vSum += cur.intervalVolume;
-        ema12 = (cur.close * (2.0 / 13.0)) + (ema12 * (1.0 - (2.0 / 13.0)));
-        ema26 = (cur.close * (2.0 / 27.0)) + (ema26 * (1.0 - (2.0 / 27.0)));
+    double? atmCeLtp;
+    for (final r in rows) {
+      if (r.offset == 0 && r.ceLtp > 0) {
+        atmCeLtp = r.ceLtp;
+        break;
       }
-      if (lossSum > 1e-6) {
-        rsi14 = 100.0 - (100.0 / (1.0 + gainSum / lossSum));
-      }
-      macdVal = ema12 - ema26;
-      macdSignal = macdVal * 0.82;
-      if (vSum > 0) vwapVal = pvSum / vSum;
     }
-
-    final barCount = _intradayBars.length;
-    final selBar = _intradayBars[
-        (_touchedIdx >= 0 && _touchedIdx < barCount)
-            ? _touchedIdx
-            : barCount - 1];
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -326,7 +349,7 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
                   child: Container(
                     margin: const EdgeInsets.only(right: 4),
                     padding:
-                        const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+                        const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
                     decoration: BoxDecoration(
                       color: active ? QuantTheme.accent : QuantTheme.bgPanel,
                       borderRadius: BorderRadius.circular(6),
@@ -335,7 +358,9 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
                       tf,
                       style: QuantTheme.mono(
                         size: 10,
-                        color: active ? QuantTheme.bgMain : QuantTheme.textPrimary,
+                        color: active
+                            ? QuantTheme.bgMain
+                            : QuantTheme.textPrimary,
                       ),
                     ),
                   ),
@@ -353,65 +378,10 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
           ],
         ),
         const SizedBox(height: 8),
-        QuantPanel(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Text(
-                    '${DateFormat("HH:mm").format(DateTime.fromMillisecondsSinceEpoch(selBar.timestampMs))} • ${selBar.strike} ${selBar.optionType}',
-                    style: QuantTheme.heading(size: 11),
-                  ),
-                  Text(
-                    'O:${selBar.open.toStringAsFixed(1)} H:${selBar.high.toStringAsFixed(1)} L:${selBar.low.toStringAsFixed(1)} C:${selBar.close.toStringAsFixed(1)}',
-                    style: QuantTheme.mono(size: 10, color: QuantTheme.positive),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 8),
-              LayoutBuilder(
-                builder: (ctx, constraints) {
-                  final w = constraints.maxWidth;
-                  void handleTouch(Offset pos) {
-                    if (barCount <= 0 || w <= 0) return;
-                    final i =
-                        ((pos.dx / w).clamp(0.0, 0.999) * barCount).floor();
-                    if (i != _touchedIdx) setState(() => _touchedIdx = i);
-                  }
-
-                  return GestureDetector(
-                    onTapDown: (d) => handleTouch(d.localPosition),
-                    onPanUpdate: (d) => handleTouch(d.localPosition),
-                    child: SizedBox(
-                      width: w,
-                      height: 200,
-                      child: CustomPaint(
-                        painter: _QuantCandleChartPainter(
-                          bars: _intradayBars,
-                          touchedIdx: _touchedIdx,
-                          showSpotOverlay: _compareSpotVsOption,
-                        ),
-                      ),
-                    ),
-                  );
-                },
-              ),
-              const SizedBox(height: 6),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Text(
-                    'RSI(14): ${rsi14?.toStringAsFixed(1) ?? "N/A"} | MACD: ${macdVal.toStringAsFixed(2)}/${macdSignal.toStringAsFixed(2)}',
-                    style: QuantTheme.mono(size: 10, color: QuantTheme.accent),
-                  ),
-                  Text('VWAP: ₹${vwapVal.toStringAsFixed(2)}',
-                      style: QuantTheme.mono(size: 10, color: QuantTheme.warning)),
-                ],
-              ),
-            ],
-          ),
+        ProKLineChart(
+          bars: barsToPlot,
+          liveLtp: atmCeLtp,
+          showSpotOverlay: _compareSpotVsOption,
         ),
       ],
     );
@@ -657,7 +627,8 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
                     const SizedBox(height: 4),
                     Text(
                       '5m: ${fmtOptDiff(sumCe5)}\n15m: ${fmtOptDiff(sumCe15)}\n60m: ${fmtOptDiff(sumCe60)}',
-                      style: QuantTheme.mono(size: 10, color: QuantTheme.positive),
+                      style:
+                          QuantTheme.mono(size: 10, color: QuantTheme.positive),
                     ),
                   ],
                 ),
@@ -672,7 +643,8 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
                     const SizedBox(height: 4),
                     Text(
                       '5m: ${fmtOptDiff(sumPe5)}\n15m: ${fmtOptDiff(sumPe15)}\n60m: ${fmtOptDiff(sumPe60)}',
-                      style: QuantTheme.mono(size: 10, color: QuantTheme.negative),
+                      style:
+                          QuantTheme.mono(size: 10, color: QuantTheme.negative),
                     ),
                   ],
                 ),
@@ -716,7 +688,6 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        // 1. Multi-Leg Payoff Comparator (Naked ATM vs Vertical Debit Spread)
         QuantPanel(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -811,8 +782,6 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
           ),
         ),
         const SizedBox(height: 10),
-
-        // 2. Black-76 Surface + No-Extrapolation IV Grid Summary
         QuantPanel(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -823,7 +792,8 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
                   Text('Black-76 Surface & No-Extrapolation IV Grid',
                       style: QuantTheme.heading(size: 11)),
                   QuantBadge(
-                    text: 'OBS:${ivGrid.observedCount} INT:${ivGrid.interpolatedCount}',
+                    text:
+                        'OBS:${ivGrid.observedCount} INT:${ivGrid.interpolatedCount}',
                     color: QuantTheme.accent,
                   ),
                 ],
@@ -866,8 +836,6 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
           ),
         ),
         const SizedBox(height: 10),
-
-        // 3. Strike-wise Observed/Interpolated IV & CE/PE Greeks Table
         QuantPanel(
           padding: EdgeInsets.zero,
           child: Column(
@@ -957,142 +925,123 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
             style: QuantTheme.mono(size: 11, color: QuantTheme.negative)),
       );
     }
-    final displayRows = rows.where((r) => r.offset.abs() <= 4).toList();
-    return QuantPanel(
-      padding: EdgeInsets.zero,
-      child: Column(
-        children: [
-          Container(
-            padding: const EdgeInsets.all(10),
-            decoration: const BoxDecoration(
-              color: QuantTheme.bgElevated,
-              borderRadius: BorderRadius.vertical(top: Radius.circular(11)),
-            ),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text('Real Order-Book Depth & Spread (${idx.label})',
-                    style: QuantTheme.heading(size: 11)),
-                Text('Null when absent',
-                    style: QuantTheme.mono(size: 9, color: QuantTheme.accent)),
-              ],
-            ),
-          ),
-          ...displayRows.map((r) {
-            final ceSpreadStr = (r.ceBid != null && r.ceAsk != null)
-                ? '₹${(r.ceAsk! - r.ceBid!).abs().toStringAsFixed(2)}'
-                : 'N/A';
-            final ceImbStr = r.ceImbalance != null
-                ? '${(r.ceImbalance! * 100).toStringAsFixed(0)}%'
-                : 'N/A';
-            final peImbStr = r.peImbalance != null
-                ? '${(r.peImbalance! * 100).toStringAsFixed(0)}%'
-                : 'N/A';
-            return Container(
-              padding: const EdgeInsets.all(9),
-              decoration: const BoxDecoration(
-                border: Border(
-                    bottom: BorderSide(color: QuantTheme.border, width: 0.6)),
-              ),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+
+    final ws = AngelWsStreamer.instance;
+    final micro = MicrostructureEngine.instance;
+    final displayRows = rows.where((r) => r.offset.abs() <= 3).toList();
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        QuantPanel(
+          backgroundColor: QuantTheme.bgSecondary,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('${r.strike}',
-                      style:
-                          QuantTheme.mono(size: 11, color: QuantTheme.accent)),
-                  Text('CE Vol ${r.ceVolume} | Sprd $ceSpreadStr | Imb $ceImbStr',
-                      style:
-                          QuantTheme.mono(size: 9, color: QuantTheme.positive)),
-                  Text('PE Vol ${r.peVolume} | Imb $peImbStr',
-                      style:
-                          QuantTheme.mono(size: 9, color: QuantTheme.negative)),
+                  Text('VisualHFT LOB Microstructure (${idx.label})',
+                      style: QuantTheme.heading(size: 11.5)),
+                  Text('5-Lvl Weighted OBI • Micro-Price • Flow Toxicity',
+                      style: QuantTheme.label(size: 9.5)),
                 ],
               ),
-            );
-          }),
-        ],
-      ),
+              QuantBadge(
+                text: ws.isConnected
+                    ? 'WS LIVE • ${ws.totalTicksReceived}t'
+                    : 'REST SNAPSHOT',
+                color: ws.isConnected ? QuantTheme.positive : QuantTheme.warning,
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 8),
+        ...displayRows.map((r) {
+          final ceMicro = micro.getSnapshot(r.ceSecurityId);
+          final peMicro = micro.getSnapshot(r.peSecurityId);
+          return QuantPanel(
+            margin: const EdgeInsets.only(bottom: 8),
+            padding: const EdgeInsets.all(9),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(
+                      'Strike ${r.strike} ${r.offset == 0 ? "(ATM)" : ""}',
+                      style: QuantTheme.heading(
+                          size: 11, color: QuantTheme.accent),
+                    ),
+                    Text(
+                      'CE ₹${r.ceLtp.toStringAsFixed(1)} | PE ₹${r.peLtp.toStringAsFixed(1)}',
+                      style: QuantTheme.mono(size: 10),
+                    ),
+                  ],
+                ),
+                const Divider(color: QuantTheme.border, height: 10),
+                _microSideRow('CE', r.ceImbalance, ceMicro, QuantTheme.positive),
+                const SizedBox(height: 5),
+                _microSideRow('PE', r.peImbalance, peMicro, QuantTheme.negative),
+              ],
+            ),
+          );
+        }),
+      ],
     );
   }
-}
 
-class _QuantCandleChartPainter extends CustomPainter {
-  final List<OneMinEnrichedBar> bars;
-  final int touchedIdx;
-  final bool showSpotOverlay;
+  Widget _microSideRow(
+    String side,
+    double? fallbackImb,
+    MicrostructureSnapshot? snap,
+    Color sideCol,
+  ) {
+    final obiVal = snap != null ? snap.weightedObi : (fallbackImb ?? 0.0);
+    final hasAny = snap != null || fallbackImb != null;
+    final obiStr = hasAny
+        ? '${obiVal >= 0 ? "+" : ""}${(obiVal * 100).toStringAsFixed(0)}%'
+        : 'N/A';
+    final toxStr = snap != null ? '${snap.toxicityScore.toStringAsFixed(0)}%' : '--';
+    final mpStr = snap?.microPrice != null
+        ? 'μ₹${snap!.microPrice!.toStringAsFixed(2)}'
+        : 'μ--';
+    final sprdStr = snap?.spreadBps != null
+        ? '${snap!.spreadBps!.toStringAsFixed(0)}bps'
+        : '--';
+    final lbl = snap?.pressureLabel ?? (hasAny ? 'DEPTH' : 'AWAITING WS');
 
-  _QuantCandleChartPainter({
-    required this.bars,
-    required this.touchedIdx,
-    required this.showSpotOverlay,
-  });
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final gridPaint = Paint()
-      ..color = QuantTheme.border.withOpacity(0.45)
-      ..strokeWidth = 0.8;
-    for (int i = 1; i <= 3; i++) {
-      final y = size.height * (i / 4.0);
-      canvas.drawLine(Offset(0, y), Offset(size.width, y), gridPaint);
-    }
-    if (bars.isEmpty) return;
-
-    double minP = double.infinity, maxP = -double.infinity;
-    double minS = double.infinity, maxS = -double.infinity;
-    for (final b in bars) {
-      if (b.low < minP) minP = b.low;
-      if (b.high > maxP) maxP = b.high;
-      if (b.underlyingSpot < minS) minS = b.underlyingSpot;
-      if (b.underlyingSpot > maxS) maxS = b.underlyingSpot;
-    }
-    if (maxP <= minP) maxP = minP + 1.0;
-    if (maxS <= minS) maxS = minS + 1.0;
-
-    final n = bars.length;
-    final slotW = size.width / math.max(1, n);
-    final candleW = (slotW * 0.58).clamp(2.0, 9.0);
-    final usableH = size.height - 16.0;
-    final spotPath = Path();
-
-    for (int i = 0; i < n; i++) {
-      final b = bars[i];
-      final cx = (i + 0.5) * slotW;
-      double yFor(double p) =>
-          usableH - ((p - minP) / (maxP - minP)) * (usableH - 12.0);
-      final color =
-          b.close >= b.open ? QuantTheme.positive : QuantTheme.negative;
-
-      canvas.drawLine(Offset(cx, yFor(b.high)), Offset(cx, yFor(b.low)),
-          Paint()..color = color..strokeWidth = 1.1);
-      final yO = yFor(b.open);
-      final yC = yFor(b.close);
-      canvas.drawRect(
-        Rect.fromLTWH(cx - candleW / 2, math.min(yO, yC), candleW,
-            math.max(2.0, (yO - yC).abs())),
-        Paint()..color = color,
-      );
-
-      final ySp = usableH -
-          ((b.underlyingSpot - minS) / (maxS - minS)) * (usableH - 12.0);
-      if (i == 0) {
-        spotPath.moveTo(cx, ySp);
-      } else {
-        spotPath.lineTo(cx, ySp);
-      }
-    }
-
-    if (showSpotOverlay) {
-      canvas.drawPath(
-        spotPath,
-        Paint()
-          ..color = QuantTheme.accent.withOpacity(0.7)
-          ..strokeWidth = 1.2
-          ..style = PaintingStyle.stroke,
-      );
-    }
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Row(
+          children: [
+            QuantBadge(text: side, color: sideCol),
+            const SizedBox(width: 6),
+            Text('OBI $obiStr • Tox $toxStr',
+                style: QuantTheme.mono(size: 9.5)),
+          ],
+        ),
+        Row(
+          children: [
+            Text('$mpStr ($sprdStr) ',
+                style: QuantTheme.mono(
+                    size: 9, color: QuantTheme.textSecondary)),
+            Text(
+              lbl,
+              style: QuantTheme.mono(
+                size: 8.5,
+                color: lbl.contains('BUY')
+                    ? QuantTheme.positive
+                    : (lbl.contains('SELL')
+                        ? QuantTheme.negative
+                        : QuantTheme.accent),
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
   }
-
-  @override
-  bool shouldRepaint(covariant _QuantCandleChartPainter oldDelegate) => true;
 }

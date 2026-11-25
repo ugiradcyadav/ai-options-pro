@@ -2,9 +2,12 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart' hide TextDirection;
 import '../../core/models.dart';
+import '../../data/angel_ws_streamer.dart';
 import '../../data/dhan_data_engine.dart';
 import '../../data/flow_data_engine.dart';
 import '../../data/forever_db.dart';
+import '../../data/tv_screener_engine.dart';
+import '../../engine/trendline_engine.dart';
 import '../../state/app_state.dart';
 import '../theme/quant_theme.dart';
 import '../widgets/flow_painters.dart';
@@ -20,7 +23,10 @@ class PulseFlowScreen extends StatefulWidget {
 
 class _PulseFlowScreenState extends State<PulseFlowScreen>
     with SingleTickerProviderStateMixin {
-  String _subTab = 'Overview'; // 'Overview' | 'Money flow' | 'Order flow' | 'Radar'
+  String _subTab = 'Overview';
+  String _scannerMode = 'GAINERS';
+  bool _scannerLoading = false;
+  List<TvScannerStock> _scannerStocks = [];
   bool _motionPaused = false;
   SectorFlowSnapshot? _selectedSector;
   List<OneMinEnrichedBar> _recentBars = [];
@@ -54,6 +60,21 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
     });
   }
 
+  Future<void> _loadTvScanner({String? mode}) async {
+    final targetMode = mode ?? _scannerMode;
+    setState(() {
+      _scannerMode = targetMode;
+      _scannerLoading = true;
+    });
+    final res = await TvScreenerEngine.instance
+        .fetchTopNseMovers(mode: targetMode, limit: 15);
+    if (!mounted) return;
+    setState(() {
+      _scannerStocks = res;
+      _scannerLoading = false;
+    });
+  }
+
   void _toggleMotion() {
     setState(() {
       _motionPaused = !_motionPaused;
@@ -77,10 +98,12 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
     final idx = widget.appState.selectedIndex;
     final engine = DhanDataEngine.instance;
     final flow = FlowDataEngine.instance;
+    final ws = AngelWsStreamer.instance;
     final health = engine.dataHealth;
     final spot = engine.spotPrices[idx] ?? 0.0;
     final chgPct = engine.spotChangePct[idx] ?? 0.0;
-    final rows = engine.optionChainRows[idx] ?? const <StrikeRowSnapshot>[];
+    final rows =
+        engine.optionChainRows[idx] ?? const <StrikeRowSnapshot>[];
     final hasLive = health == DataHealthStatus.live && spot > 0;
 
     final mood = flow.marketMoodScore;
@@ -103,9 +126,20 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
       ..sort((a, b) => a.changePct.compareTo(b.changePct));
 
     final injections = flow.computeOptionCapitalInjection(idx);
-    final radarAxes = flow.computeRadarAxes(
+    final rawRadar = flow.computeRadarAxes(
       index: idx,
       recentBars: _recentBars,
+    );
+    final srTrend = TrendlineEngine.detect(_recentBars);
+    final radarAxes = RadarSignalAxes(
+      oiScore: rawRadar.oiScore,
+      optionsScore: rawRadar.optionsScore,
+      vwapScore: rawRadar.vwapScore,
+      volProfileScore: rawRadar.volProfileScore,
+      rsiScore: rawRadar.rsiScore,
+      priceActionScore: rawRadar.priceActionScore,
+      vixCalmScore: rawRadar.vixCalmScore,
+      srRoomScore: srTrend.srRoomScore ?? rawRadar.srRoomScore,
     );
 
     final lastUpdStr = flow.lastSectorFetchMs > 0
@@ -116,7 +150,6 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        // 1. Top 3-Card Tredye Pulse Strip: Mood | NIFTY/Index | India VIX
         Row(
           children: [
             Expanded(
@@ -215,17 +248,28 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
           ],
         ),
         const SizedBox(height: 10),
-
-        // 2. Internal Sub-Tabs: Overview | Money flow | Order flow | Radar
-        Row(
-          children: ['Overview', 'Money flow', 'Order flow', 'Radar'].map((t) {
-            final active = _subTab == t;
-            return Expanded(
-              child: GestureDetector(
-                onTap: () => setState(() => _subTab = t),
+        SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Row(
+            children: [
+              'Overview',
+              'Money flow',
+              'Order flow',
+              'Radar',
+              'Scanner',
+            ].map((t) {
+              final active = _subTab == t;
+              return GestureDetector(
+                onTap: () {
+                  setState(() => _subTab = t);
+                  if (t == 'Scanner' && _scannerStocks.isEmpty && !_scannerLoading) {
+                    _loadTvScanner();
+                  }
+                },
                 child: Container(
-                  margin: const EdgeInsets.symmetric(horizontal: 2),
-                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  margin: const EdgeInsets.only(right: 5),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 11, vertical: 7),
                   alignment: Alignment.center,
                   decoration: BoxDecoration(
                     color: active ? QuantTheme.bgElevated : QuantTheme.bgPanel,
@@ -244,21 +288,21 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
                     ),
                   ),
                 ),
-              ),
-            );
-          }).toList(),
+              );
+            }).toList(),
+          ),
         ),
         const SizedBox(height: 10),
-
-        // 3. Status & Motion Control Strip
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
             QuantBadge(
-              text: health == DataHealthStatus.live
-                  ? 'LIVE FLOW • $lastUpdStr'
-                  : 'FEED ${health.label} — NO DATA',
-              color: health == DataHealthStatus.live
+              text: ws.isConnected
+                  ? 'WS LIVE • ${ws.totalTicksReceived} ticks'
+                  : (health == DataHealthStatus.live
+                      ? 'LIVE REST • $lastUpdStr'
+                      : 'FEED ${health.label} — NO DATA'),
+              color: (ws.isConnected || health == DataHealthStatus.live)
                   ? QuantTheme.positive
                   : QuantTheme.negative,
               icon: Icons.circle,
@@ -283,7 +327,6 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
           ],
         ),
         const SizedBox(height: 10),
-
         if (_subTab == 'Overview') ...[
           _buildMoneyRotationCard(inflows, outflows, flow.hasSectorData),
           const SizedBox(height: 10),
@@ -298,12 +341,132 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
           _buildFollowTheMoneyHubCard(flow),
           const SizedBox(height: 10),
           _buildOrderBookWallCard(idx, rows, spot),
-        ] else ...[
-          _buildSignalRadarCard(idx, radarAxes),
+        ] else if (_subTab == 'Radar') ...[
+          _buildSignalRadarCard(idx, radarAxes, srTrend.breakoutState),
           const SizedBox(height: 10),
           _buildOptionCapitalInjectionCard(idx, injections),
+        ] else ...[
+          _buildTvScannerCard(),
         ],
       ],
+    );
+  }
+
+  Widget _buildTvScannerCard() {
+    return QuantPanel(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('NSE Live Momentum Scanner',
+                      style: QuantTheme.heading(size: 13)),
+                  Text('Powered by TradingView India Screener',
+                      style: QuantTheme.label(size: 9.5)),
+                ],
+              ),
+              GestureDetector(
+                onTap: _scannerLoading ? null : () => _loadTvScanner(),
+                child: QuantBadge(
+                  text: _scannerLoading ? 'Scanning...' : '↻ Refresh',
+                  color: QuantTheme.accent,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: ['GAINERS', 'LOSERS', 'VOLUME'].map((m) {
+              final active = _scannerMode == m;
+              return Expanded(
+                child: GestureDetector(
+                  onTap: () => _loadTvScanner(mode: m),
+                  child: Container(
+                    margin: const EdgeInsets.symmetric(horizontal: 2),
+                    padding: const EdgeInsets.symmetric(vertical: 6),
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      color:
+                          active ? QuantTheme.accent : QuantTheme.bgSecondary,
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: Text(
+                      m,
+                      style: QuantTheme.mono(
+                        size: 9.5,
+                        color: active
+                            ? QuantTheme.bgMain
+                            : QuantTheme.textSecondary,
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+          const Divider(color: QuantTheme.border, height: 14),
+          if (_scannerLoading)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 20),
+              child: Center(child: CircularProgressIndicator(strokeWidth: 2)),
+            )
+          else if (_scannerStocks.isEmpty)
+            Text(
+              TvScreenerEngine.instance.lastError.isNotEmpty
+                  ? TvScreenerEngine.instance.lastError
+                  : 'Tap Refresh to scan top NSE liquid movers.',
+              style: QuantTheme.mono(size: 11, color: QuantTheme.warning),
+            )
+          else
+            ..._scannerStocks.map((st) {
+              final isUp = st.changePct >= 0;
+              final col = isUp ? QuantTheme.positive : QuantTheme.negative;
+              return Container(
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                decoration: const BoxDecoration(
+                  border: Border(
+                      bottom: BorderSide(color: QuantTheme.border, width: 0.5)),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Expanded(
+                      flex: 4,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(st.symbol,
+                              style: QuantTheme.heading(size: 11)),
+                          Text(
+                            '${st.sector} • RelVol ${st.relVolume.toStringAsFixed(1)}x • RSI ${st.rsi14?.toStringAsFixed(0) ?? "-"}',
+                            overflow: TextOverflow.ellipsis,
+                            style: QuantTheme.mono(
+                                size: 8.5, color: QuantTheme.textSecondary),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: [
+                        Text('₹${st.close.toStringAsFixed(1)}',
+                            style: QuantTheme.mono(size: 11)),
+                        Text(
+                          '${isUp ? "+" : ""}${st.changePct.toStringAsFixed(2)}% • ${st.ratingLabel}',
+                          style: QuantTheme.mono(size: 9, color: col),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              );
+            }),
+        ],
+      ),
     );
   }
 
@@ -559,7 +722,8 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
                   children: [
                     Row(
                       children: [
-                        QuantBadge(text: '${s.strike} ${s.optionType}', color: col),
+                        QuantBadge(
+                            text: '${s.strike} ${s.optionType}', color: col),
                         const SizedBox(width: 8),
                         Text('₹${s.ltp.toStringAsFixed(1)}',
                             style: QuantTheme.mono(size: 11)),
@@ -698,7 +862,8 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
     );
   }
 
-  Widget _buildSignalRadarCard(UnderlyingIndex idx, RadarSignalAxes axes) {
+  Widget _buildSignalRadarCard(
+      UnderlyingIndex idx, RadarSignalAxes axes, String trendState) {
     final bias = axes.overallBias;
     final col = bias == 'bullish'
         ? QuantTheme.positive
@@ -716,7 +881,7 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
                 children: [
                   Text('8 signals at a glance (${idx.label})',
                       style: QuantTheme.heading(size: 13)),
-                  Text('Signal radar • 50 is neutral; outer is stronger',
+                  Text('S/R Trendline: $trendState • 50 is neutral',
                       style: QuantTheme.label(size: 10)),
                 ],
               ),

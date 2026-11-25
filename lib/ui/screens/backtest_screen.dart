@@ -5,6 +5,7 @@ import '../../data/dhan_data_engine.dart';
 import '../../data/forever_db.dart';
 import '../../data/scrip_master_engine.dart';
 import '../../engine/backtest_engine.dart';
+import '../../engine/quantstats_engine.dart';
 import '../../engine/strategy_settings.dart';
 import '../../state/app_state.dart';
 import '../theme/quant_theme.dart';
@@ -30,6 +31,7 @@ class _BacktestScreenState extends State<BacktestScreen> {
   BacktestReport? _report;
   ThreeWayBacktestReport? _threeWay;
   List<FrictionStressRow> _stressRows = [];
+  QuantStatsTearSheet _tearSheet = QuantStatsTearSheet.empty;
 
   @override
   void initState() {
@@ -68,12 +70,17 @@ class _BacktestScreenState extends State<BacktestScreen> {
       lotSize: lotSize,
       outOfSampleOnly: true,
     );
+    final qs = QuantStatsEngine.computeFromTradeLogs(
+      tradeLogs: rep.tradeLogs,
+      startingCapitalInr: cap > 0 ? cap : 50000.0,
+    );
 
     if (!mounted) return;
     setState(() {
       _report = rep;
       _threeWay = threeWay;
       _stressRows = stress;
+      _tearSheet = qs;
       _running = false;
     });
   }
@@ -111,7 +118,7 @@ class _BacktestScreenState extends State<BacktestScreen> {
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Text('Research Lab: 3-Way OOS & Stress Test',
+                  Text('Research Lab: QuantStats & 3-Way OOS',
                       style: QuantTheme.heading(size: 13)),
                   GestureDetector(
                     onTap: () => V2ControlDialogs.openStrategySettingsSheet(
@@ -150,9 +157,11 @@ class _BacktestScreenState extends State<BacktestScreen> {
                           ),
                         ),
                         child: Text(
-                          u.label,
+                          u.label.replaceAll(' 50', ''),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                           style: QuantTheme.heading(
-                            size: 10,
+                            size: 9.5,
                             color: active
                                 ? QuantTheme.accent
                                 : QuantTheme.textSecondary,
@@ -165,15 +174,13 @@ class _BacktestScreenState extends State<BacktestScreen> {
               ),
               const SizedBox(height: 8),
               Text(
-                'Same evaluateEntry() • Gap-Aware Stops • 0.15% Sell STT • Target +${settings.targetPct}% / SL -${settings.stopLossPct}% / Hold ${settings.timeExitMinutes}m',
+                'Same evaluateEntry() • Gap-Aware Stops • 0.15% STT • Target +${settings.targetPct}% / SL -${settings.stopLossPct}% / Hold ${settings.timeExitMinutes}m',
                 style: QuantTheme.label(size: 10),
               ),
             ],
           ),
         ),
         const SizedBox(height: 10),
-
-        // 1. Primary OOS Results & Equity/Drawdown Curve
         QuantPanel(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -272,8 +279,8 @@ class _BacktestScreenState extends State<BacktestScreen> {
                   icon: const Icon(Icons.play_arrow, size: 18),
                   label: Text(
                     _running
-                        ? 'Running 3-Way & Stress Test...'
-                        : 'Run 3-Way Holdout & Stress Test',
+                        ? 'Running QuantStats & Stress Test...'
+                        : 'Run QuantStats, 3-Way & Stress Test',
                     style:
                         QuantTheme.heading(size: 12, color: QuantTheme.bgMain),
                   ),
@@ -283,8 +290,100 @@ class _BacktestScreenState extends State<BacktestScreen> {
           ),
         ),
         const SizedBox(height: 10),
-
-        // 2. 3-Way Split (50% Train / 25% Frozen OOS / 25% Final Holdout)
+        QuantPanel(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text('Fund-Grade Risk Tear-Sheet (QuantStats)',
+                      style: QuantTheme.heading(size: 12)),
+                  QuantBadge(
+                    text: _tearSheet.totalTrades > 0
+                        ? '${_tearSheet.totalTrades} TRADES'
+                        : 'NO TRADES',
+                    color: _tearSheet.totalTrades > 0
+                        ? QuantTheme.accent
+                        : QuantTheme.textSecondary,
+                  ),
+                ],
+              ),
+              const Divider(color: QuantTheme.border, height: 14),
+              if (_tearSheet.totalTrades == 0)
+                Text(
+                    'Run on recorded trades to compute Sharpe, Sortino, Calmar & VaR.',
+                    style: QuantTheme.label(size: 10.5))
+              else ...[
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    QuantMetricCell(
+                      label: 'SHARPE',
+                      value: _tearSheet.sharpeRatio.toStringAsFixed(2),
+                      valueColor: _tearSheet.sharpeRatio >= 1.0
+                          ? QuantTheme.positive
+                          : QuantTheme.warning,
+                    ),
+                    QuantMetricCell(
+                      label: 'SORTINO',
+                      value: _tearSheet.sortinoRatio.toStringAsFixed(2),
+                      valueColor: QuantTheme.accent,
+                    ),
+                    QuantMetricCell(
+                      label: 'CALMAR',
+                      value: _tearSheet.calmarRatio.toStringAsFixed(2),
+                    ),
+                    QuantMetricCell(
+                      label: 'RECOVERY',
+                      value: '${_tearSheet.recoveryFactor.toStringAsFixed(2)}x',
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    QuantMetricCell(
+                      label: 'ULCER IDX',
+                      value: _tearSheet.ulcerIndex.toStringAsFixed(2),
+                    ),
+                    QuantMetricCell(
+                      label: 'VaR (95%)',
+                      value: '₹${_tearSheet.var95Inr.toStringAsFixed(0)}',
+                      valueColor: QuantTheme.negative,
+                    ),
+                    QuantMetricCell(
+                      label: 'PAYOFF RATIO',
+                      value: '${_tearSheet.payoffRatio.toStringAsFixed(2)}x',
+                    ),
+                    QuantMetricCell(
+                      label: 'STREAK W/L',
+                      value:
+                          '${_tearSheet.maxConsecutiveWins}W / ${_tearSheet.maxConsecutiveLosses}L',
+                    ),
+                  ],
+                ),
+                if (_tearSheet.monthlyPnlInr.isNotEmpty) ...[
+                  const Divider(color: QuantTheme.border, height: 14),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: _tearSheet.monthlyPnlInr.entries.map((e) {
+                      final pos = e.value >= 0;
+                      return QuantBadge(
+                        text:
+                            '${e.key}: ${pos ? "+" : ""}₹${e.value.toStringAsFixed(0)}',
+                        color: pos ? QuantTheme.positive : QuantTheme.negative,
+                      );
+                    }).toList(),
+                  ),
+                ],
+              ],
+            ],
+          ),
+        ),
+        const SizedBox(height: 10),
         if (_threeWay != null)
           QuantPanel(
             child: Column(
@@ -310,8 +409,6 @@ class _BacktestScreenState extends State<BacktestScreen> {
             ),
           ),
         const SizedBox(height: 10),
-
-        // 3. Fee & Slippage Sensitivity Stress-Test (1.0x / 1.5x / 2.0x)
         if (_stressRows.isNotEmpty)
           QuantPanel(
             child: Column(
@@ -376,7 +473,8 @@ class _BacktestScreenState extends State<BacktestScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(title, style: QuantTheme.heading(size: 9, color: QuantTheme.accent)),
+            Text(title,
+                style: QuantTheme.heading(size: 9, color: QuantTheme.accent)),
             const SizedBox(height: 4),
             Text('Trades: ${r.totalTrades}', style: QuantTheme.mono(size: 9.5)),
             Text('WR: ${r.winRatePct.toStringAsFixed(0)}%',
@@ -436,5 +534,6 @@ class _EquityDrawdownCurvePainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant _EquityDrawdownCurvePainter oldDelegate) => true;
+  bool shouldRepaint(covariant _EquityDrawdownCurvePainter oldDelegate) =>
+      true;
 }

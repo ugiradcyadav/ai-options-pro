@@ -1,13 +1,19 @@
 enum UnderlyingIndex {
   nifty50('NIFTY 50', 'NIFTY', 50),
   bankNifty('BANK NIFTY', 'BANKNIFTY', 100),
-  finNifty('FINNIFTY', 'FINNIFTY', 50);
+  finNifty('FINNIFTY', 'FINNIFTY', 50),
+  sensex('SENSEX', 'SENSEX', 100);
 
   final String label;
   final String dhanSymbol;
   final int strikeStep;
 
   const UnderlyingIndex(this.label, this.dhanSymbol, this.strikeStep);
+
+  String get spotExchange => this == UnderlyingIndex.sensex ? 'BSE' : 'NSE';
+  String get foExchange => this == UnderlyingIndex.sensex ? 'BFO' : 'NFO';
+  int get wsSpotExchType => this == UnderlyingIndex.sensex ? 3 : 1;
+  int get wsFoExchType => this == UnderlyingIndex.sensex ? 4 : 2;
 }
 
 enum OptionType { ce, pe }
@@ -229,6 +235,72 @@ class StrikeRowSnapshot {
   });
 
   int get lastUpdatedMs => receivedAtMs;
+
+  StrikeRowSnapshot copyWith({
+    double? ceLtp,
+    double? peLtp,
+    int? ceOi,
+    int? peOi,
+    int? ceVolume,
+    int? peVolume,
+    double? ceBid,
+    double? ceAsk,
+    double? peBid,
+    double? peAsk,
+    int? ceBidQty,
+    int? ceAskQty,
+    int? peBidQty,
+    int? peAskQty,
+    double? ceImbalance,
+    double? peImbalance,
+    int? receivedAtMs,
+    int? exchangeTimestampMs,
+  }) {
+    return StrikeRowSnapshot(
+      strike: strike,
+      offset: offset,
+      ceSecurityId: ceSecurityId,
+      peSecurityId: peSecurityId,
+      ceTradingSymbol: ceTradingSymbol,
+      peTradingSymbol: peTradingSymbol,
+      lotSize: lotSize,
+      ceLtp: ceLtp ?? this.ceLtp,
+      peLtp: peLtp ?? this.peLtp,
+      ceOi: ceOi ?? this.ceOi,
+      peOi: peOi ?? this.peOi,
+      ceOiChange5m: ceOiChange5m,
+      peOiChange5m: peOiChange5m,
+      ceOiChange15m: ceOiChange15m,
+      peOiChange15m: peOiChange15m,
+      ceOiChange60m: ceOiChange60m,
+      peOiChange60m: peOiChange60m,
+      ceVolume: ceVolume ?? this.ceVolume,
+      peVolume: peVolume ?? this.peVolume,
+      ceIv: ceIv,
+      peIv: peIv,
+      ceDelta: ceDelta,
+      peDelta: peDelta,
+      ceGamma: ceGamma,
+      peGamma: peGamma,
+      ceTheta: ceTheta,
+      peTheta: peTheta,
+      ceVega: ceVega,
+      peVega: peVega,
+      ceBid: ceBid ?? this.ceBid,
+      ceAsk: ceAsk ?? this.ceAsk,
+      peBid: peBid ?? this.peBid,
+      peAsk: peAsk ?? this.peAsk,
+      ceBidQty: ceBidQty ?? this.ceBidQty,
+      ceAskQty: ceAskQty ?? this.ceAskQty,
+      peBidQty: peBidQty ?? this.peBidQty,
+      peAskQty: peAskQty ?? this.peAskQty,
+      ceImbalance: ceImbalance ?? this.ceImbalance,
+      peImbalance: peImbalance ?? this.peImbalance,
+      source: source,
+      exchangeTimestampMs: exchangeTimestampMs ?? this.exchangeTimestampMs,
+      receivedAtMs: receivedAtMs ?? this.receivedAtMs,
+    );
+  }
 }
 
 class OneMinEnrichedBar {

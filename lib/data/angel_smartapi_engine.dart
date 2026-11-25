@@ -3,8 +3,8 @@ import 'dart:io';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
-import '../core/models.dart';
 import '../core/http_safe_client.dart';
+import '../core/models.dart';
 import '../core/totp_auth.dart';
 import '../engine/math_greeks.dart';
 import 'forever_db.dart';
@@ -38,6 +38,10 @@ class AngelSmartApiEngine {
   String _resolvedLocalIp = '';
   String _resolvedPublicIp = '';
   static const String _androidOsMac = '02:00:00:00:00:00';
+
+  // Throttle SQLite snapshot writes to once every 30s per index to prevent UI/feed choke
+  final Map<String, int> _lastDbPersistMsByIndex = {};
+  final Map<String, Map<String, int?>> _cachedOiDeltas = {};
 
   Future<void> loadSavedConfig() async {
     apiKey = await _secure.read(key: _kAngelApiKey) ?? '';
@@ -91,7 +95,7 @@ class AngelSmartApiEngine {
         'https://ifconfig.me/ip',
       ]) {
         try {
-          final resp = await SafeBrokerHttp
+          final resp = await http
               .get(Uri.parse(url))
               .timeout(const Duration(seconds: 4));
           if (resp.statusCode == 200) {
@@ -141,11 +145,11 @@ class AngelSmartApiEngine {
             .toString()
             .trim();
         if (code.isNotEmpty || msg.isNotEmpty) {
-          return '[v3.2] Angel rejected (${code.isNotEmpty ? code : "HTTP ${resp.statusCode}"}): $msg';
+          return '[v3.5] Angel rejected (${code.isNotEmpty ? code : "HTTP ${resp.statusCode}"}): $msg';
         }
       }
     } catch (_) {}
-    return '[v3.2] Angel login failed (HTTP ${resp.statusCode}, IP: $_resolvedPublicIp).';
+    return '[v3.5] Angel login failed (HTTP ${resp.statusCode}, IP: $_resolvedPublicIp).';
   }
 
   Future<bool> loginAndSave({
@@ -210,24 +214,23 @@ class AngelSmartApiEngine {
             : '');
 
     if (apiKey.isEmpty || clientCode.isEmpty || usePin.isEmpty || useOtp.isEmpty) {
-      lastError = '[v3.2] Missing API Key, Client Code, MPIN, or 6-digit OTP.';
+      lastError = '[v3.5] Missing API Key, Client Code, MPIN, or 6-digit OTP.';
       return false;
     }
 
     try {
-      final resp = await SafeBrokerHttp
-          .post(
-            Uri.parse(
-                'https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword'),
-            headers: _buildHeaders(includeAuth: false),
-            body: jsonEncode({
-              'clientcode': clientCode,
-              'password': usePin,
-              'totp': useOtp,
-              'state': 'live',
-            }),
-          )
-          .timeout(const Duration(seconds: 10));
+      final resp = await SafeBrokerHttp.post(
+        Uri.parse(
+            'https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword'),
+        headers: _buildHeaders(includeAuth: false),
+        body: jsonEncode({
+          'clientcode': clientCode,
+          'password': usePin,
+          'totp': useOtp,
+          'state': 'live',
+        }),
+        timeout: const Duration(seconds: 10),
+      );
 
       if (resp.statusCode == 200) {
         final body = jsonDecode(resp.body);
@@ -245,7 +248,7 @@ class AngelSmartApiEngine {
       lastError = _extractSafeBrokerError(resp);
       return false;
     } catch (_) {
-      lastError = '[v3.2] Network timeout connecting to Angel One.';
+      lastError = '[v3.5] Network timeout connecting to Angel One.';
       return false;
     }
   }
@@ -254,13 +257,12 @@ class AngelSmartApiEngine {
     if (jwtToken.isEmpty) return null;
     await _ensureRealNetworkInfo();
     try {
-      final resp = await SafeBrokerHttp
-          .get(
-            Uri.parse(
-                'https://apiconnect.angelone.in/rest/secure/angelbroking/user/v1/getRMS'),
-            headers: _buildHeaders(),
-          )
-          .timeout(const Duration(seconds: 6));
+      final resp = await SafeBrokerHttp.get(
+        Uri.parse(
+            'https://apiconnect.angelone.in/rest/secure/angelbroking/user/v1/getRMS'),
+        headers: _buildHeaders(),
+        timeout: const Duration(seconds: 6),
+      );
       if (resp.statusCode == 200) {
         final body = jsonDecode(resp.body);
         if (body is Map && body['status'] == true && body['data'] != null) {
@@ -273,7 +275,7 @@ class AngelSmartApiEngine {
     return null;
   }
 
-  String _indexTokenForAngel(UnderlyingIndex index) {
+  static String spotTokenForIndex(UnderlyingIndex index) {
     switch (index) {
       case UnderlyingIndex.nifty50:
         return '99926000';
@@ -281,6 +283,8 @@ class AngelSmartApiEngine {
         return '99926009';
       case UnderlyingIndex.finNifty:
         return '99926037';
+      case UnderlyingIndex.sensex:
+        return '99919000';
     }
   }
 
@@ -308,25 +312,26 @@ class AngelSmartApiEngine {
       }
     }
 
-    final idxToken = _indexTokenForAngel(index);
+    final idxToken = spotTokenForIndex(index);
+    final spotExch = index.spotExchange; // 'NSE' or 'BSE'
+    final foExch = index.foExchange; // 'NFO' or 'BFO'
     double spot = 0.0;
     double changePct = 0.0;
     final exchangeTsMs = DateTime.now().millisecondsSinceEpoch;
 
     try {
-      final spotResp = await SafeBrokerHttp
-          .post(
-            Uri.parse(
-                'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/'),
-            headers: _buildHeaders(),
-            body: jsonEncode({
-              'mode': 'FULL',
-              'exchangeTokens': {
-                'NSE': [idxToken]
-              }
-            }),
-          )
-          .timeout(const Duration(seconds: 4));
+      final spotResp = await SafeBrokerHttp.post(
+        Uri.parse(
+            'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/'),
+        headers: _buildHeaders(),
+        body: jsonEncode({
+          'mode': 'FULL',
+          'exchangeTokens': {
+            spotExch: [idxToken]
+          }
+        }),
+        timeout: const Duration(seconds: 5),
+      );
 
       if (spotResp.statusCode == 200) {
         final body = jsonDecode(spotResp.body);
@@ -354,7 +359,7 @@ class AngelSmartApiEngine {
     final tYears =
         StrikeSelectionEngine.computeFractionalYearsToExpiryIst(expiryIso);
 
-    final List<String> nfoTokens = [];
+    final List<String> foTokens = [];
     final Map<int, ResolvedContract> ceContracts = {};
     final Map<int, ResolvedContract> peContracts = {};
 
@@ -372,39 +377,38 @@ class AngelSmartApiEngine {
         optionType: OptionType.pe,
       );
       if (ceC != null) {
-        nfoTokens.add(ceC.securityId);
+        foTokens.add(ceC.securityId);
         ceContracts[strike] = ceC;
       }
       if (peC != null) {
-        nfoTokens.add(peC.securityId);
+        foTokens.add(peC.securityId);
         peContracts[strike] = peC;
       }
     }
 
-    if (nfoTokens.isEmpty) {
+    if (foTokens.isEmpty) {
       lastError =
-          'No contracts resolved in master for ${index.dhanSymbol} $expiryIso.';
+          'No contracts resolved in master for ${index.dhanSymbol} $expiryIso ($foExch).';
       return null;
     }
 
     final Map<String, Map> quoteByToken = {};
-    for (int start = 0; start < nfoTokens.length; start += 50) {
-      final end = (start + 50 > nfoTokens.length)
-          ? nfoTokens.length
+    for (int start = 0; start < foTokens.length; start += 50) {
+      final end = (start + 50 > foTokens.length)
+          ? foTokens.length
           : start + 50;
-      final chunk = nfoTokens.sublist(start, end);
+      final chunk = foTokens.sublist(start, end);
       try {
-        final qResp = await SafeBrokerHttp
-            .post(
-              Uri.parse(
-                  'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/'),
-              headers: _buildHeaders(),
-              body: jsonEncode({
-                'mode': 'FULL',
-                'exchangeTokens': {'NFO': chunk}
-              }),
-            )
-            .timeout(const Duration(seconds: 4));
+        final qResp = await SafeBrokerHttp.post(
+          Uri.parse(
+              'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/'),
+          headers: _buildHeaders(),
+          body: jsonEncode({
+            'mode': 'FULL',
+            'exchangeTokens': {foExch: chunk}
+          }),
+          timeout: const Duration(seconds: 5),
+        );
 
         if (qResp.statusCode == 200) {
           final qBody = jsonDecode(qResp.body);
@@ -423,6 +427,11 @@ class AngelSmartApiEngine {
 
     final receivedAtMs = DateTime.now().millisecondsSinceEpoch;
     final db = ForeverDatabase.instance;
+    final shouldPersistDb =
+        receivedAtMs - (_lastDbPersistMsByIndex[index.label] ?? 0) >= 30000;
+    if (shouldPersistDb) {
+      _lastDbPersistMsByIndex[index.label] = receivedAtMs;
+    }
 
     double? parityForward;
     final atmCeC = ceContracts[atm];
@@ -470,65 +479,88 @@ class AngelSmartApiEngine {
       final ceDepthInfo = _extractRealDepth(ceQ['depth'] as Map?);
       final peDepthInfo = _extractRealDepth(peQ['depth'] as Map?);
 
-      await db.insertChainSnapshot(
-        contractId: ceC.securityId,
-        indexName: index.label,
-        expiry: expiryIso,
-        strike: strike,
-        optionType: 'CE',
-        timestampMs: receivedAtMs,
-        ltp: ceLtp,
-        bid: ceDepthInfo['bid'] as double?,
-        ask: ceDepthInfo['ask'] as double?,
-        volume: ceVol,
-        oiLots: ceOiLots,
-        source: 'ANGEL_SMARTAPI',
-      );
-      await db.insertChainSnapshot(
-        contractId: peC.securityId,
-        indexName: index.label,
-        expiry: expiryIso,
-        strike: strike,
-        optionType: 'PE',
-        timestampMs: receivedAtMs,
-        ltp: peLtp,
-        bid: peDepthInfo['bid'] as double?,
-        ask: peDepthInfo['ask'] as double?,
-        volume: peVol,
-        oiLots: peOiLots,
-        source: 'ANGEL_SMARTAPI',
-      );
+      int? ceChg5, peChg5, ceChg15, peChg15, ceChg60, peChg60;
+      if (shouldPersistDb || !_cachedOiDeltas.containsKey(ceC.securityId)) {
+        await db.insertChainSnapshot(
+          contractId: ceC.securityId,
+          indexName: index.label,
+          expiry: expiryIso,
+          strike: strike,
+          optionType: 'CE',
+          timestampMs: receivedAtMs,
+          ltp: ceLtp,
+          bid: ceDepthInfo['bid'] as double?,
+          ask: ceDepthInfo['ask'] as double?,
+          volume: ceVol,
+          oiLots: ceOiLots,
+          source: 'ANGEL_SMARTAPI',
+        );
+        await db.insertChainSnapshot(
+          contractId: peC.securityId,
+          indexName: index.label,
+          expiry: expiryIso,
+          strike: strike,
+          optionType: 'PE',
+          timestampMs: receivedAtMs,
+          ltp: peLtp,
+          bid: peDepthInfo['bid'] as double?,
+          ask: peDepthInfo['ask'] as double?,
+          volume: peVol,
+          oiLots: peOiLots,
+          source: 'ANGEL_SMARTAPI',
+        );
 
-      final ceChg5 = await db.computeRealOiChange(
-          contractId: ceC.securityId,
-          currentOiLots: ceOiLots,
-          nowMs: receivedAtMs,
-          minutesAgo: 5);
-      final peChg5 = await db.computeRealOiChange(
-          contractId: peC.securityId,
-          currentOiLots: peOiLots,
-          nowMs: receivedAtMs,
-          minutesAgo: 5);
-      final ceChg15 = await db.computeRealOiChange(
-          contractId: ceC.securityId,
-          currentOiLots: ceOiLots,
-          nowMs: receivedAtMs,
-          minutesAgo: 15);
-      final peChg15 = await db.computeRealOiChange(
-          contractId: peC.securityId,
-          currentOiLots: peOiLots,
-          nowMs: receivedAtMs,
-          minutesAgo: 15);
-      final ceChg60 = await db.computeRealOiChange(
-          contractId: ceC.securityId,
-          currentOiLots: ceOiLots,
-          nowMs: receivedAtMs,
-          minutesAgo: 60);
-      final peChg60 = await db.computeRealOiChange(
-          contractId: peC.securityId,
-          currentOiLots: peOiLots,
-          nowMs: receivedAtMs,
-          minutesAgo: 60);
+        ceChg5 = await db.computeRealOiChange(
+            contractId: ceC.securityId,
+            currentOiLots: ceOiLots,
+            nowMs: receivedAtMs,
+            minutesAgo: 5);
+        peChg5 = await db.computeRealOiChange(
+            contractId: peC.securityId,
+            currentOiLots: peOiLots,
+            nowMs: receivedAtMs,
+            minutesAgo: 5);
+        ceChg15 = await db.computeRealOiChange(
+            contractId: ceC.securityId,
+            currentOiLots: ceOiLots,
+            nowMs: receivedAtMs,
+            minutesAgo: 15);
+        peChg15 = await db.computeRealOiChange(
+            contractId: peC.securityId,
+            currentOiLots: peOiLots,
+            nowMs: receivedAtMs,
+            minutesAgo: 15);
+        ceChg60 = await db.computeRealOiChange(
+            contractId: ceC.securityId,
+            currentOiLots: ceOiLots,
+            nowMs: receivedAtMs,
+            minutesAgo: 60);
+        peChg60 = await db.computeRealOiChange(
+            contractId: peC.securityId,
+            currentOiLots: peOiLots,
+            nowMs: receivedAtMs,
+            minutesAgo: 60);
+
+        _cachedOiDeltas[ceC.securityId] = {
+          '5': ceChg5,
+          '15': ceChg15,
+          '60': ceChg60,
+        };
+        _cachedOiDeltas[peC.securityId] = {
+          '5': peChg5,
+          '15': peChg15,
+          '60': peChg60,
+        };
+      } else {
+        final cMap = _cachedOiDeltas[ceC.securityId];
+        final pMap = _cachedOiDeltas[peC.securityId];
+        ceChg5 = cMap?['5'];
+        ceChg15 = cMap?['15'];
+        ceChg60 = cMap?['60'];
+        peChg5 = pMap?['5'];
+        peChg15 = pMap?['15'];
+        peChg60 = pMap?['60'];
+      }
 
       final dteDays = tYears * 365.0;
       final ceG = MathGreeksEngine.computeIvAndGreeks(
