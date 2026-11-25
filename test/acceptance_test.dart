@@ -370,7 +370,7 @@ void main() {
       ).sharpeRatio,
       greaterThan(0),
     );
-    expect(TrendlineEngine.detect(const []).breakoutState, 'NEUTRAL');
+    expect(TrendlineEngine.detect(const []).breakoutState, 'NO DATA');
     expect(
       MtfStrategyEngine.evaluateEntry(
         index: UnderlyingIndex.nifty50,
