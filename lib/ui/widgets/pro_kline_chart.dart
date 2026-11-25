@@ -59,9 +59,9 @@ class _ProKLineChartState extends State<ProKLineChart> {
     }
 
     final total = allBars.length;
-    final clampedVisible = _visibleCount.clamp(12, math.max(12, math.min(120, total)));
+    final clampedVisible = _visibleCount.clamp(12, math.max(12, math.min(120, total))).toInt();
     final maxOffset = math.max(0, total - clampedVisible);
-    final clampedOffset = _rightOffset.clamp(0, maxOffset);
+    final clampedOffset = _rightOffset.clamp(0, maxOffset).toInt();
     final endIdx = total - clampedOffset;
     final startIdx = math.max(0, endIdx - clampedVisible);
     final visibleBars = allBars.sublist(startIdx, endIdx);
@@ -157,13 +157,13 @@ class _ProKLineChartState extends State<ProKLineChart> {
                     if (d.pointerCount >= 2 && (d.scale - 1.0).abs() > 0.02) {
                       _visibleCount = (_scaleBaseCount / d.scale)
                           .round()
-                          .clamp(12, math.max(12, math.min(120, total)));
+                          .clamp(12, math.max(12, math.min(120, total))).toInt();
                     } else if (d.pointerCount == 1) {
                       _dragAccumPx += d.focalPointDelta.dx;
                       final pxPerBar = math.max(4.0, chartW / math.max(1, visibleBars.length));
                       if (_dragAccumPx.abs() >= pxPerBar) {
                         final shift = (_dragAccumPx / pxPerBar).truncate();
-                        _rightOffset = (_rightOffset + shift).clamp(0, maxOffset);
+                        _rightOffset = (_rightOffset + shift).clamp(0, maxOffset).toInt();
                         _dragAccumPx -= shift * pxPerBar;
                       }
                       updateCrosshair(d.localFocalPoint);
