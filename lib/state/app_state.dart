@@ -6,11 +6,15 @@ import '../data/constituent_flow_engine.dart';
 import '../data/dhan_data_engine.dart';
 import '../data/flow_data_engine.dart';
 import '../data/forever_db.dart';
+import '../data/macro_data_engine.dart';
+import '../data/news_wire_engine.dart';
+import '../data/participant_oi_engine.dart';
 import '../engine/ai_recalibration_engine.dart';
 import '../engine/backtest_engine.dart';
 import '../engine/execution_engine.dart';
 import '../engine/exit_manager.dart';
 import '../engine/journal_coach_engine.dart';
+import '../engine/minor_intel_engine.dart';
 import '../engine/mtf_strategy_engine.dart';
 import '../engine/regime_engine.dart';
 import '../engine/sadhu_ml_engine.dart';
@@ -29,13 +33,17 @@ class AppState extends ChangeNotifier {
   double todayNetRealizedPnlIst = 0.0;
   bool isBusy = false;
   Timer? _supervisorTimer;
+  Timer? _intelTimer;
 
   // C4 & C5 Concurrency Locks
   bool _evalExitLock = false;
   bool _isExecutingOrder = false;
 
-  // Per-index real measured regime (replaces stuck global HMM constants)
+  // Per-index real measured regime & Minor intraday intelligence
   final Map<UnderlyingIndex, MeasuredRegimeSnapshot> measuredRegimes = {};
+  final Map<UnderlyingIndex, IndexContributionSummary> contributions = {};
+  final Map<UnderlyingIndex, StraddleGammaSnapshot?> straddleGammas = {};
+  final Map<UnderlyingIndex, IntradayLevelsSnapshot> orbLevelsMap = {};
   SadhuMlTrainingReport sadhuMlReport = SadhuMlTrainingReport.untrained;
 
   bool get isLiveMode =>
@@ -47,6 +55,26 @@ class AppState extends ChangeNotifier {
   MeasuredRegimeSnapshot get activeRegime =>
       measuredRegimes[selectedIndex] ??
       MeasuredRegimeSnapshot.collecting(selectedIndex.label, 0);
+
+  FuturesBasisSnapshot? get activeFuturesBasis =>
+      MinorIntelEngine.instance.getFuturesBasis(selectedIndex);
+
+  IndexContributionSummary get activeContribution =>
+      contributions[selectedIndex] ?? IndexContributionSummary.empty;
+
+  StraddleGammaSnapshot? get activeStraddleGamma =>
+      straddleGammas[selectedIndex];
+
+  IntradayLevelsSnapshot get activeOrbLevels =>
+      orbLevelsMap[selectedIndex] ?? IntradayLevelsSnapshot.collecting;
+
+  MacroSnapshot get macroSnapshot => MacroDataEngine.instance.current;
+  ParticipantOiSnapshot get participantOi =>
+      ParticipantOiEngine.instance.current;
+  List<MarketNewsItem> get newsItems =>
+      NewsWireEngine.instance.items;
+  int get newsLastFetchedMs => NewsWireEngine.instance.lastFetchedMs;
+  String get newsErrorNote => NewsWireEngine.instance.lastError;
 
   JournalCoachSummary get journalSummary =>
       JournalCoachEngine.analyze(openPositions);
@@ -85,7 +113,6 @@ class AppState extends ChangeNotifier {
         sadhuMlReport = SadhuMlEngine.instance.lastReport;
       }
     } catch (_) {
-      // Fail-closed: if persisted risk config cannot be loaded, keep strict defaults
       riskConfig = const RiskConfig();
     }
 
@@ -95,12 +122,44 @@ class AppState extends ChangeNotifier {
     };
 
     unawaited(DhanDataEngine.instance.initializeAndStart());
+    unawaited(refreshAllIntelligenceLayers(force: true));
 
     _supervisorTimer?.cancel();
     _supervisorTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       _onMarketTick();
     });
 
+    _intelTimer?.cancel();
+    _intelTimer = Timer.periodic(const Duration(seconds: 45), (_) {
+      unawaited(refreshAllIntelligenceLayers());
+    });
+
+    notifyListeners();
+  }
+
+  Future<void> refreshAllIntelligenceLayers({bool force = false}) async {
+    await Future.wait([
+      MacroDataEngine.instance.refresh(force: force),
+      NewsWireEngine.instance.refresh(force: force),
+      ParticipantOiEngine.instance.refreshLatest(force: force),
+      ConstituentFlowEngine.instance
+          .refreshForIndex(selectedIndex, force: force),
+    ]);
+    notifyListeners();
+  }
+
+  Future<void> refreshMacroNow() async {
+    await MacroDataEngine.instance.refresh(force: true);
+    notifyListeners();
+  }
+
+  Future<void> refreshParticipantOiNow() async {
+    await ParticipantOiEngine.instance.refreshLatest(force: true);
+    notifyListeners();
+  }
+
+  Future<void> refreshNewsNow() async {
+    await NewsWireEngine.instance.refresh(force: true);
     notifyListeners();
   }
 
@@ -156,12 +215,15 @@ class AppState extends ChangeNotifier {
     selectedIndex = index;
     DhanDataEngine.instance.switchActiveIndex(index);
     unawaited(ConstituentFlowEngine.instance.refreshForIndex(index));
+    final sp = DhanDataEngine.instance.spotPrices[index] ?? 0.0;
+    if (sp > 0) {
+      unawaited(MinorIntelEngine.instance.refreshFuturesBasis(index, sp));
+    }
     unawaited(_evaluateCurrentIndexSignal());
     notifyListeners();
   }
 
   bool toggleTradingMode(bool enableLive) {
-    // Strictly Paper-only until Phase 2 real broker order layer + unlock gates pass
     if (enableLive && !ExecutionEngine.liveTradingUnlocked) {
       tradingMode = TradingMode.paper;
       notifyListeners();
@@ -207,12 +269,40 @@ class AppState extends ChangeNotifier {
       limit: 60,
     );
 
-    // Real per-index measured market regime (zero hardcoded HMM constants)
+    // Real per-index measured market regime
     measuredRegimes[selectedIndex] = RegimeEngine.evaluate(
       indexLabel: selectedIndex.label,
       spotBars: spotBars,
       liveSpot: spot > 0 ? spot : null,
       indiaVix: FlowDataEngine.instance.indiaVix,
+    );
+
+    // Layer 1 (Minor) Real-Time Drivers: Futures Basis, Heavyweight Points, 0-DTE Straddle/Gamma & ORB
+    if (spot > 0) {
+      unawaited(
+          MinorIntelEngine.instance.refreshFuturesBasis(selectedIndex, spot));
+    }
+    final constSnap =
+        ConstituentFlowEngine.instance.getSnapshot(selectedIndex);
+    contributions[selectedIndex] = MinorIntelEngine.computeHeavyweightPoints(
+      index: selectedIndex,
+      spot: spot,
+      constituents: constSnap,
+    );
+    straddleGammas[selectedIndex] =
+        MinorIntelEngine.instance.evaluateStraddleAndGamma(
+      index: selectedIndex,
+      expiryIso: exp,
+      spot: spot,
+      rows: rows,
+    );
+    final breadthUpPct = (constSnap != null && constSnap.items.isNotEmpty)
+        ? (constSnap.inflows.length / constSnap.items.length) * 100.0
+        : null;
+    orbLevelsMap[selectedIndex] = MinorIntelEngine.evaluateOrbAndLevels(
+      spotBars: spotBars,
+      liveSpot: spot,
+      breadthUpPct: breadthUpPct,
     );
 
     currentSignal = MtfStrategyEngine.evaluateEntry(
@@ -251,13 +341,13 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// C5 + H4 Fix: Single-flight lock, 15:10 IST cut-off, fresh risk re-check & deterministic ID
   Future<ExecutionResult?> executeActiveSignal() async {
     if (_isExecutingOrder) return null;
     if (isAtOrPastEntryCutoffIst()) {
       await ForeverDatabase.instance.logAuditEvent(
         category: 'ENTRY_CUTOFF_BLOCKED',
-        message: 'Blocked entry after 15:10 IST cut-off (before 15:15 forced square-off).',
+        message:
+            'Blocked entry after 15:10 IST cut-off (before 15:15 forced square-off).',
       );
       return null;
     }
@@ -273,7 +363,6 @@ class AppState extends ChangeNotifier {
         return null;
       }
 
-      // Per-contract freshness check (H3)
       double? bid;
       double? ask;
       int? askQty;
@@ -363,7 +452,6 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Trains Sadhu AI ML Engine on strictly per-contract, non-overlapping real recorded bars
   Future<SadhuMlTrainingReport> trainSadhuMlFromRealBars() async {
     final raw = await ForeverDatabase.instance.getRecentBars(
       indexName: selectedIndex.label,
@@ -383,11 +471,12 @@ class AppState extends ChangeNotifier {
       list.sort((a, b) => a.timestampMs.compareTo(b.timestampMs));
       if (list.length < 10) continue;
 
-      // Step by `horizon` so training samples never overlap (eliminates autocorrelation leak)
       for (int i = 3; i + horizon < list.length; i += horizon) {
         final cur = list[i];
         final prev = list[i - 3];
-        if (cur.close <= 0 || prev.close <= 0 || prev.underlyingSpot <= 0) {
+        if (cur.close <= 0 ||
+            prev.close <= 0 ||
+            prev.underlyingSpot <= 0) {
           continue;
         }
 
@@ -401,7 +490,6 @@ class AppState extends ChangeNotifier {
         final absDelta = cur.delta.abs();
         final spreadNorm = (cur.spreadPct ?? 0.30) / 100.0;
 
-        // Triple-barrier label on the SAME contract timeline
         final targetPx = cur.close * 1.06;
         final stopPx = cur.close * 0.96;
         int label = 0;

@@ -32,6 +32,24 @@ class ResolvedContract {
       '${index.dhanSymbol}|$expiryIso|$strike|${optionType == OptionType.ce ? "CE" : "PE"}';
 }
 
+class ResolvedFutureContract {
+  final String securityId;
+  final String tradingSymbol;
+  final UnderlyingIndex index;
+  final String expiryIso;
+  final int lotSize;
+  final String exchangeSegment; // 'NFO' or 'BFO'
+
+  const ResolvedFutureContract({
+    required this.securityId,
+    required this.tradingSymbol,
+    required this.index,
+    required this.expiryIso,
+    required this.lotSize,
+    required this.exchangeSegment,
+  });
+}
+
 class ScripMasterEngine {
   static final ScripMasterEngine instance = ScripMasterEngine._();
   ScripMasterEngine._();
@@ -41,6 +59,10 @@ class ScripMasterEngine {
 
   final Map<String, ResolvedContract> _contractsByKey = {};
   final Map<String, String> _nseEquityTokens = {};
+  final Map<UnderlyingIndex, List<ResolvedFutureContract>>
+      _futuresByIndex = {
+    for (final u in UnderlyingIndex.values) u: <ResolvedFutureContract>[],
+  };
   final Map<UnderlyingIndex, List<String>> _expiriesByIndex = {
     for (final u in UnderlyingIndex.values) u: <String>[],
   };
@@ -58,18 +80,8 @@ class ScripMasterEngine {
   };
 
   static const Map<String, int> _monthMap = {
-    'JAN': 1,
-    'FEB': 2,
-    'MAR': 3,
-    'APR': 4,
-    'MAY': 5,
-    'JUN': 6,
-    'JUL': 7,
-    'AUG': 8,
-    'SEP': 9,
-    'OCT': 10,
-    'NOV': 11,
-    'DEC': 12,
+    'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
+    'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12,
   };
 
   static String? parseAngelExpiryToIso(String raw) {
@@ -100,13 +112,19 @@ class ScripMasterEngine {
 
   int get loadedEquityCount => _nseEquityTokens.length;
 
+  ResolvedFutureContract? getNearestFutureForIndex(UnderlyingIndex index) {
+    final list = _futuresByIndex[index];
+    if (list == null || list.isEmpty) return null;
+    return list.first;
+  }
+
   Future<bool> loadOrRefreshMaster({bool forceDownload = false}) async {
     try {
       final dir = await getApplicationDocumentsDirectory();
       final todayStr = DateFormat('yyyyMMdd').format(
           DateTime.now().toUtc().add(const Duration(hours: 5, minutes: 30)));
       final cacheFile =
-          File(join(dir.path, 'angel_sadhu_master_v3_$todayStr.json'));
+          File(join(dir.path, 'angel_sadhu_master_v4_$todayStr.json'));
       final trackedEq = ConstituentFlowEngine.allTrackedEquitySymbols;
 
       String jsonBody = '';
@@ -128,15 +146,15 @@ class ScripMasterEngine {
                 final name = (item['name'] ?? '').toString().toUpperCase();
                 final sym = (item['symbol'] ?? '').toString().toUpperCase();
 
-                final isTargetOpt = (exch == 'NFO' || exch == 'BFO') &&
-                    inst == 'OPTIDX' &&
+                final isTargetFo = (exch == 'NFO' || exch == 'BFO') &&
+                    (inst == 'OPTIDX' || inst == 'FUTIDX') &&
                     _allowedSymbols.contains(name);
                 final isTargetEq = exch == 'NSE' &&
                     sym.endsWith('-EQ') &&
                     (trackedEq.contains(name) ||
                         trackedEq.contains(sym.substring(0, sym.length - 3)));
 
-                if (isTargetOpt || isTargetEq) {
+                if (isTargetFo || isTargetEq) {
                   filtered.add(Map<String, dynamic>.from(item));
                 }
               }
@@ -156,8 +174,10 @@ class ScripMasterEngine {
       }
 
       final count = loadFromAngelJsonList(jsonDecode(jsonBody) as List);
+      final futCount = _futuresByIndex.values.fold<int>(
+          0, (sum, list) => sum + list.length);
       masterVersion =
-          'ANGEL-v3-$todayStr ($count opt, ${_nseEquityTokens.length} eq)';
+          'ANGEL-v4-$todayStr ($count opt, $futCount fut, ${_nseEquityTokens.length} eq)';
       isLoaded = count > 0;
       lastLoadError =
           isLoaded ? '' : 'No index option contracts found in master';
@@ -173,6 +193,7 @@ class ScripMasterEngine {
     _nseEquityTokens.clear();
     for (final idx in UnderlyingIndex.values) {
       _expiriesByIndex[idx] = [];
+      _futuresByIndex[idx] = [];
     }
     _lotSizeByIndex.clear();
 
@@ -196,17 +217,12 @@ class ScripMasterEngine {
 
       if (exch == 'NSE' && symbol.endsWith('-EQ') && token.isNotEmpty) {
         final baseSym = symbol.substring(0, symbol.length - 3);
-        if (trackedEq.contains(baseSym)) {
-          _nseEquityTokens[baseSym] = token;
-        }
-        if (trackedEq.contains(name)) {
-          _nseEquityTokens[name] = token;
-        }
+        if (trackedEq.contains(baseSym)) _nseEquityTokens[baseSym] = token;
+        if (trackedEq.contains(name)) _nseEquityTokens[name] = token;
         continue;
       }
 
-      if ((exch != 'NFO' && exch != 'BFO') || inst != 'OPTIDX') continue;
-
+      if (exch != 'NFO' && exch != 'BFO') continue;
       final idx = matchExactIndex(name);
       if (idx == null) continue;
       if (idx == UnderlyingIndex.sensex && exch != 'BFO') continue;
@@ -214,19 +230,29 @@ class ScripMasterEngine {
 
       final expIso = parseAngelExpiryToIso((raw['expiry'] ?? '').toString());
       final lotSize = int.tryParse((raw['lotsize'] ?? '0').toString()) ?? 0;
+      if (token.isEmpty || expIso == null || lotSize <= 0) continue;
+      if (expIso.compareTo(todayIso) < 0) continue;
+
+      if (inst == 'FUTIDX') {
+        _futuresByIndex[idx]!.add(ResolvedFutureContract(
+          securityId: token,
+          tradingSymbol: symbol,
+          index: idx,
+          expiryIso: expIso,
+          lotSize: lotSize,
+          exchangeSegment: exch,
+        ));
+        continue;
+      }
+
+      if (inst != 'OPTIDX') continue;
+
       final strikeRaw =
           double.tryParse((raw['strike'] ?? '0').toString()) ?? 0.0;
       final strike = strikeRaw > 100000
           ? (strikeRaw / 100.0).round()
           : strikeRaw.round();
-
-      if (token.isEmpty ||
-          expIso == null ||
-          lotSize <= 0 ||
-          strike <= 0) {
-        continue;
-      }
-      if (expIso.compareTo(todayIso) < 0) continue;
+      if (strike <= 0) continue;
 
       OptionType? optType;
       if (symbol.endsWith('CE')) {
@@ -255,6 +281,7 @@ class ScripMasterEngine {
     for (final idx in UnderlyingIndex.values) {
       final sorted = expirySets[idx]!.toList()..sort();
       _expiriesByIndex[idx] = sorted;
+      _futuresByIndex[idx]!.sort((a, b) => a.expiryIso.compareTo(b.expiryIso));
     }
     isLoaded = loaded > 0;
     return loaded;

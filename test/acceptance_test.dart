@@ -5,8 +5,10 @@ import 'package:ai_options_pro/core/models.dart';
 import 'package:ai_options_pro/core/totp_auth.dart';
 import 'package:ai_options_pro/data/angel_smartapi_engine.dart';
 import 'package:ai_options_pro/data/angel_ws_streamer.dart';
+import 'package:ai_options_pro/data/constituent_flow_engine.dart';
+import 'package:ai_options_pro/data/news_wire_engine.dart';
+import 'package:ai_options_pro/data/participant_oi_engine.dart';
 import 'package:ai_options_pro/data/scrip_master_engine.dart';
-import 'package:ai_options_pro/data/strike_selector.dart';
 import 'package:ai_options_pro/engine/backtest_engine.dart';
 import 'package:ai_options_pro/engine/execution_engine.dart';
 import 'package:ai_options_pro/engine/exit_manager.dart';
@@ -15,6 +17,7 @@ import 'package:ai_options_pro/engine/journal_coach_engine.dart';
 import 'package:ai_options_pro/engine/ledger_reconciler.dart';
 import 'package:ai_options_pro/engine/math_greeks.dart';
 import 'package:ai_options_pro/engine/microstructure_engine.dart';
+import 'package:ai_options_pro/engine/minor_intel_engine.dart';
 import 'package:ai_options_pro/engine/monte_carlo_engine.dart';
 import 'package:ai_options_pro/engine/mtf_strategy_engine.dart';
 import 'package:ai_options_pro/engine/quantstats_engine.dart';
@@ -31,13 +34,12 @@ String _makeTestJwt(int expEpochSec) {
 
 void main() {
   test('Phase1_C1_C2_C3: Per-contract 2-option backtest is isolated & reproducible', () {
-    // 10:00 IST = 04:30 UTC (before 15:10 IST cut-off)
     final baseMs = DateTime.utc(2026, 11, 20, 4, 30).millisecondsSinceEpoch;
     final bars = <OneMinEnrichedBar>[];
 
     for (int i = 0; i < 10; i++) {
       final ts = baseMs + i * 60000;
-      final spot = 24000.0 + i * 25.0; // steady uptrend
+      final spot = 24000.0 + i * 25.0;
       bars.add(OneMinEnrichedBar(
         timestampMs: ts,
         contractId: 'SPOT_NIFTY',
@@ -59,7 +61,6 @@ void main() {
         vega: 0,
       ));
 
-      // Contract 1: CE_24000 rises cleanly to hit target
       final cePx = 100.0 + i * 6.0;
       bars.add(OneMinEnrichedBar(
         timestampMs: ts,
@@ -85,7 +86,6 @@ void main() {
         spreadPct: 0.20,
       ));
 
-      // Contract 2: PE_24000 crashes (must NEVER leak into CE_24000 trade path)
       final pePx = (80.0 - i * 7.0).clamp(5.0, 200.0).toDouble();
       bars.add(OneMinEnrichedBar(
         timestampMs: ts,
@@ -101,8 +101,8 @@ void main() {
         low: pePx - 4.0,
         close: pePx,
         intervalVolume: 50000,
-        absoluteOi: 160000, // PCR = 1.60 >= 1.05
-        oiChange15m: 90000, // Net ΔOI = +140,000 lots
+        absoluteOi: 160000,
+        oiChange15m: 90000,
         iv: 15.0,
         delta: -0.48,
         gamma: 0.001,
@@ -173,7 +173,6 @@ void main() {
     expect(bull.bullProb, greaterThan(bull.bearProb));
     expect(bear.bearProb, greaterThan(bear.bullProb));
 
-    // H4: 15:11 IST blocked, 10:30 IST allowed
     expect(
       AppState.isAtOrPastEntryCutoffIst(
           nowUtc: DateTime.utc(2026, 11, 20, 9, 41)),
@@ -185,7 +184,6 @@ void main() {
       isFalse,
     );
 
-    // H6: JWT real exp validation
     final nowSec = DateTime.now().toUtc().millisecondsSinceEpoch ~/ 1000;
     expect(AngelSmartApiEngine.isJwtValid(_makeTestJwt(nowSec + 3600)), isTrue);
     expect(AngelSmartApiEngine.isJwtValid(_makeTestJwt(nowSec - 120)), isFalse);
@@ -266,6 +264,174 @@ void main() {
     expect(coach.currentStreakDays, 2);
   });
 
+  test('Phase2_IntelLayers: FUTIDX + NSE Participant OI + RSS News + Minor Pulse', () {
+    // 1. FUTIDX resolution
+    final master = ScripMasterEngine.instance;
+    master.loadFromAngelJsonList([
+      {
+        'token': '99001',
+        'symbol': 'NIFTY26NOV26FUT',
+        'name': 'NIFTY',
+        'expiry': '26NOV2026',
+        'strike': '0',
+        'lotsize': '65',
+        'instrumenttype': 'FUTIDX',
+        'exch_seg': 'NFO',
+      },
+      {
+        'token': '99002',
+        'symbol': 'NIFTY26NOV2624000CE',
+        'name': 'NIFTY',
+        'expiry': '26NOV2026',
+        'strike': '2400000',
+        'lotsize': '65',
+        'instrumenttype': 'OPTIDX',
+        'exch_seg': 'NFO',
+      },
+    ], referenceNowUtc: DateTime.utc(2026, 11, 25, 6, 0));
+    final fut = master.getNearestFutureForIndex(UnderlyingIndex.nifty50);
+    expect(fut?.securityId, '99001');
+    expect(fut?.tradingSymbol, 'NIFTY26NOV26FUT');
+
+    // 2. Official NSE Participant OI CSV parsing
+    const sampleCsv = 'Participant Wise Open Interest\n'
+        'Client Type,Future Index Long,Future Index Short,Future Stock Long,Future Stock Short,Option Index Call Long,Option Index Put Long,Option Index Call Short,Option Index Put Short\n'
+        'Client,250000,180000,1000,1000,500000,400000,450000,380000\n'
+        'DII,80000,40000,1000,1000,10000,20000,5000,10000\n'
+        'FII,120000,180000,1000,1000,200000,300000,260000,220000\n'
+        'Pro,60000,110000,1000,1000,150000,140000,145000,250000\n';
+    final oiSnap = ParticipantOiEngine.parseNseCsv(sampleCsv, '25-Nov-2026');
+    expect(oiSnap, isNotNull);
+    expect(oiSnap!.fii?.netIndexFutures, -60000);
+    expect(oiSnap.fii?.futLongRatioPct, closeTo(40.0, 0.1));
+    expect(oiSnap.dii?.netIndexFutures, 40000);
+
+    // 3. Official RSS News parsing & high-impact tagging
+    const sampleRss = '<rss><channel>'
+        '<item><title>RBI MPC announces Repo Rate policy update</title>'
+        '<link>https://rbi.org.in/pr1</link>'
+        '<pubDate>Thu, 26 Nov 2026 04:00:00 GMT</pubDate></item>'
+        '<item><title>HDFC Bank quarterly disclosure</title>'
+        '<link>https://nseindia.com/a1</link>'
+        '<pubDate>Thu, 26 Nov 2026 04:15:00 GMT</pubDate></item>'
+        '</channel></rss>';
+    final rbiNews = NewsWireEngine.parseRssXml(sampleRss, 'RBI');
+    expect(rbiNews.length, 2);
+    expect(rbiNews.first.isHighImpact, isTrue);
+    expect(rbiNews.first.impactTag, 'POLICY');
+    final nseNews = NewsWireEngine.parseRssXml(sampleRss, 'NSE');
+    expect(nseNews[1].isHighImpact, isTrue);
+    expect(nseNews[1].impactTag, 'HEAVYWEIGHT');
+
+    // 4. Heavyweight narrow-rally trap math
+    ConstituentFlowItem mkStock(String sym, double chg) => ConstituentFlowItem(
+          symbol: sym,
+          ltp: 1000,
+          open: 1000,
+          high: 1020,
+          low: 990,
+          changePct: chg,
+          volume: 100000,
+          turnoverCr: 10.0,
+          rangePressure: chg >= 0 ? 0.8 : 0.2,
+        );
+    final constSnap = IndexConstituentFlowSnapshot(
+      index: UnderlyingIndex.nifty50,
+      items: [
+        mkStock('HDFCBANK', 2.5),
+        mkStock('RELIANCE', 2.0),
+        mkStock('ICICIBANK', 2.0),
+        mkStock('ITC', -0.2),
+        mkStock('WIPRO', -0.2),
+        mkStock('TECHM', -0.2),
+        mkStock('CIPLA', -0.2),
+        mkStock('ONGC', -0.2),
+        mkStock('NTPC', -0.2),
+        mkStock('BEL', -0.2),
+      ],
+      fetchedAtMs: 1764000000000,
+    );
+    final contrib = MinorIntelEngine.computeHeavyweightPoints(
+      index: UnderlyingIndex.nifty50,
+      spot: 24000.0,
+      constituents: constSnap,
+    );
+    expect(contrib.isNarrowTrap, isTrue);
+    expect(contrib.topDrivers.first.symbol, 'HDFCBANK');
+
+    // 5. 0-DTE Straddle & Gamma Blast Zone + ORB Trap
+    final straddle = MinorIntelEngine.instance.evaluateStraddleAndGamma(
+      index: UnderlyingIndex.nifty50,
+      expiryIso: '2026-11-26',
+      spot: 24000.0,
+      nowUtc: DateTime.utc(2026, 11, 26, 5, 0),
+      rows: const [
+        StrikeRowSnapshot(
+          strike: 24000,
+          offset: 0,
+          ceSecurityId: 'C1',
+          peSecurityId: 'P1',
+          ceTradingSymbol: 'NIFTY_24000_CE',
+          peTradingSymbol: 'NIFTY_24000_PE',
+          lotSize: 65,
+          ceLtp: 120.0,
+          peLtp: 110.0,
+          ceOi: 50000,
+          peOi: 60000,
+          ceVolume: 10000,
+          peVolume: 10000,
+          ceDelta: 0.5,
+          peDelta: -0.5,
+          ceGamma: 0.002,
+          peGamma: 0.002,
+          ceTheta: -20.0,
+          peTheta: -20.0,
+          ceVega: 5.0,
+          peVega: 5.0,
+          source: 'TEST',
+          exchangeTimestampMs: 1764000000000,
+          receivedAtMs: 1764000000000,
+        ),
+      ],
+    );
+    expect(straddle, isNotNull);
+    expect(straddle!.atmStraddlePrice, closeTo(230.0, 1e-6));
+    expect(straddle.isZeroDte, isTrue);
+    expect(straddle.gammaBlastAlert, isTrue);
+
+    final orbBaseMs = DateTime.utc(2026, 11, 26, 3, 45).millisecondsSinceEpoch; // 09:15 IST
+    final orbBars = List.generate(
+      5,
+      (i) => OneMinEnrichedBar(
+        timestampMs: orbBaseMs + i * 60000,
+        contractId: 'SPOT_NIFTY',
+        indexName: 'NIFTY 50',
+        expiry: '2026-11-26',
+        strike: 0,
+        optionType: 'SPOT',
+        strikeOffset: 0,
+        underlyingSpot: 24050.0,
+        open: 24040.0,
+        high: 24100.0,
+        low: 24000.0,
+        close: 24050.0,
+        intervalVolume: 0,
+        absoluteOi: 0,
+        delta: 1,
+        gamma: 0,
+        theta: 0,
+        vega: 0,
+      ),
+    );
+    final orb = MinorIntelEngine.evaluateOrbAndLevels(
+      spotBars: orbBars,
+      liveSpot: 24150.0,
+      breadthUpPct: 35.0,
+    );
+    expect(orb.stateLabel, 'ABOVE ORB');
+    expect(orb.divergenceTrap, isTrue);
+  });
+
   test('Core_Infra: Sensex BFO + NSE Constituents + WS v2 + Black-76 + QuantStats', () {
     final master = ScripMasterEngine.instance;
     final loaded = master.loadFromAngelJsonList([
@@ -321,7 +487,8 @@ void main() {
 
     final tick = AngelWsStreamer.parseBinaryPacket(buf);
     expect(tick?.ltp, closeTo(245.50, 0.001));
-    expect(MicrostructureEngine.instance.ingestTick(tick!).weightedObi, greaterThan(0.4));
+    expect(MicrostructureEngine.instance.ingestTick(tick!).weightedObi,
+        greaterThan(0.4));
 
     const f = 24050.0, k = 24000.0, t = 5.0 / 365.0, sigma = 0.16;
     final cPrice = MathGreeksEngine.black76Price(
