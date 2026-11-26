@@ -24,9 +24,9 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('pubspec.yaml') }}
+          key: gradle-v2-${{ runner.os }}-${{ hashFiles('pubspec.yaml') }}
           restore-keys: |
-            gradle-${{ runner.os }}-
+            gradle-v2-${{ runner.os }}-
 
       - name: Configure Google Maven Central Mirror (Fix 429 Rate Limit)
         run: |
@@ -58,6 +58,16 @@ jobs:
         run: |
           flutter pub get
           flutter test test/acceptance_test.dart
+
+      - name: Rewrite mavenCentral() to Google Mirror across Android, Flutter Gradle & Plugins
+        run: |
+          MIRROR='https://maven-central.storage-download.googleapis.com/maven2/'
+          find android "$FLUTTER_ROOT/packages/flutter_tools/gradle" ~/.pub-cache/hosted -type f -name "*.gradle" 2>/dev/null | while read -r f; do
+            sed -i "s|mavenCentral()|maven { url '$MIRROR' }|g" "$f" || true
+          done
+          find android "$FLUTTER_ROOT/packages/flutter_tools/gradle" ~/.pub-cache/hosted -type f -name "*.gradle.kts" 2>/dev/null | while read -r f; do
+            sed -i "s|mavenCentral()|maven(url = \"$MIRROR\")|g" "$f" || true
+          done
 
       - name: Build Compressed arm64 Release APK
         run: flutter build apk --release --target-platform android-arm64 --split-per-abi

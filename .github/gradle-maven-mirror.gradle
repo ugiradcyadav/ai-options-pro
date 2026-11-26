@@ -1,26 +1,66 @@
 def mirrorUrl = "https://maven-central.storage-download.googleapis.com/maven2/"
 
-def redirectMavenCentral = { repos ->
+def patchRepos = { repos ->
     if (repos == null) return
     repos.all { repo ->
         if (repo instanceof MavenArtifactRepository) {
             def u = repo.url?.toString() ?: ""
-            if (u.startsWith("https://repo.maven.apache.org/maven2") ||
-                u.startsWith("https://repo1.maven.org/maven2") ||
-                u.startsWith("http://repo.maven.apache.org/maven2") ||
-                u.startsWith("http://repo1.maven.org/maven2")) {
+            if (u.contains("repo.maven.apache.org") || u.contains("repo1.maven.org")) {
                 repo.setUrl(URI.create(mirrorUrl))
             }
         }
     }
 }
 
-gradle.settingsEvaluated { settings ->
-    try { redirectMavenCentral(settings.pluginManagement.repositories) } catch (ignored) {}
-    try { redirectMavenCentral(settings.dependencyResolutionManagement.repositories) } catch (ignored) {}
+def ensureMirrorFirst = { repos ->
+    if (repos == null) return
+    patchRepos(repos)
+    def existing = repos.find {
+        it instanceof MavenArtifactRepository &&
+        (it.url?.toString() ?: "").startsWith(mirrorUrl)
+    }
+    if (existing == null) {
+        existing = repos.maven {
+            name = "GoogleMavenCentralMirror"
+            url = URI.create(mirrorUrl)
+        }
+    }
+    repos.remove(existing)
+    repos.addFirst(existing)
 }
 
-gradle.allprojects { proj ->
-    redirectMavenCentral(proj.buildscript.repositories)
-    redirectMavenCentral(proj.repositories)
+beforeSettings { settings ->
+    try { patchRepos(settings.buildscript.repositories) } catch (ignored) {}
+    try { patchRepos(settings.pluginManagement.repositories) } catch (ignored) {}
+    try { patchRepos(settings.dependencyResolutionManagement.repositories) } catch (ignored) {}
+}
+
+settingsEvaluated { settings ->
+    try {
+        if (settings.pluginManagement.repositories.isEmpty()) {
+            settings.pluginManagement.repositories.google()
+            settings.pluginManagement.repositories.maven {
+                name = "GoogleMavenCentralMirror"
+                url = URI.create(mirrorUrl)
+            }
+            settings.pluginManagement.repositories.gradlePluginPortal()
+        } else {
+            ensureMirrorFirst(settings.pluginManagement.repositories)
+        }
+    } catch (ignored) {}
+    try {
+        if (!settings.dependencyResolutionManagement.repositories.isEmpty()) {
+            ensureMirrorFirst(settings.dependencyResolutionManagement.repositories)
+        }
+    } catch (ignored) {}
+}
+
+beforeProject { proj ->
+    try { ensureMirrorFirst(proj.buildscript.repositories) } catch (ignored) {}
+    try { ensureMirrorFirst(proj.repositories) } catch (ignored) {}
+}
+
+allprojects { proj ->
+    try { patchRepos(proj.buildscript.repositories) } catch (ignored) {}
+    try { patchRepos(proj.repositories) } catch (ignored) {}
 }
