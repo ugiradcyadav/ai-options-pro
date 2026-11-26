@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -44,11 +45,38 @@ class AngelSmartApiEngine {
   String _resolvedPublicIp = '';
   static const String _androidOsMac = '02:00:00:00:00:00';
 
+  // Strict global 1 req / 1.15s queue for Angel One /market/v1/quote/ (prevents 403/429)
+  Future<void> _quoteQueueTail = Future<void>.value();
+  int _lastQuoteEndMs = 0;
+  static const int _minQuoteGapMs = 1150;
+
+  final Map<UnderlyingIndex, double> _lastSpotByIndex = {};
   final Map<String, int> _lastDbPersistMsByIndex = {};
   final Map<String, Map<String, int?>> _cachedOiDeltas = {};
 
   String get savedPin => _pin;
   String get savedTotpKey => _totpKey;
+
+  Future<T> _runSerializedQuote<T>(
+      Future<T> Function() action) {
+    final completer = Completer<T>();
+    _quoteQueueTail = _quoteQueueTail.then((_) async {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final waitMs = _minQuoteGapMs - (now - _lastQuoteEndMs);
+      if (waitMs > 0) {
+        await Future.delayed(Duration(milliseconds: waitMs));
+      }
+      try {
+        final res = await action();
+        _lastQuoteEndMs = DateTime.now().millisecondsSinceEpoch;
+        if (!completer.isCompleted) completer.complete(res);
+      } catch (e, st) {
+        _lastQuoteEndMs = DateTime.now().millisecondsSinceEpoch;
+        if (!completer.isCompleted) completer.completeError(e, st);
+      }
+    });
+    return completer.future;
+  }
 
   Future<String> _safeSecureRead(String key) async {
     try {
@@ -68,7 +96,6 @@ class AngelSmartApiEngine {
     } catch (_) {}
   }
 
-  /// Decodes JWT payload `exp` claim to check real session validity (60s safety buffer)
   static DateTime? parseJwtExpiryUtc(String token) {
     final clean = token.trim();
     if (clean.isEmpty) return null;
@@ -90,7 +117,7 @@ class AngelSmartApiEngine {
     final clean = token.trim();
     if (clean.isEmpty) return false;
     final exp = parseJwtExpiryUtc(clean);
-    if (exp == null) return true; // Non-JWT opaque token fallback
+    if (exp == null) return true;
     final now = nowUtc ?? DateTime.now().toUtc();
     return now.isBefore(exp.subtract(const Duration(seconds: 60)));
   }
@@ -181,7 +208,8 @@ class AngelSmartApiEngine {
     final h = <String, String>{
       'Content-Type': 'application/json',
       'Accept': 'application/json',
-      'User-Agent': 'SadhuAI-Android/5.0',
+      'User-Agent':
+          'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36',
       'X-UserType': 'USER',
       'X-SourceID': 'WEB',
       'X-ClientLocalIP': localIp,
@@ -209,11 +237,11 @@ class AngelSmartApiEngine {
             .toString()
             .trim();
         if (code.isNotEmpty || msg.isNotEmpty) {
-          return '[Sadhu AI] Angel rejected (${code.isNotEmpty ? code : "HTTP ${resp.statusCode}"}): $msg';
+          return '[Angel ${code.isNotEmpty ? code : "HTTP ${resp.statusCode}"}] $msg';
         }
       }
     } catch (_) {}
-    return '[Sadhu AI] Angel login failed (HTTP ${resp.statusCode}).';
+    return '[Angel HTTP ${resp.statusCode}] Quote/Auth rejected.';
   }
 
   Future<bool> loginAndSave({
@@ -278,7 +306,6 @@ class AngelSmartApiEngine {
     await loadSavedConfig();
     await _ensureRealNetworkInfo();
 
-    // Reuse saved JWT only if it is actually unexpired
     if (!forceLogin && jwtToken.isNotEmpty && isJwtValid(jwtToken)) {
       return true;
     }
@@ -334,43 +361,100 @@ class AngelSmartApiEngine {
     }
   }
 
-  /// Batch market quote fetcher (up to 50 tokens per chunk) for constituents & sectors
-  Future<List<Map<String, dynamic>>> fetchBatchMarketQuotes({
-    required String exchange,
-    required List<String> tokens,
-  }) async {
-    if (tokens.isEmpty) return const [];
+  /// Serialized multi-exchange quote fetcher (strictly <= 50 tokens total per call, 1.15s rate limit)
+  Future<List<Map<String, dynamic>>> fetchMultiExchangeQuotes(
+    Map<String, List<String>> exchangeTokens,
+  ) async {
+    final cleaned = <String, List<String>{};
+    int totalCount = 0;
+    exchangeTokens.forEach((exch, toks) {
+      final list = toks.where((t) => t.trim().isNotEmpty).toSet().toList();
+      if (list.isNotEmpty) {
+        cleaned[exch] = list;
+        totalCount += list.length;
+      }
+    });
+    if (totalCount == 0) return const [];
+
     await _ensureRealNetworkInfo();
     if (!hasValidJwt) {
       final ok = await ensureSession();
       if (!ok) return const [];
     }
 
+    return _runSerializedQuote(() async {
+      for (int attempt = 0; attempt < 2; attempt++) {
+        try {
+          final resp = await SafeBrokerHttp.post(
+            Uri.parse(
+                'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/'),
+            headers: _buildHeaders(),
+            body: jsonEncode({
+              'mode': 'FULL',
+              'exchangeTokens': cleaned,
+            }),
+            timeout: const Duration(seconds: 7),
+          );
+
+          if (resp.statusCode == 200) {
+            final body = jsonDecode(resp.body);
+            if (body is Map && body['status'] == true) {
+              final fetched = body['data']?['fetched'] as List? ?? [];
+              lastError = '';
+              return fetched
+                  .whereType<Map>()
+                  .map((m) => Map<String, dynamic>.from(m))
+                  .toList();
+            }
+            final errCode = (body is Map
+                    ? (body['errorcode'] ?? body['errorCode'] ?? '')
+                    : '')
+                .toString()
+                .toUpperCase();
+            lastError = _extractSafeBrokerError(resp);
+            if ((errCode == 'AB1010' || errCode == 'AG8001') && attempt == 0) {
+              final relogged = await ensureSession(forceLogin: true);
+              if (relogged) continue;
+            }
+            if (attempt == 0) {
+              await Future.delayed(const Duration(milliseconds: 1400));
+              continue;
+            }
+            return const <Map<String, dynamic>>[];
+          }
+
+          lastError = _extractSafeBrokerError(resp);
+          if ((resp.statusCode == 403 || resp.statusCode == 429) &&
+              attempt == 0) {
+            await Future.delayed(const Duration(milliseconds: 1500));
+            continue;
+          }
+          return const <Map<String, dynamic>>[];
+        } catch (e) {
+          lastError = 'Angel quote error: $e';
+          if (attempt == 0) {
+            await Future.delayed(const Duration(milliseconds: 1200));
+            continue;
+          }
+          return const <Map<String, dynamic>>[];
+        }
+      }
+      return const <Map<String, dynamic>>[];
+    });
+  }
+
+  /// Serialized single-exchange batch quote fetcher (chunks of 50 tokens)
+  Future<List<Map<String, dynamic>>> fetchBatchMarketQuotes({
+    required String exchange,
+    required List<String> tokens,
+  }) async {
+    if (tokens.isEmpty) return const [];
     final results = <Map<String, dynamic>>[];
     for (int start = 0; start < tokens.length; start += 50) {
       final end = (start + 50 > tokens.length) ? tokens.length : start + 50;
       final chunk = tokens.sublist(start, end);
-      try {
-        final resp = await SafeBrokerHttp.post(
-          Uri.parse(
-              'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/'),
-          headers: _buildHeaders(),
-          body: jsonEncode({
-            'mode': 'FULL',
-            'exchangeTokens': {exchange: chunk},
-          }),
-          timeout: const Duration(seconds: 6),
-        );
-        if (resp.statusCode == 200) {
-          final body = jsonDecode(resp.body);
-          final fetched = body['data']?['fetched'] as List? ?? [];
-          for (final item in fetched) {
-            if (item is Map) {
-              results.add(Map<String, dynamic>.from(item));
-            }
-          }
-        }
-      } catch (_) {}
+      final batch = await fetchMultiExchangeQuotes({exchange: chunk});
+      results.addAll(batch);
     }
     return results;
   }
@@ -437,25 +521,31 @@ class AngelSmartApiEngine {
     final idxToken = spotTokenForIndex(index);
     final spotExch = index.spotExchange;
     final foExch = index.foExchange;
-    double spot = 0.0;
+    double spot = _lastSpotByIndex[index] ?? 0.0;
     double changePct = 0.0;
     final exchangeTsMs = DateTime.now().millisecondsSinceEpoch;
 
-    final spotFetched =
-        await fetchBatchMarketQuotes(exchange: spotExch, tokens: [idxToken]);
-    if (spotFetched.isNotEmpty) {
-      final item = spotFetched.first;
-      spot = ((item['ltp'] ?? 0) as num).toDouble();
-      changePct = ((item['percentChange'] ?? 0) as num).toDouble();
-    } else {
-      lastError = 'Spot quote unavailable for ${index.label}.';
-      return null;
+    // First-ever poll for this index: resolve spot once so ATM strike band can be built
+    if (spot <= 0) {
+      final spotFetched =
+          await fetchBatchMarketQuotes(exchange: spotExch, tokens: [idxToken]);
+      if (spotFetched.isNotEmpty) {
+        final item = spotFetched.first;
+        spot = ((item['ltp'] ?? 0) as num).toDouble();
+        changePct = ((item['percentChange'] ?? 0) as num).toDouble();
+        if (spot > 0) _lastSpotByIndex[index] = spot;
+      } else {
+        if (lastError.isEmpty) {
+          lastError = 'Spot quote unavailable for ${index.label}.';
+        }
+        return null;
+      }
     }
-
     if (spot <= 0) return null;
 
+    // ATM ± 10 strikes = 21 strikes x 2 = 42 option tokens + 1 spot = 43 tokens in ONE single call!
     final band =
-        StrikeSelectionEngine.getMonitoringStrikeBand(index, spot, radius: 12);
+        StrikeSelectionEngine.getMonitoringStrikeBand(index, spot, radius: 10);
     final atm = StrikeSelectionEngine.computeAtmStrike(index, spot);
     final step = index.strikeStep;
     final tYears =
@@ -494,14 +584,29 @@ class AngelSmartApiEngine {
       return null;
     }
 
-    final foFetched =
-        await fetchBatchMarketQuotes(exchange: foExch, tokens: foTokens);
+    // Combine Spot + Options into ONE single rate-limited REST request
+    final multiPayload = <String, List<String>{
+      spotExch: [idxToken],
+      foExch: foTokens,
+    };
+    final combinedFetched = await fetchMultiExchangeQuotes(multiPayload);
     final Map<String, Map> quoteByToken = {};
-    for (final f in foFetched) {
+    for (final f in combinedFetched) {
       final tok = (f['symbolToken'] ?? '').toString();
       if (tok.isNotEmpty) quoteByToken[tok] = f;
     }
-    if (quoteByToken.isEmpty) return null;
+
+    final liveSpotMap = quoteByToken[idxToken];
+    if (liveSpotMap != null) {
+      final s = ((liveSpotMap['ltp'] ?? 0) as num).toDouble();
+      if (s > 0) {
+        spot = s;
+        _lastSpotByIndex[index] = s;
+      }
+      changePct = ((liveSpotMap['percentChange'] ?? changePct) as num).toDouble();
+    }
+
+    if (quoteByToken.length <= 1) return null;
 
     final receivedAtMs = DateTime.now().millisecondsSinceEpoch;
     final db = ForeverDatabase.instance;
