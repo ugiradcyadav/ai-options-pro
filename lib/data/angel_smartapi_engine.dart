@@ -365,7 +365,7 @@ class AngelSmartApiEngine {
   Future<List<Map<String, dynamic>>> fetchMultiExchangeQuotes(
     Map<String, List<String>> exchangeTokens,
   ) async {
-    final cleaned = <String, List<String>{};
+    final cleaned = <String, List<String>>{};
     int totalCount = 0;
     exchangeTokens.forEach((exch, toks) {
       final list = toks.where((t) => t.trim().isNotEmpty).toSet().toList();
@@ -585,7 +585,7 @@ class AngelSmartApiEngine {
     }
 
     // Combine Spot + Options into ONE single rate-limited REST request
-    final multiPayload = <String, List<String>{
+    final multiPayload = <String, List<String>>{
       spotExch: [idxToken],
       foExch: foTokens,
     };
