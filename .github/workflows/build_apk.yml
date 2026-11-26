@@ -18,6 +18,21 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
+      - name: Cache Gradle Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('pubspec.yaml') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Configure Google Maven Central Mirror (Fix 429 Rate Limit)
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cp .github/gradle-maven-mirror.gradle ~/.gradle/init.d/maven-mirror.gradle
+
       - name: Set up Flutter SDK
         uses: subosito/flutter-action@v2
         with:

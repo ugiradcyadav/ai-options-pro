@@ -1,0 +1,26 @@
+def mirrorUrl = "https://maven-central.storage-download.googleapis.com/maven2/"
+
+def redirectMavenCentral = { repos ->
+    if (repos == null) return
+    repos.all { repo ->
+        if (repo instanceof MavenArtifactRepository) {
+            def u = repo.url?.toString() ?: ""
+            if (u.startsWith("https://repo.maven.apache.org/maven2") ||
+                u.startsWith("https://repo1.maven.org/maven2") ||
+                u.startsWith("http://repo.maven.apache.org/maven2") ||
+                u.startsWith("http://repo1.maven.org/maven2")) {
+                repo.setUrl(URI.create(mirrorUrl))
+            }
+        }
+    }
+}
+
+gradle.settingsEvaluated { settings ->
+    try { redirectMavenCentral(settings.pluginManagement.repositories) } catch (ignored) {}
+    try { redirectMavenCentral(settings.dependencyResolutionManagement.repositories) } catch (ignored) {}
+}
+
+gradle.allprojects { proj ->
+    redirectMavenCentral(proj.buildscript.repositories)
+    redirectMavenCentral(proj.repositories)
+}
