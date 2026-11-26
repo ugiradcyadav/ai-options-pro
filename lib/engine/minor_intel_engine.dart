@@ -166,7 +166,7 @@ class MinorIntelEngine {
     if (liveSpot <= 0) return _basisCache[idx];
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     final prev = _basisCache[idx];
-    if (!force && prev != null && (nowMs - prev.fetchedAtMs) < 5000) {
+    if (!force && prev != null && (nowMs - prev.fetchedAtMs) < 10000) {
       return prev;
     }
     if (_basisInFlight[idx] == true) return prev;

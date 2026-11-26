@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart' hide TextDirection;
 import 'package:path/path.dart';
@@ -69,6 +70,7 @@ class ScripMasterEngine {
   final Map<UnderlyingIndex, int> _lotSizeByIndex = {};
 
   bool isLoaded = false;
+  bool _loadingInFlight = false;
   String masterVersion = 'UNLOADED';
   String lastLoadError = '';
 
@@ -118,7 +120,56 @@ class ScripMasterEngine {
     return list.first;
   }
 
+  static String _filterMasterJsonInIsolate(
+    String rawBody,
+    Set<String> trackedEq,
+  ) {
+    final decoded = jsonDecode(rawBody);
+    if (decoded is! List) return '';
+    final filtered = <Map<String, dynamic>>[];
+    for (final item in decoded) {
+      if (item is Map) {
+        final exch = (item['exch_seg'] ?? '').toString().toUpperCase();
+        final inst = (item['instrumenttype'] ?? '').toString().toUpperCase();
+        final name = (item['name'] ?? '').toString().toUpperCase();
+        final sym = (item['symbol'] ?? '').toString().toUpperCase();
+
+        final isTargetFo = (exch == 'NFO' || exch == 'BFO') &&
+            (inst == 'OPTIDX' || inst == 'FUTIDX') &&
+            _allowedSymbols.contains(name);
+        final isTargetEq = exch == 'NSE' &&
+            sym.endsWith('-EQ') &&
+            (trackedEq.contains(name) ||
+                trackedEq.contains(sym.substring(0, sym.length - 3)));
+
+        if (isTargetFo || isTargetEq) {
+          filtered.add(Map<String, dynamic>.from(item));
+        }
+      }
+    }
+    return jsonEncode(filtered);
+  }
+
+  Future<File?> _findLatestCachedMasterFile(Directory dir) async {
+    try {
+      final files = dir
+          .listSync()
+          .whereType<File>()
+          .where((f) =>
+              basename(f.path).startsWith('angel_sadhu_master_') &&
+              f.path.endsWith('.json'))
+          .toList();
+      if (files.isEmpty) return null;
+      files.sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
+      return files.first;
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<bool> loadOrRefreshMaster({bool forceDownload = false}) async {
+    if (_loadingInFlight) return isLoaded;
+    _loadingInFlight = true;
     try {
       final dir = await getApplicationDocumentsDirectory();
       final todayStr = DateFormat('yyyyMMdd').format(
@@ -128,48 +179,51 @@ class ScripMasterEngine {
       final trackedEq = ConstituentFlowEngine.allTrackedEquitySymbols;
 
       String jsonBody = '';
-      if (!forceDownload && await cacheFile.exists()) {
+      if (!forceDownload &&
+          await cacheFile.exists() &&
+          await cacheFile.length() > 1024) {
         jsonBody = await cacheFile.readAsString();
       } else {
-        final resp = await http
-            .get(Uri.parse(angelMasterUrl))
-            .timeout(const Duration(seconds: 35));
-        if (resp.statusCode == 200 && resp.body.isNotEmpty) {
-          final decoded = jsonDecode(resp.body);
-          if (decoded is List) {
-            final filtered = <Map<String, dynamic>>[];
-            for (final item in decoded) {
-              if (item is Map) {
-                final exch = (item['exch_seg'] ?? '').toString().toUpperCase();
-                final inst =
-                    (item['instrumenttype'] ?? '').toString().toUpperCase();
-                final name = (item['name'] ?? '').toString().toUpperCase();
-                final sym = (item['symbol'] ?? '').toString().toUpperCase();
+        try {
+          final resp = await http.get(
+            Uri.parse(angelMasterUrl),
+            headers: const {
+              'User-Agent':
+                  'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36',
+              'Accept': 'application/json',
+            },
+          ).timeout(const Duration(seconds: 90));
 
-                final isTargetFo = (exch == 'NFO' || exch == 'BFO') &&
-                    (inst == 'OPTIDX' || inst == 'FUTIDX') &&
-                    _allowedSymbols.contains(name);
-                final isTargetEq = exch == 'NSE' &&
-                    sym.endsWith('-EQ') &&
-                    (trackedEq.contains(name) ||
-                        trackedEq.contains(sym.substring(0, sym.length - 3)));
-
-                if (isTargetFo || isTargetEq) {
-                  filtered.add(Map<String, dynamic>.from(item));
-                }
-              }
+          if (resp.statusCode == 200 && resp.body.length > 10000) {
+            final rawBody = resp.body;
+            jsonBody = await Isolate.run(
+              () => _filterMasterJsonInIsolate(rawBody, trackedEq),
+            );
+            if (jsonBody.length > 1024) {
+              final tmp = File('${cacheFile.path}.tmp');
+              await tmp.writeAsString(jsonBody);
+              await tmp.rename(cacheFile.path);
             }
-            jsonBody = jsonEncode(filtered);
-            await cacheFile.writeAsString(jsonBody);
+          } else {
+            lastLoadError = 'Instrument master HTTP ${resp.statusCode}';
           }
-        } else {
-          lastLoadError = 'Instrument master HTTP ${resp.statusCode}';
-          return false;
+        } catch (e) {
+          lastLoadError = 'Master download error: $e';
+        }
+      }
+
+      // Fallback to most recent cached master file if today's download timed out
+      if (jsonBody.length <= 1024) {
+        final fallback = await _findLatestCachedMasterFile(dir);
+        if (fallback != null && await fallback.length() > 1024) {
+          jsonBody = await fallback.readAsString();
         }
       }
 
       if (jsonBody.isEmpty) {
-        lastLoadError = 'Empty instrument master payload';
+        if (lastLoadError.isEmpty) {
+          lastLoadError = 'Empty instrument master payload';
+        }
         return false;
       }
 
@@ -185,6 +239,8 @@ class ScripMasterEngine {
     } catch (e) {
       lastLoadError = 'Master load error: $e';
       return false;
+    } finally {
+      _loadingInFlight = false;
     }
   }
 
@@ -281,7 +337,8 @@ class ScripMasterEngine {
     for (final idx in UnderlyingIndex.values) {
       final sorted = expirySets[idx]!.toList()..sort();
       _expiriesByIndex[idx] = sorted;
-      _futuresByIndex[idx]!.sort((a, b) => a.expiryIso.compareTo(b.expiryIso));
+      _futuresByIndex[idx]!
+          .sort((a, b) => a.expiryIso.compareTo(b.expiryIso));
     }
     isLoaded = loaded > 0;
     return loaded;

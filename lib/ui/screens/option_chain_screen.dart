@@ -193,7 +193,8 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
     final chgPct = engine.spotChangePct[idx] ?? 0.0;
     final health = engine.dataHealth;
     final hasLiveData =
-        health == DataHealthStatus.live && spot > 0 && rows.isNotEmpty;
+        health != DataHealthStatus.disconnected && spot > 0 && rows.isNotEmpty;
+    final hasSpotData = health != DataHealthStatus.disconnected && spot > 0;
     final isPos = chgPct >= 0;
 
     return SingleChildScrollView(
@@ -301,17 +302,17 @@ class _OptionChainScreenState extends State<OptionChainScreen> {
                     Row(
                       children: [
                         Text(
-                          hasLiveData ? spot.toStringAsFixed(2) : 'NO DATA',
+                          hasSpotData ? spot.toStringAsFixed(2) : 'NO DATA',
                           style: QuantTheme.mono(
                             size: 16,
-                            color: hasLiveData
+                            color: hasSpotData
                                 ? QuantTheme.textPrimary
                                 : QuantTheme.negative,
                             weight: FontWeight.w800,
                           ),
                         ),
                         const SizedBox(width: 8),
-                        if (hasLiveData)
+                        if (hasSpotData)
                           Text(
                             '${isPos ? "+" : ""}${chgPct.toStringAsFixed(2)}% ${isPos ? "▲" : "▼"}',
                             style: QuantTheme.mono(

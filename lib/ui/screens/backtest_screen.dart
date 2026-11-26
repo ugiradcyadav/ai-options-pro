@@ -64,7 +64,7 @@ class _BacktestScreenState extends State<BacktestScreen> {
       index: idx,
       bars: bars,
       riskConfig: widget.appState.riskConfig,
-      startingCapital: cap,
+      startingCapital: simCap,
       lotSize: lotSize,
       outOfSampleOnly: true,
     );
@@ -72,14 +72,14 @@ class _BacktestScreenState extends State<BacktestScreen> {
       index: idx,
       bars: bars,
       riskConfig: widget.appState.riskConfig,
-      startingCapital: cap,
+      startingCapital: simCap,
       lotSize: lotSize,
     );
     final stress = BacktestEngine.runFrictionStressTest(
       index: idx,
       bars: bars,
       riskConfig: widget.appState.riskConfig,
-      startingCapital: cap,
+      startingCapital: simCap,
       lotSize: lotSize,
       outOfSampleOnly: true,
     );
@@ -114,7 +114,8 @@ class _BacktestScreenState extends State<BacktestScreen> {
     final settings = StrategySettingsEngine.instance.current;
     final mlRep = widget.appState.sadhuMlReport;
     final rep = _report ?? widget.appState.lastBacktestReport;
-    final startCap = DhanDataEngine.instance.availableTradingCapital ?? 0.0;
+    final _rawCap = DhanDataEngine.instance.availableTradingCapital ?? 0.0;
+    final startCap = _rawCap > 0 ? _rawCap : 50000.0;
 
     final List<double> equityPoints = [startCap];
     final List<double> drawdownPoints = [0.0];

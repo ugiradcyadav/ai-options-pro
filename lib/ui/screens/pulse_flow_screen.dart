@@ -46,7 +46,7 @@ class _PulseFlowScreenState extends State<PulseFlowScreen>
     )..repeat();
 
     _refreshAllFlowData(forceConstituents: true);
-    _refreshTimer = Timer.periodic(const Duration(seconds: 8), (_) {
+    _refreshTimer = Timer.periodic(const Duration(seconds: 15), (_) {
       _refreshAllFlowData();
     });
   }

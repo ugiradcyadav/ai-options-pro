@@ -114,7 +114,7 @@ class ConstituentFlowEngine {
   }) async {
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     final prev = _cache[index];
-    if (!force && prev != null && (nowMs - prev.fetchedAtMs) < 8000) {
+    if (!force && prev != null && (nowMs - prev.fetchedAtMs) < 15000) {
       return prev;
     }
     if (_inFlight[index] == true) return prev;
@@ -195,6 +195,7 @@ class ConstituentFlowEngine {
         index: index,
         items: items,
         fetchedAtMs: DateTime.now().millisecondsSinceEpoch,
+        errorNote: items.isEmpty ? (angel.lastError.isNotEmpty ? angel.lastError : 'Syncing ${index.label} constituent quotes...') : '',
       );
       _cache[index] = snap;
       return snap;

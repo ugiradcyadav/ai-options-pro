@@ -38,7 +38,8 @@ class HomeScreen extends StatelessWidget {
     final activeExpiry = engine.selectedExpiry[selectedIdx] ?? '';
     final health = engine.dataHealth;
     final hasLiveData =
-        health == DataHealthStatus.live && chain.isNotEmpty && spot > 0;
+        health != DataHealthStatus.disconnected && chain.isNotEmpty && spot > 0;
+    final hasSpotData = health != DataHealthStatus.disconnected && spot > 0;
     final sig = appState.activeSignal;
     final regime = appState.activeRegime;
     final mlRep = appState.sadhuMlReport;
@@ -216,7 +217,7 @@ class HomeScreen extends StatelessWidget {
               contribution: appState.activeContribution,
               straddleGamma: appState.activeStraddleGamma,
               orbLevels: appState.activeOrbLevels,
-              hasLiveData: hasLiveData,
+              hasLiveData: hasSpotData,
             ),
             const SizedBox(height: 14),
 
@@ -233,7 +234,7 @@ class HomeScreen extends StatelessWidget {
                           style: QuantTheme.heading(size: 12.5)),
                       QuantBadge(
                         text: !hasLiveData ? 'NO DATA' : regime.regimeLabel,
-                        color: !hasLiveData
+                        color: !hasSpotData
                             ? QuantTheme.negative
                             : (regime.regimeLabel.contains('BULL')
                                 ? QuantTheme.positive
@@ -244,7 +245,7 @@ class HomeScreen extends StatelessWidget {
                     ],
                   ),
                   const SizedBox(height: 12),
-                  if (!hasLiveData)
+                  if (!hasSpotData)
                     Padding(
                       padding: const EdgeInsets.symmetric(vertical: 8),
                       child: Text(

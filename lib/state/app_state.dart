@@ -9,6 +9,7 @@ import '../data/forever_db.dart';
 import '../data/macro_data_engine.dart';
 import '../data/news_wire_engine.dart';
 import '../data/participant_oi_engine.dart';
+import '../data/scrip_master_engine.dart';
 import '../engine/ai_recalibration_engine.dart';
 import '../engine/backtest_engine.dart';
 import '../engine/execution_engine.dart';
@@ -138,12 +139,28 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> refreshAllIntelligenceLayers({bool force = false}) async {
+    final engine = DhanDataEngine.instance;
+    final needMaster = !ScripMasterEngine.instance.isLoaded ||
+        (engine.availableExpiries[selectedIndex]?.isEmpty ?? true);
+    if (needMaster) {
+      final ok = await ScripMasterEngine.instance.loadOrRefreshMaster();
+      if (ok) {
+        for (final idx in UnderlyingIndex.values) {
+          final exps = ScripMasterEngine.instance.getExpiriesForIndex(idx);
+          engine.availableExpiries[idx] = exps;
+          if (exps.isNotEmpty && (engine.selectedExpiry[idx] ?? '').isEmpty) {
+            engine.selectedExpiry[idx] = exps.first;
+          }
+        }
+        unawaited(engine.fetchOptionChainSnapshot(selectedIndex));
+      }
+    }
     await Future.wait([
       MacroDataEngine.instance.refresh(force: force),
       NewsWireEngine.instance.refresh(force: force),
       ParticipantOiEngine.instance.refreshLatest(force: force),
-      ConstituentFlowEngine.instance
-          .refreshForIndex(selectedIndex, force: force),
+      FlowDataEngine.instance.refreshSectoralFlow(),
+      ConstituentFlowEngine.instance.refreshForIndex(selectedIndex, force: force),
     ]);
     notifyListeners();
   }

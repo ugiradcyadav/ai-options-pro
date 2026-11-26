@@ -154,32 +154,10 @@ class FlowDataEngine {
 
     final allTokens = [indiaVixToken, ...sectorTokens.values];
     try {
-      final resp = await http
-          .post(
-            Uri.parse(
-                'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/'),
-            headers: {
-              'Content-Type': 'application/json',
-              'Accept': 'application/json',
-              'User-Agent': 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36',
-              'X-UserType': 'USER',
-              'X-SourceID': 'WEB',
-              'X-ClientLocalIP': '192.168.1.1',
-              'X-ClientPublicIP': '192.168.1.1',
-              'X-MACAddress': '02:00:00:00:00:00',
-              'X-PrivateKey': angel.apiKey.trim(),
-              'Authorization': 'Bearer ${angel.jwtToken}',
-            },
-            body: jsonEncode({
-              'mode': 'FULL',
-              'exchangeTokens': {'NSE': allTokens},
-            }),
-          )
-          .timeout(const Duration(seconds: 5));
-
-      if (resp.statusCode != 200) return false;
-      final body = jsonDecode(resp.body);
-      final fetched = body['data']?['fetched'] as List? ?? [];
+      final fetched = await angel.fetchBatchMarketQuotes(
+        exchange: 'NSE',
+        tokens: allTokens,
+      );
       if (fetched.isEmpty) return false;
 
       final byToken = <String, Map>{};

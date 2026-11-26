@@ -393,7 +393,7 @@ class AngelSmartApiEngine {
               'mode': 'FULL',
               'exchangeTokens': cleaned,
             }),
-            timeout: const Duration(seconds: 7),
+            timeout: const Duration(seconds: 10),
           );
 
           if (resp.statusCode == 200) {
@@ -450,8 +450,8 @@ class AngelSmartApiEngine {
   }) async {
     if (tokens.isEmpty) return const [];
     final results = <Map<String, dynamic>>[];
-    for (int start = 0; start < tokens.length; start += 50) {
-      final end = (start + 50 > tokens.length) ? tokens.length : start + 50;
+    for (int start = 0; start < tokens.length; start += 30) {
+      final end = (start + 30 > tokens.length) ? tokens.length : start + 30;
       final chunk = tokens.sublist(start, end);
       final batch = await fetchMultiExchangeQuotes({exchange: chunk});
       results.addAll(batch);
@@ -545,7 +545,7 @@ class AngelSmartApiEngine {
 
     // ATM ± 10 strikes = 21 strikes x 2 = 42 option tokens + 1 spot = 43 tokens in ONE single call!
     final band =
-        StrikeSelectionEngine.getMonitoringStrikeBand(index, spot, radius: 10);
+        StrikeSelectionEngine.getMonitoringStrikeBand(index, spot, radius: 6);
     final atm = StrikeSelectionEngine.computeAtmStrike(index, spot);
     final step = index.strikeStep;
     final tYears =
@@ -584,12 +584,8 @@ class AngelSmartApiEngine {
       return null;
     }
 
-    // Combine Spot + Options into ONE single rate-limited REST request
-    final multiPayload = <String, List<String>>{
-      spotExch: [idxToken],
-      foExch: foTokens,
-    };
-    final combinedFetched = await fetchMultiExchangeQuotes(multiPayload);
+    // Single-exchange FO quote fetch (26 tokens in 1 fast serialized request)
+    final combinedFetched = await fetchBatchMarketQuotes(exchange: foExch, tokens: foTokens);
     final Map<String, Map> quoteByToken = {};
     for (final f in combinedFetched) {
       final tok = (f['symbolToken'] ?? '').toString();
@@ -606,7 +602,7 @@ class AngelSmartApiEngine {
       changePct = ((liveSpotMap['percentChange'] ?? changePct) as num).toDouble();
     }
 
-    if (quoteByToken.length <= 1) return null;
+    if (quoteByToken.isEmpty) return null;
 
     final receivedAtMs = DateTime.now().millisecondsSinceEpoch;
     final db = ForeverDatabase.instance;
