@@ -55,36 +55,8 @@ jobs:
           sed -i 's/android:label="[^"]*"/android:label="Sadhu AI"/' android/app/src/main/AndroidManifest.xml
           sed -i 's/kotlin-version = ".*"/kotlin-version = "1.8.22"/g' android/settings.gradle || true
           sed -i 's/id "org.jetbrains.kotlin.android" version ".*"/id "org.jetbrains.kotlin.android" version "1.8.22"/g' android/settings.gradle || true
-
-          if [ -f assets/images/sadhu_founder.png ]; then
-            python3 - << 'PYICON'
-from PIL import Image
-import os
-
-src = Image.open("assets/images/sadhu_founder.png").convert("RGBA")
-w, h = src.size
-# Tight square crop focused on upper-left/center portrait subject
-side = min(w, h)
-left = max(0, min(w - side, int(w * 0.14)))
-top = max(0, min(h - side, int(h * 0.04)))
-sq = src.crop((left, top, left + side, top + side))
-
-sizes = {
-    "mipmap-mdpi": 48,
-    "mipmap-hdpi": 72,
-    "mipmap-xhdpi": 96,
-    "mipmap-xxhdpi": 144,
-    "mipmap-xxxhdpi": 192,
-}
-for folder, px in sizes.items():
-    out_dir = os.path.join("android/app/src/main/res", folder)
-    os.makedirs(out_dir, exist_ok=True)
-    icon = sq.resize((px, px), Image.Resampling.LANCZOS)
-    icon.save(os.path.join(out_dir, "ic_launcher.png"))
-    icon.save(os.path.join(out_dir, "ic_launcher_round.png"))
-print("Generated Sadhu AI launcher icons successfully.")
-PYICON
-          fi
+          python3 -c "import PIL" 2>/dev/null || python3 -m pip install --quiet pillow
+          python3 .github/generate_icon.py
 
       - name: Install Dependencies & Run Acceptance Tests
         run: |
