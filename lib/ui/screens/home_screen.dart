@@ -464,7 +464,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       GestureDetector(
                         onTap: () {
                           UiHaptics.tap();
-                          onNavigateTab?.call(1);
+                          widget.onNavigateTab?.call(1);
                         },
                         child: const QuantBadge(
                             text: 'Open Chain & OI →',
