@@ -307,7 +307,6 @@ class AppState extends ChangeNotifier {
       spot: spot,
       constituents: constSnap,
     );
-    final _sg =
     final _sg = MinorIntelEngine.instance.evaluateStraddleAndGamma(
       index: selectedIndex,
       expiryIso: exp,

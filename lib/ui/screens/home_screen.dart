@@ -754,7 +754,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   width: 44,
                   height: 20,
                   child: CustomPaint(
-                    painter: _MiniSeriesPainter(
+                    painter: MiniSeriesPainter(
                       values: sparkPts,
                       color: isPos ? QuantTheme.positive : QuantTheme.negative,
                     ),

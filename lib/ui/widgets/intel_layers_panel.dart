@@ -283,7 +283,7 @@ class MinorIntradayIntelCard extends StatelessWidget {
                       width: 150,
                       height: 30,
                       child: CustomPaint(
-                        painter: _MiniSeriesPainter(
+                        painter: MiniSeriesPainter(
                           values: straddleHistory,
                           color: (straddleGamma?.decaySinceOpenPct ?? 0) <= 0
                               ? QuantTheme.warning
@@ -482,11 +482,11 @@ class MinorIntradayIntelCard extends StatelessWidget {
   }
 }
 
-class _MiniSeriesPainter extends CustomPainter {
+class MiniSeriesPainter extends CustomPainter {
   final List<double> values;
   final Color color;
 
-  _MiniSeriesPainter({required this.values, required this.color});
+  MiniSeriesPainter({required this.values, required this.color});
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -518,7 +518,7 @@ class _MiniSeriesPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant _MiniSeriesPainter oldDelegate) => true;
+  bool shouldRepaint(covariant MiniSeriesPainter oldDelegate) => true;
 }
 
 /// LAYER 2 (MAJOR): Official NSE Clearing Participant-Wise OI (FII / DII / Pro / Client)
