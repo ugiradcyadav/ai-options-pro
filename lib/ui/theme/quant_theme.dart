@@ -2,39 +2,44 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 class QuantTheme {
-  // Approved Hybrid Institutional Quant Color Palette
-  static const Color bgMain = Color(0xFF080F1E);
-  static const Color bgSecondary = Color(0xFF0C1528);
-  static const Color bgPanel = Color(0xFF111D35);
-  static const Color bgElevated = Color(0xFF162644);
-  static const Color border = Color(0xFF23385D);
-  static const Color accent = Color(0xFF28BFFF);
-  static const Color positive = Color(0xFF00D995);
-  static const Color negative = Color(0xFFFF5368);
-  static const Color warning = Color(0xFFFFBB55);
-  static const Color textPrimary = Color(0xFFF1F5FC);
-  static const Color textSecondary = Color(0xFF98A7BE);
+  // Daylight Tactical Pro Palette (Glare-free ceramic surfaces + deep navy command bars)
+  static const Color bgMain = Color(0xFFF4F6F9);
+  static const Color bgSecondary = Color(0xFFECEFF4);
+  static const Color bgPanel = Color(0xFFFFFFFF);
+  static const Color bgElevated = Color(0xFFF8FAFC);
+  static const Color headerNavy = Color(0xFF0F1E36);
+  static const Color headerNavySoft = Color(0xFF1A2F52);
+  static const Color border = Color(0xFFD8E0EA);
+  static const Color accent = Color(0xFF0F1E36);
+  static const Color positive = Color(0xFF0D8A55);
+  static const Color negative = Color(0xFFD9383A);
+  static const Color warning = Color(0xFFD97706);
+  static const Color textPrimary = Color(0xFF0F172A);
+  static const Color textSecondary = Color(0xFF475569);
 
   static ThemeData buildTheme() {
     return ThemeData(
-      brightness: Brightness.dark,
+      brightness: Brightness.light,
       scaffoldBackgroundColor: bgMain,
-      primaryColor: accent,
+      primaryColor: headerNavy,
       canvasColor: bgSecondary,
       dividerColor: border,
       fontFamily: 'sans-serif',
-      colorScheme: const ColorScheme.dark(
-        primary: accent,
+      colorScheme: const ColorScheme.light(
+        primary: headerNavy,
         secondary: positive,
         surface: bgPanel,
         error: negative,
+        onPrimary: Colors.white,
+        onSurface: textPrimary,
       ),
       appBarTheme: const AppBarTheme(
-        backgroundColor: bgSecondary,
+        backgroundColor: headerNavy,
+        foregroundColor: Colors.white,
         elevation: 0,
         centerTitle: false,
         titleTextStyle: TextStyle(
-          color: textPrimary,
+          color: Colors.white,
           fontSize: 15,
           fontWeight: FontWeight.w700,
           letterSpacing: 0.2,
@@ -43,7 +48,6 @@ class QuantTheme {
     );
   }
 
-  // Roboto Mono style for prices, percentages, Greeks, OI, quantities
   static TextStyle mono({
     double size = 12,
     Color color = textPrimary,
@@ -58,7 +62,6 @@ class QuantTheme {
     );
   }
 
-  // Inter / Sans-serif general interface text
   static TextStyle label({
     double size = 11,
     Color color = textSecondary,
@@ -138,6 +141,13 @@ class QuantPanel extends StatelessWidget {
         color: backgroundColor,
         borderRadius: BorderRadius.circular(radius),
         border: Border.all(color: borderColor, width: 1.0),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x0A0F1E36),
+            blurRadius: 6,
+            offset: Offset(0, 2),
+          ),
+        ],
       ),
       child: child,
     );
@@ -152,12 +162,14 @@ class QuantBadge extends StatelessWidget {
   final String text;
   final Color color;
   final IconData? icon;
+  final bool darkSurface;
 
   const QuantBadge({
     super.key,
     required this.text,
     required this.color,
     this.icon,
+    this.darkSurface = false,
   });
 
   @override
@@ -165,15 +177,22 @@ class QuantBadge extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
       decoration: BoxDecoration(
-        color: color.withOpacity(0.16),
+        color: darkSurface
+            ? color.withOpacity(0.24)
+            : color.withOpacity(0.12),
         borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: color.withOpacity(0.65), width: 0.9),
+        border: Border.all(
+          color: darkSurface
+              ? color.withOpacity(0.75)
+              : color.withOpacity(0.45),
+          width: 0.9,
+        ),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
           if (icon != null) ...[
-            Icon(icon, size: 11, color: color),
+            Icon(icon, size: 10, color: color),
             const SizedBox(width: 4),
           ],
           Text(
@@ -241,8 +260,8 @@ class RegimeArcGauge extends StatelessWidget {
   Widget build(BuildContext context) {
     final isBull = bullProb >= bearProb && bullProb >= chopProb;
     final isBear = bearProb > bullProb && bearProb >= chopProb;
-    final domPct = ((isBull ? bullProb : (isBear ? bearProb : chopProb)) * 100)
-        .round();
+    final domPct =
+        ((isBull ? bullProb : (isBear ? bearProb : chopProb)) * 100).round();
     final domLabel = isBull ? 'Bullish' : (isBear ? 'Bearish' : 'Sideways');
     final domColor = isBull
         ? QuantTheme.positive
@@ -298,12 +317,13 @@ class _ArcGaugePainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final rect = Rect.fromLTWH(10, 10, size.width - 20, (size.height - 10) * 1.8);
+    final rect =
+        Rect.fromLTWH(10, 10, size.width - 20, (size.height - 10) * 1.8);
     const startAngle = math.pi;
     const totalSweep = math.pi;
 
     final bgPaint = Paint()
-      ..color = QuantTheme.border.withOpacity(0.45)
+      ..color = QuantTheme.border
       ..strokeWidth = 10
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.round;

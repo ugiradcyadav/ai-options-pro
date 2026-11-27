@@ -39,20 +39,52 @@ jobs:
           flutter-version: '3.24.0'
           channel: 'stable'
 
-      - name: Generate Android Platform Wrapper & Sadhu AI Branding
+      - name: Generate Android Platform Wrapper & Sadhu AI Branding + Icon
         run: |
           cp pubspec.yaml pubspec.yaml.bak
           cp -r lib lib_bak
           cp -r test test_bak
+          cp -r assets assets_bak
           flutter create --platforms=android --project-name ai_options_pro --org com.sadhuai.trading .
           cp pubspec.yaml.bak pubspec.yaml
           cp -r lib_bak/* lib/
           rm -rf test && mv test_bak test
+          rm -rf assets && mv assets_bak assets
           rm -rf pubspec.yaml.bak lib_bak
           sed -i '/<application/i <uses-permission android:name="android.permission.INTERNET"/>' android/app/src/main/AndroidManifest.xml
           sed -i 's/android:label="[^"]*"/android:label="Sadhu AI"/' android/app/src/main/AndroidManifest.xml
           sed -i 's/kotlin-version = ".*"/kotlin-version = "1.8.22"/g' android/settings.gradle || true
           sed -i 's/id "org.jetbrains.kotlin.android" version ".*"/id "org.jetbrains.kotlin.android" version "1.8.22"/g' android/settings.gradle || true
+
+          if [ -f assets/images/sadhu_founder.png ]; then
+            python3 - << 'PYICON'
+from PIL import Image
+import os
+
+src = Image.open("assets/images/sadhu_founder.png").convert("RGBA")
+w, h = src.size
+# Tight square crop focused on upper-left/center portrait subject
+side = min(w, h)
+left = max(0, min(w - side, int(w * 0.14)))
+top = max(0, min(h - side, int(h * 0.04)))
+sq = src.crop((left, top, left + side, top + side))
+
+sizes = {
+    "mipmap-mdpi": 48,
+    "mipmap-hdpi": 72,
+    "mipmap-xhdpi": 96,
+    "mipmap-xxhdpi": 144,
+    "mipmap-xxxhdpi": 192,
+}
+for folder, px in sizes.items():
+    out_dir = os.path.join("android/app/src/main/res", folder)
+    os.makedirs(out_dir, exist_ok=True)
+    icon = sq.resize((px, px), Image.Resampling.LANCZOS)
+    icon.save(os.path.join(out_dir, "ic_launcher.png"))
+    icon.save(os.path.join(out_dir, "ic_launcher_round.png"))
+print("Generated Sadhu AI launcher icons successfully.")
+PYICON
+          fi
 
       - name: Install Dependencies & Run Acceptance Tests
         run: |

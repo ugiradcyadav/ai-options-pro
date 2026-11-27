@@ -45,6 +45,7 @@ class AppState extends ChangeNotifier {
   final Map<UnderlyingIndex, IndexContributionSummary> contributions = {};
   final Map<UnderlyingIndex, StraddleGammaSnapshot?> straddleGammas = {};
   final Map<UnderlyingIndex, IntradayLevelsSnapshot> orbLevelsMap = {};
+  final Map<UnderlyingIndex, List<double>> straddleSeriesMap = {};
   SadhuMlTrainingReport sadhuMlReport = SadhuMlTrainingReport.untrained;
 
   bool get isLiveMode =>
@@ -306,13 +307,21 @@ class AppState extends ChangeNotifier {
       spot: spot,
       constituents: constSnap,
     );
-    straddleGammas[selectedIndex] =
-        MinorIntelEngine.instance.evaluateStraddleAndGamma(
+    final _sg =
+    final _sg = MinorIntelEngine.instance.evaluateStraddleAndGamma(
       index: selectedIndex,
       expiryIso: exp,
       spot: spot,
       rows: rows,
     );
+    straddleGammas[selectedIndex] = _sg;
+    if (_sg != null && _sg.atmStraddlePrice > 0) {
+      final _hist = straddleSeriesMap.putIfAbsent(selectedIndex, () => []);
+      if (_hist.isEmpty || (_hist.last - _sg.atmStraddlePrice).abs() > 0.25) {
+        _hist.add(_sg.atmStraddlePrice);
+        if (_hist.length > 60) _hist.removeAt(0);
+      }
+    }
     final breadthUpPct = (constSnap != null && constSnap.items.isNotEmpty)
         ? (constSnap.inflows.length / constSnap.items.length) * 100.0
         : null;

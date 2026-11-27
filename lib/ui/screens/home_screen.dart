@@ -1,8 +1,10 @@
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart' hide TextDirection;
 import '../../core/models.dart';
 import '../../core/ui_haptics.dart';
 import '../../data/dhan_data_engine.dart';
+import '../../data/forever_db.dart';
 import '../../data/strike_selector.dart';
 import '../../engine/execution_engine.dart';
 import '../../engine/math_greeks.dart';
@@ -13,7 +15,7 @@ import '../widgets/intel_layers_panel.dart';
 import '../widgets/pnl_streak_heatmap.dart';
 import 'signal_details_screen.dart';
 
-class HomeScreen extends StatelessWidget {
+class HomeScreen extends StatefulWidget {
   final AppState appState;
   final void Function(int)? onNavigateTab;
 
@@ -23,26 +25,64 @@ class HomeScreen extends StatelessWidget {
     this.onNavigateTab,
   });
 
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  final Map<UnderlyingIndex, List<double>> _sparkSeries = {};
+  int _lastSparkSyncMs = 0;
+
   Color _healthColor(DataHealthStatus status) {
     if (status == DataHealthStatus.live) return QuantTheme.positive;
     if (status == DataHealthStatus.delayed) return QuantTheme.warning;
     return QuantTheme.negative;
   }
 
+  Future<void> _refreshSparklinesIfNeeded() async {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (nowMs - _lastSparkSyncMs < 25000) return;
+    _lastSparkSyncMs = nowMs;
+    bool changed = false;
+    for (final u in UnderlyingIndex.values) {
+      try {
+        final bars = await ForeverDatabase.instance.getRecentBars(
+          indexName: u.label,
+          optionType: 'SPOT',
+          limit: 24,
+        );
+        final pts = bars
+            .where((b) => b.close > 0)
+            .map((b) => b.close)
+            .toList();
+        if (pts.length >= 2) {
+          _sparkSeries[u] = pts;
+          changed = true;
+        }
+      } catch (_) {}
+    }
+    if (changed && mounted) setState(() => {});
+  }
+
   @override
   Widget build(BuildContext context) {
+    final appState = widget.appState;
     final engine = DhanDataEngine.instance;
     final selectedIdx = appState.selectedIndex;
     final chain = engine.optionChainRows[selectedIdx] ?? const [];
     final spot = engine.spotPrices[selectedIdx] ?? 0.0;
     final activeExpiry = engine.selectedExpiry[selectedIdx] ?? '';
     final health = engine.dataHealth;
-    final hasLiveData =
-        health != DataHealthStatus.disconnected && chain.isNotEmpty && spot > 0;
     final hasSpotData = health != DataHealthStatus.disconnected && spot > 0;
+    final hasLiveData = hasSpotData && chain.isNotEmpty;
     final sig = appState.activeSignal;
     final regime = appState.activeRegime;
     final mlRep = appState.sadhuMlReport;
+
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (nowMs - _lastSparkSyncMs >= 25000) {
+      Future.microtask(_refreshSparklinesIfNeeded);
+    }
 
     int totalCeOi = 0;
     int totalPeOi = 0;
@@ -83,82 +123,27 @@ class HomeScreen extends StatelessWidget {
     final indices = UnderlyingIndex.values;
 
     return RefreshIndicator(
-      color: QuantTheme.accent,
+      color: QuantTheme.headerNavy,
       backgroundColor: QuantTheme.bgPanel,
-      onRefresh: () => appState.refreshAllIntelligenceLayers(force: true),
+      onRefresh: () async {
+        _lastSparkSyncMs = 0;
+        await appState.refreshAllIntelligenceLayers(force: true);
+        await _refreshSparklinesIfNeeded();
+      },
       child: SingleChildScrollView(
         physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // 1. Sadhu AI Admin Command Header
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Row(
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.all(8),
-                      decoration: BoxDecoration(
-                        color: QuantTheme.bgElevated,
-                        borderRadius: BorderRadius.circular(10),
-                        border:
-                            Border.all(color: QuantTheme.accent.withOpacity(0.5)),
-                      ),
-                      child: const Icon(Icons.auto_graph,
-                          color: QuantTheme.accent, size: 20),
-                    ),
-                    const SizedBox(width: 10),
-                    Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text('Sadhu AI', style: QuantTheme.heading(size: 16)),
-                        Text(
-                          'Admin: Sadhu AI • ${mlRep.trained ? "ML Active" : "ML Ready"}',
-                          style: QuantTheme.label(size: 10),
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-                Row(
-                  children: [
-                    QuantBadge(
-                      text: health.label,
-                      color: _healthColor(health),
-                      icon: Icons.circle,
-                    ),
-                    const SizedBox(width: 6),
-                    GestureDetector(
-                      onTap: () {
-                        UiHaptics.tap();
-                        if (!ExecutionEngine.liveTradingUnlocked) {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(
-                              backgroundColor: QuantTheme.warning,
-                              content: Text(
-                                'Sadhu AI is Paper-only until Phase 2 real broker adapter & 15-day paper gates pass.',
-                              ),
-                            ),
-                          );
-                        }
-                      },
-                      child: const QuantBadge(
-                        text: 'PAPER',
-                        color: QuantTheme.positive,
-                      ),
-                    ),
-                  ],
-                ),
-              ],
-            ),
+            // 1. Sadhu AI Navy Command Header with Blended Founder Portrait & Avatar
+            _buildNavyFounderHeader(context, health, mlRep.trained),
             const SizedBox(height: 12),
 
             // 2. Feed Health Telemetry Strip
             QuantPanel(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
-              backgroundColor: QuantTheme.bgSecondary,
+              backgroundColor: QuantTheme.bgPanel,
               borderColor: _healthColor(health).withOpacity(0.55),
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -188,7 +173,7 @@ class HomeScreen extends StatelessWidget {
             ),
             const SizedBox(height: 12),
 
-            // 4. Responsive 2x2 Four-Index Monitoring Grid
+            // 4. Responsive 2x2 Four-Index Grid with Live Intraday Sparklines
             Row(
               children: [
                 Expanded(
@@ -210,13 +195,16 @@ class HomeScreen extends StatelessWidget {
             ),
             const SizedBox(height: 14),
 
-            // 5. LAYER 1 (MINOR): Futures Basis, Heavyweight Points, 0-DTE Straddle/Gamma & 15m ORB
+            // 5. LAYER 1 (MINOR): Futures Basis, 0-DTE Straddle Decay, Depth Ladder, Heavyweights & ORB
             MinorIntradayIntelCard(
               index: selectedIdx,
               futuresBasis: appState.activeFuturesBasis,
               contribution: appState.activeContribution,
               straddleGamma: appState.activeStraddleGamma,
               orbLevels: appState.activeOrbLevels,
+              chainRows: chain,
+              straddleHistory:
+                  appState.straddleSeriesMap[selectedIdx] ?? const [],
               hasLiveData: hasSpotData,
             ),
             const SizedBox(height: 14),
@@ -233,7 +221,7 @@ class HomeScreen extends StatelessWidget {
                       Text('Measured Regime (${selectedIdx.label})',
                           style: QuantTheme.heading(size: 12.5)),
                       QuantBadge(
-                        text: !hasLiveData ? 'NO DATA' : regime.regimeLabel,
+                        text: !hasSpotData ? 'NO DATA' : regime.regimeLabel,
                         color: !hasSpotData
                             ? QuantTheme.negative
                             : (regime.regimeLabel.contains('BULL')
@@ -260,7 +248,7 @@ class HomeScreen extends StatelessWidget {
                         width: double.infinity,
                         padding: const EdgeInsets.all(10),
                         decoration: BoxDecoration(
-                          color: QuantTheme.bgSecondary,
+                          color: QuantTheme.bgMain,
                           borderRadius: BorderRadius.circular(8),
                           border: Border.all(color: QuantTheme.border),
                         ),
@@ -506,8 +494,8 @@ class HomeScreen extends StatelessWidget {
                                     horizontal: 7, vertical: 2),
                                 decoration: BoxDecoration(
                                   color: r.offset == 0
-                                      ? QuantTheme.accent
-                                      : QuantTheme.bgSecondary,
+                                      ? QuantTheme.headerNavy
+                                      : QuantTheme.bgMain,
                                   borderRadius: BorderRadius.circular(4),
                                 ),
                                 child: Text(
@@ -515,7 +503,7 @@ class HomeScreen extends StatelessWidget {
                                   style: QuantTheme.mono(
                                     size: 10,
                                     color: r.offset == 0
-                                        ? QuantTheme.bgMain
+                                        ? Colors.white
                                         : QuantTheme.textPrimary,
                                     weight: FontWeight.w800,
                                   ),
@@ -534,7 +522,7 @@ class HomeScreen extends StatelessWidget {
             ),
             const SizedBox(height: 14),
 
-            // 11. DEDICATED BOTTOM SECTION: Live Official News & Announcements Wire (RBI / NSE / BSE)
+            // 11. DEDICATED BOTTOM SECTION: Official Announcements Wire (RBI / NSE / BSE)
             LiveNewsWireCard(
               items: appState.newsItems,
               lastFetchedMs: appState.newsLastFetchedMs,
@@ -543,6 +531,158 @@ class HomeScreen extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildNavyFounderHeader(
+    BuildContext context,
+    DataHealthStatus health,
+    bool mlTrained,
+  ) {
+    final hCol = _healthColor(health);
+    return Container(
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: QuantTheme.headerNavy,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: QuantTheme.headerNavySoft, width: 1.2),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x1F0F1E36),
+            blurRadius: 10,
+            offset: Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Stack(
+        children: [
+          // Soft right-side photo blend inside deep navy command bar
+          Positioned.fill(
+            child: Row(
+              children: [
+                const Expanded(flex: 4, child: SizedBox.shrink()),
+                Expanded(
+                  flex: 6,
+                  child: Opacity(
+                    opacity: 0.36,
+                    child: Image.asset(
+                      'assets/images/sadhu_founder.png',
+                      fit: BoxFit.cover,
+                      alignment: const Alignment(0.15, -0.35),
+                      errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          // Left-to-right navy gradient fade so foreground text & badges stay sharp
+          Positioned.fill(
+            child: Container(
+              decoration: const BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.centerLeft,
+                  end: Alignment.centerRight,
+                  colors: [
+                    QuantTheme.headerNavy,
+                    Color(0xE60F1E36),
+                    Color(0x660F1E36),
+                  ],
+                  stops: [0.0, 0.52, 1.0],
+                ),
+              ),
+            ),
+          ),
+          // Foreground Header Content
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      width: 38,
+                      height: 38,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                            color: QuantTheme.positive.withOpacity(0.85),
+                            width: 1.6),
+                        color: QuantTheme.headerNavySoft,
+                      ),
+                      clipBehavior: Clip.antiAlias,
+                      child: Image.asset(
+                        'assets/images/sadhu_founder.png',
+                        fit: BoxFit.cover,
+                        alignment: const Alignment(0.15, -0.35),
+                        errorBuilder: (_, __, ___) => const Icon(
+                            Icons.auto_graph,
+                            color: Colors.white,
+                            size: 18),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Sadhu AI',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.w800,
+                            letterSpacing: 0.2,
+                          ),
+                        ),
+                        Text(
+                          'Admin • ${mlTrained ? "ML Active" : "ML Ready"}',
+                          style: const TextStyle(
+                            color: Color(0xFFCBD5E1),
+                            fontSize: 10,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+                Row(
+                  children: [
+                    QuantBadge(
+                      text: health.label,
+                      color: hCol,
+                      icon: Icons.circle,
+                      darkSurface: true,
+                    ),
+                    const SizedBox(width: 6),
+                    GestureDetector(
+                      onTap: () {
+                        UiHaptics.tap();
+                        if (!ExecutionEngine.liveTradingUnlocked) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              backgroundColor: QuantTheme.headerNavy,
+                              content: Text(
+                                'Sadhu AI is Paper-only until Phase 2 real broker adapter & 15-day paper gates pass.',
+                              ),
+                            ),
+                          );
+                        }
+                      },
+                      child: const QuantBadge(
+                        text: 'PAPER',
+                        color: Color(0xFF34D399),
+                        darkSurface: true,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -559,14 +699,15 @@ class HomeScreen extends StatelessWidget {
     final exp = engine.selectedExpiry[u] ?? '';
     final hasIdxData = sp > 0 && health != DataHealthStatus.disconnected;
     final isPos = chg >= 0;
+    final sparkPts = _sparkSeries[u] ?? const <double>[];
 
     return QuantPanel(
       padding: const EdgeInsets.all(11),
       backgroundColor: active ? QuantTheme.bgElevated : QuantTheme.bgPanel,
-      borderColor: active ? QuantTheme.accent : QuantTheme.border,
+      borderColor: active ? QuantTheme.headerNavy : QuantTheme.border,
       onTap: () {
         UiHaptics.tap();
-        appState.setSelectedUnderlying(u);
+        widget.appState.setSelectedUnderlying(u);
       },
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -578,7 +719,8 @@ class HomeScreen extends StatelessWidget {
                 u.label,
                 style: QuantTheme.heading(
                   size: 10.5,
-                  color: active ? QuantTheme.accent : QuantTheme.textSecondary,
+                  color:
+                      active ? QuantTheme.headerNavy : QuantTheme.textSecondary,
                 ),
               ),
               if (hasIdxData)
@@ -592,13 +734,33 @@ class HomeScreen extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 5),
-          Text(
-            hasIdxData ? sp.toStringAsFixed(2) : 'NO DATA',
-            style: QuantTheme.mono(
-              size: 13.5,
-              color: hasIdxData ? QuantTheme.textPrimary : QuantTheme.negative,
-              weight: FontWeight.w800,
-            ),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Expanded(
+                child: Text(
+                  hasIdxData ? sp.toStringAsFixed(2) : 'NO DATA',
+                  style: QuantTheme.mono(
+                    size: 13,
+                    color:
+                        hasIdxData ? QuantTheme.textPrimary : QuantTheme.negative,
+                    weight: FontWeight.w800,
+                  ),
+                ),
+              ),
+              if (sparkPts.length >= 2)
+                SizedBox(
+                  width: 44,
+                  height: 20,
+                  child: CustomPaint(
+                    painter: _MiniSeriesPainter(
+                      values: sparkPts,
+                      color: isPos ? QuantTheme.positive : QuantTheme.negative,
+                    ),
+                  ),
+                ),
+            ],
           ),
           const SizedBox(height: 2),
           Text(
@@ -629,7 +791,7 @@ class HomeScreen extends StatelessWidget {
           child: LinearProgressIndicator(
             value: p,
             minHeight: 4.5,
-            backgroundColor: QuantTheme.bgSecondary,
+            backgroundColor: QuantTheme.bgMain,
             valueColor: AlwaysStoppedAnimation(col),
           ),
         ),

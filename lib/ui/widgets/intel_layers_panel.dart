@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:intl/intl.dart' hide TextDirection;
@@ -35,7 +36,7 @@ class MacroCuesStripCard extends StatelessWidget {
 
     return QuantPanel(
       padding: const EdgeInsets.all(12),
-      backgroundColor: QuantTheme.bgSecondary,
+      backgroundColor: QuantTheme.bgPanel,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -84,7 +85,7 @@ class MacroCuesStripCard extends StatelessWidget {
                     padding: const EdgeInsets.symmetric(
                         horizontal: 10, vertical: 6),
                     decoration: BoxDecoration(
-                      color: QuantTheme.bgPanel,
+                      color: QuantTheme.bgMain,
                       borderRadius: BorderRadius.circular(8),
                       border: Border.all(color: QuantTheme.border),
                     ),
@@ -137,13 +138,15 @@ class MacroCuesStripCard extends StatelessWidget {
   }
 }
 
-/// LAYER 1 (MINOR): Live Futures Basis + Heavyweight Index Points + 0-DTE Straddle/Gamma + 15m ORB
+/// LAYER 1 (MINOR): Futures Basis + 0-DTE Straddle Decay + 5-Level Depth Ladder + Heavyweight Points + ORB
 class MinorIntradayIntelCard extends StatelessWidget {
   final UnderlyingIndex index;
   final FuturesBasisSnapshot? futuresBasis;
   final IndexContributionSummary contribution;
   final StraddleGammaSnapshot? straddleGamma;
   final IntradayLevelsSnapshot orbLevels;
+  final List<StrikeRowSnapshot> chainRows;
+  final List<double> straddleHistory;
   final bool hasLiveData;
 
   const MinorIntradayIntelCard({
@@ -153,6 +156,8 @@ class MinorIntradayIntelCard extends StatelessWidget {
     required this.contribution,
     required this.straddleGamma,
     required this.orbLevels,
+    required this.chainRows,
+    this.straddleHistory = const [],
     required this.hasLiveData,
   });
 
@@ -161,6 +166,19 @@ class MinorIntradayIntelCard extends StatelessWidget {
     final anyAlert = (straddleGamma?.gammaBlastAlert == true) ||
         contribution.isNarrowTrap ||
         orbLevels.divergenceTrap;
+
+    final depthRows = chainRows.where((r) => r.offset.abs() <= 2).toList()
+      ..sort((a, b) => a.offset.compareTo(b.offset));
+
+    int sumBid = 0;
+    int sumAsk = 0;
+    for (final r in depthRows) {
+      sumBid += r.ceBidQty + r.peBidQty;
+      sumAsk += r.ceAskQty + r.peAskQty;
+    }
+    final totDepth = math.max(1, sumBid + sumAsk);
+    final bidPct = (sumBid / totDepth) * 100.0;
+    final askPct = (sumAsk / totDepth) * 100.0;
 
     return QuantPanel(
       padding: const EdgeInsets.all(14),
@@ -171,11 +189,11 @@ class MinorIntradayIntelCard extends StatelessWidget {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text('Minor Intraday Pulse (${index.label})',
+              Text('Minor Intraday & 0-DTE Desk (${index.label})',
                   style: QuantTheme.heading(size: 12.5)),
               QuantBadge(
                 text: straddleGamma?.gammaBlastAlert == true
-                    ? 'GAMMA BLAST'
+                    ? 'GAMMA BLAST ZONE'
                     : (contribution.isNarrowTrap || orbLevels.divergenceTrap
                         ? 'TRAP ALERT'
                         : orbLevels.stateLabel),
@@ -192,11 +210,10 @@ class MinorIntradayIntelCard extends StatelessWidget {
           const SizedBox(height: 10),
           if (!hasLiveData)
             Text(
-              'NO DATA — Connect Angel One to stream Futures Basis, Heavyweight Points, 0-DTE Straddle & ORB.',
+              'NO DATA — Connect Angel One to stream Futures Basis, 0-DTE Straddle Decay, Depth Ladder & ORB.',
               style: QuantTheme.mono(size: 10, color: QuantTheme.negative),
             )
           else ...[
-            // Row 1: Futures Basis + 0-DTE ATM Straddle + 15m ORB
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
@@ -237,6 +254,48 @@ class MinorIntradayIntelCard extends StatelessWidget {
                 ),
               ],
             ),
+
+            if (straddleHistory.length >= 2) ...[
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: QuantTheme.bgMain,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: QuantTheme.border),
+                ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('ATM Straddle Decay Curve',
+                              style: QuantTheme.heading(size: 10)),
+                          Text(
+                            '${straddleHistory.length} session points',
+                            style: QuantTheme.label(size: 9),
+                          ),
+                        ],
+                      ),
+                    ),
+                    SizedBox(
+                      width: 150,
+                      height: 30,
+                      child: CustomPaint(
+                        painter: _MiniSeriesPainter(
+                          values: straddleHistory,
+                          color: (straddleGamma?.decaySinceOpenPct ?? 0) <= 0
+                              ? QuantTheme.warning
+                              : QuantTheme.positive,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+
             if (futuresBasis != null) ...[
               const SizedBox(height: 6),
               Text(
@@ -257,9 +316,107 @@ class MinorIntradayIntelCard extends StatelessWidget {
                 ),
               ),
             ],
-            const Divider(color: QuantTheme.border, height: 14),
 
-            // Row 2: Heavyweight Index Points Contribution
+            if (depthRows.isNotEmpty) ...[
+              const Divider(color: QuantTheme.border, height: 14),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text('Order Book Depth Ladder (ATM ±2)',
+                      style: QuantTheme.heading(size: 10.5)),
+                  Text(
+                    'Bids ${bidPct.toStringAsFixed(1)}% | Asks ${askPct.toStringAsFixed(1)}%',
+                    style: QuantTheme.mono(
+                        size: 9, color: QuantTheme.textSecondary),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              ...depthRows.map((r) {
+                final bQty = r.ceBidQty + r.peBidQty;
+                final aQty = r.ceAskQty + r.peAskQty;
+                final maxSide = math.max(1, math.max(bQty, aQty));
+                final bRatio = (bQty / maxSide).clamp(0.05, 1.0).toDouble();
+                final aRatio = (aQty / maxSide).clamp(0.05, 1.0).toDouble();
+                return Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 2.5),
+                  child: Row(
+                    children: [
+                      SizedBox(
+                        width: 44,
+                        child: Text(
+                          QuantTheme.fmtLakhs(bQty),
+                          style: QuantTheme.mono(
+                              size: 9, color: QuantTheme.positive),
+                        ),
+                      ),
+                      Expanded(
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.end,
+                          children: [
+                            Container(
+                              width: bRatio * 68,
+                              height: 7,
+                              decoration: BoxDecoration(
+                                color: QuantTheme.positive,
+                                borderRadius: BorderRadius.circular(2),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      Container(
+                        margin: const EdgeInsets.symmetric(horizontal: 6),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 6, vertical: 1),
+                        decoration: BoxDecoration(
+                          color: r.offset == 0
+                              ? QuantTheme.headerNavy
+                              : QuantTheme.bgMain,
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(
+                          '${r.strike}',
+                          style: QuantTheme.mono(
+                            size: 9,
+                            color: r.offset == 0
+                                ? Colors.white
+                                : QuantTheme.textPrimary,
+                            weight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                      Expanded(
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.start,
+                          children: [
+                            Container(
+                              width: aRatio * 68,
+                              height: 7,
+                              decoration: BoxDecoration(
+                                color: QuantTheme.negative,
+                                borderRadius: BorderRadius.circular(2),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      SizedBox(
+                        width: 44,
+                        child: Text(
+                          QuantTheme.fmtLakhs(aQty),
+                          textAlign: TextAlign.right,
+                          style: QuantTheme.mono(
+                              size: 9, color: QuantTheme.negative),
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }),
+            ],
+
+            const Divider(color: QuantTheme.border, height: 14),
             Text('Heavyweight Index Points Contribution',
                 style: QuantTheme.heading(size: 10.5)),
             const SizedBox(height: 6),
@@ -276,7 +433,7 @@ class MinorIntradayIntelCard extends StatelessWidget {
                     padding:
                         const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                     decoration: BoxDecoration(
-                      color: QuantTheme.bgSecondary,
+                      color: col.withOpacity(0.08),
                       borderRadius: BorderRadius.circular(6),
                       border: Border.all(color: col.withOpacity(0.45)),
                     ),
@@ -299,13 +456,23 @@ class MinorIntradayIntelCard extends StatelessWidget {
               ),
             ],
             const SizedBox(height: 6),
-            Text(
-              'ORB: ${orbLevels.note}',
-              style: QuantTheme.mono(
-                size: 9.5,
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+              decoration: BoxDecoration(
                 color: orbLevels.divergenceTrap
-                    ? QuantTheme.warning
-                    : QuantTheme.textSecondary,
+                    ? QuantTheme.warning.withOpacity(0.10)
+                    : QuantTheme.bgMain,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Text(
+                '15m ORB: ${orbLevels.note}',
+                style: QuantTheme.mono(
+                  size: 9.5,
+                  color: orbLevels.divergenceTrap
+                      ? QuantTheme.warning
+                      : QuantTheme.textSecondary,
+                ),
               ),
             ),
           ],
@@ -313,6 +480,45 @@ class MinorIntradayIntelCard extends StatelessWidget {
       ),
     );
   }
+}
+
+class _MiniSeriesPainter extends CustomPainter {
+  final List<double> values;
+  final Color color;
+
+  _MiniSeriesPainter({required this.values, required this.color});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (values.length < 2) return;
+    double minV = values.first;
+    double maxV = values.first;
+    for (final v in values) {
+      if (v < minV) minV = v;
+      if (v > maxV) maxV = v;
+    }
+    final span = math.max(0.01, maxV - minV);
+    final path = Path();
+    for (int i = 0; i < values.length; i++) {
+      final x = (i / (values.length - 1)) * size.width;
+      final norm = (values[i] - minV) / span;
+      final y = size.height - (norm * (size.height - 6) + 3);
+      if (i == 0) {
+        path.moveTo(x, y);
+      } else {
+        path.lineTo(x, y);
+      }
+    }
+    final paint = Paint()
+      ..color = color
+      ..strokeWidth = 2.0
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round;
+    canvas.drawPath(path, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _MiniSeriesPainter oldDelegate) => true;
 }
 
 /// LAYER 2 (MAJOR): Official NSE Clearing Participant-Wise OI (FII / DII / Pro / Client)
@@ -392,7 +598,7 @@ class ParticipantOiCard extends StatelessWidget {
               child: LinearProgressIndicator(
                 value: (fiiPct / 100.0).clamp(0.0, 1.0),
                 minHeight: 5,
-                backgroundColor: QuantTheme.negative.withOpacity(0.35),
+                backgroundColor: QuantTheme.negative.withOpacity(0.25),
                 valueColor: const AlwaysStoppedAnimation(QuantTheme.positive),
               ),
             ),
@@ -497,7 +703,8 @@ class _LiveNewsWireCardState extends State<LiveNewsWireCard> {
       return it.source == _filter;
     }).toList();
 
-    final visible = _expanded ? filtered.take(25).toList() : filtered.take(8).toList();
+    final visible =
+        _expanded ? filtered.take(25).toList() : filtered.take(8).toList();
     final syncStr = widget.lastFetchedMs > 0
         ? DateFormat('HH:mm:ss')
             .format(DateTime.fromMillisecondsSinceEpoch(widget.lastFetchedMs))
@@ -514,9 +721,9 @@ class _LiveNewsWireCardState extends State<LiveNewsWireCard> {
               Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('Live Announcements & News Wire',
+                  Text('Official Announcements Wire',
                       style: QuantTheme.heading(size: 13)),
-                  Text('Official RBI • NSE Filings • BSE Notices (Sync $syncStr)',
+                  Text('RBI • NSE Filings • BSE Notices (Sync $syncStr)',
                       style: QuantTheme.label(size: 9.5)),
                 ],
               ),
@@ -545,18 +752,19 @@ class _LiveNewsWireCardState extends State<LiveNewsWireCard> {
                     padding:
                         const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
                     decoration: BoxDecoration(
-                      color: active ? QuantTheme.accent : QuantTheme.bgSecondary,
+                      color: active ? QuantTheme.headerNavy : QuantTheme.bgMain,
                       borderRadius: BorderRadius.circular(6),
                       border: Border.all(
-                        color: active ? QuantTheme.accent : QuantTheme.border,
+                        color: active
+                            ? QuantTheme.headerNavy
+                            : QuantTheme.border,
                       ),
                     ),
                     child: Text(
                       f,
                       style: QuantTheme.mono(
                         size: 9,
-                        color:
-                            active ? QuantTheme.bgMain : QuantTheme.textSecondary,
+                        color: active ? Colors.white : QuantTheme.textSecondary,
                       ),
                     ),
                   ),
@@ -585,7 +793,7 @@ class _LiveNewsWireCardState extends State<LiveNewsWireCard> {
                     Clipboard.setData(ClipboardData(text: it.link));
                     ScaffoldMessenger.of(context).showSnackBar(
                       SnackBar(
-                        backgroundColor: QuantTheme.bgElevated,
+                        backgroundColor: QuantTheme.headerNavy,
                         content: Text(
                           'Official ${it.source} link copied: ${it.link}',
                           maxLines: 2,
@@ -599,7 +807,8 @@ class _LiveNewsWireCardState extends State<LiveNewsWireCard> {
                   padding: const EdgeInsets.symmetric(vertical: 8),
                   decoration: const BoxDecoration(
                     border: Border(
-                        bottom: BorderSide(color: QuantTheme.border, width: 0.6)),
+                        bottom:
+                            BorderSide(color: QuantTheme.border, width: 0.7)),
                   ),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
